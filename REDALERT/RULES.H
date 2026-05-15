@@ -918,6 +918,15 @@ class RulesClass {
 		int AirQRecallAllowed;     // Allow recalling air units with Q-Move?
 
 		/*
+		**	Project Aeloria:
+		**	Engineer Instant Capture setting.
+		**	0 = Disabled (vanilla)
+		**	1 = Enabled in Multiplayer only
+		**	2 = Enabled in Singleplayer & Multiplayer
+		*/
+		int EngineerInstantCapture;
+
+		/*
 		**	Project Aeloria / Rampastring QoL:
 		**	Modern chain wall building settings.
 		**	These live under [AeloriaWalls] (with fallback to [MoreQoL]).

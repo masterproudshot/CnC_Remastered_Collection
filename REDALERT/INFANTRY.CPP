@@ -654,7 +654,18 @@ void InfantryClass::Per_Cell_Process(PCPType why)
 							iscapturable = tech->Can_Capture();
 						}
 #ifdef FIXIT_ENGINEER	//	checked - ajw 9/28/98
-						if (tech->Health_Ratio() <= EngineerCaptureLevel && iscapturable) {
+						// Project Aeloria: Support for Engineer Instant Capture
+						bool can_instant_capture = false;
+						if (Rule.EngineerInstantCapture == 2) {
+							can_instant_capture = true;
+						} else if (Rule.EngineerInstantCapture == 1) {
+							// Only in multiplayer
+							if (Session.Type != GAME_NORMAL) {
+								can_instant_capture = true;
+							}
+						}
+
+						if ((can_instant_capture || tech->Health_Ratio() <= EngineerCaptureLevel) && iscapturable) {
 #else
 						if (tech->Health_Ratio() <= Rule.ConditionRed && iscapturable) {
 #endif

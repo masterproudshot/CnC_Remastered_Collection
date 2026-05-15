@@ -277,6 +277,9 @@ RulesClass::RulesClass(void) :
 		QmoveLoopsAllowed(1),
 		AirQMoveAllowed(1),
 		AirQRecallAllowed(1),
+
+		// Engineer Instant Capture (Project Aeloria)
+		EngineerInstantCapture(0),
 	MaxWallExtensionDistance(4),
 	WallSellPriceDivisor(3),
 	AutoRepairFacilityKickOut(true),
@@ -400,6 +403,7 @@ bool RulesClass::General(CCINIClass & ini)
 	static char const * const AELORIA_RALLYPOINTS = "AeloriaRallyPoints";
 	static char const * const AELORIA_WALLS = "AeloriaWalls";
 	static char const * const AELORIA_QMOVE = "AeloriaQMove";
+	static char const * const AELORIA_ENGINEERS = "AeloriaEngineers";
 
 	if(ini.Is_Present(AFTERMATH)) {
 //debugprint( "NewUnitsEnabled previously %i\n", NewUnitsEnabled );
@@ -466,6 +470,13 @@ bool RulesClass::General(CCINIClass & ini)
 		QmoveLoopsAllowed  = ini.Get_Int(section, "QmoveLoopsAllowed", QmoveLoopsAllowed);
 		AirQMoveAllowed    = ini.Get_Int(section, "AirQMoveAllowed", AirQMoveAllowed);
 		AirQRecallAllowed  = ini.Get_Int(section, "AirQRecallAllowed", AirQRecallAllowed);
+	}
+
+	// Project Aeloria: Engineer Instant Capture
+	if (ini.Is_Present(AELORIA_ENGINEERS) || ini.Is_Present(MOREQOL)) {
+		const char* section = ini.Is_Present(AELORIA_ENGINEERS) ? AELORIA_ENGINEERS : MOREQOL;
+
+		EngineerInstantCapture = ini.Get_Int(section, "EngineerInstantCapture", EngineerInstantCapture);
 	}
 
 	if (ini.Is_Present(GENERAL)) {
