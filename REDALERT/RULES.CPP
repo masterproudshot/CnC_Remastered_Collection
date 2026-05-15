@@ -391,6 +391,8 @@ bool RulesClass::General(CCINIClass & ini)
 #ifdef FIXIT_CSII	//	checked - ajw 9/28/98
 	static char const * const AFTERMATH = "Aftermath";
 	static char const * const MOREQOL = "MoreQoL";
+	static char const * const AELORIA_HARVESTERS = "AeloriaHarvesters";
+	static char const * const AELORIA_RALLYPOINTS = "AeloriaRallyPoints";
 
 	if(ini.Is_Present(AFTERMATH)) {
 //debugprint( "NewUnitsEnabled previously %i\n", NewUnitsEnabled );
@@ -416,13 +418,30 @@ bool RulesClass::General(CCINIClass & ini)
 
 #endif
 
+	// Project Aeloria: New dedicated section for harvester-related tunables.
+	// Falls back to [MoreQoL] for backward compatibility during transition.
+	if (ini.Is_Present(AELORIA_HARVESTERS) || ini.Is_Present(MOREQOL)) {
+		const char* section = ini.Is_Present(AELORIA_HARVESTERS) ? AELORIA_HARVESTERS : MOREQOL;
+
+		MaxFreeRefineryDistanceBias = ini.Get_Int(section, "MaxFreeRefineryDistanceBias", MaxFreeRefineryDistanceBias);
+		MinHarvesterQueueJumpDistance = ini.Get_Int(section, "MinHarvesterQueueJumpDistance", MinHarvesterQueueJumpDistance);
+
+		// Note: Other MoreQoL values (walls, repair, etc.) remain under [MoreQoL] for now.
+	}
+
+	// Legacy [MoreQoL] parsing for non-harvester values (walls, etc.)
 	if (ini.Is_Present(MOREQOL)) {
-		MaxFreeRefineryDistanceBias = ini.Get_Int(MOREQOL, "MaxFreeRefineryDistanceBias", MaxFreeRefineryDistanceBias);
-		MinHarvesterQueueJumpDistance = ini.Get_Int(MOREQOL, "MinHarvesterQueueJumpDistance", MinHarvesterQueueJumpDistance);
 		MaxWallExtensionDistance = ini.Get_Int(MOREQOL, "MaxWallExtensionDistance", MaxWallExtensionDistance);
 		WallSellPriceDivisor = ini.Get_Int(MOREQOL, "WallSellPriceDivisor", WallSellPriceDivisor);
 		AutoRepairFacilityKickOut = ini.Get_Bool(MOREQOL, "AutoRepairFacilityKickOut", AutoRepairFacilityKickOut);
 		AISurrenderObjectCountThreshold = ini.Get_Int(MOREQOL, "AISurrenderObjectCountThreshold", AISurrenderObjectCountThreshold);
+	}
+
+	// Project Aeloria: Rally Point settings
+	if (ini.Is_Present(AELORIA_RALLYPOINTS) || ini.Is_Present(MOREQOL)) {
+		const char* section = ini.Is_Present(AELORIA_RALLYPOINTS) ? AELORIA_RALLYPOINTS : MOREQOL;
+
+		RallyPointsEnabled = ini.Get_Int(section, "RallyPointsEnabled", RallyPointsEnabled);
 	}
 
 	if (ini.Is_Present(GENERAL)) {

@@ -208,12 +208,45 @@ class BuildingClass : public TechnoClass
 		*/
 		CDTimerClass<FrameTimerClass> PlacementDelay;
 
-		// Taken from cfehunter's CFE Patch, original comment follows
-		//cfehunter 7th June 2020. Took a lot of digging into the allocation
-		//but it looks like memory is initialised to zeros when allocated from the object pools.
-		//So even though this CELL doesn't exist in older saves, it should be zero initialised.
-		//NOTE: /!\ Stole 2 bytes from the save game padding /!\/
+		/*
+		**	=== Project Aeloria Rally Point System ===
+		**
+		**	Each building that supports rally points stores a single TARGET (RallyPoint).
+		**	When a unit is produced or finishes being repaired, it is sent to this location
+		**	using the helper SendUnitToRallyPoint().
+		**
+		**	Helpers:
+		**	  - Can_Have_Rally_Point()  : Can this building type have a rally point?
+		**	  - HasRallyPoint()         : Does this specific building have one set?
+		**	  - SetRallyPoint()         : Preferred way to assign a rally point (future net event hook)
+		**	  - ClearRallyPoint()       : Clear the current rally point
+		**	  - SendUnitToRallyPoint()  : Send a unit to the rally point (handles harvester special case)
+		**	  - Target_For_Rally_Point(): Returns a safe target (handles Nearby_Location for cells)
+		**
+		**	Note: Rally point setting is currently not networked (direct member write).
+		**	This is a known limitation carried over from the original Rampastring/CFE implementation.
+		*/
 		TARGET RallyPoint;
+
+		/*
+		**	Project Aeloria (Moderate cleanup):
+		**	Helper for harvester queue jumping logic at refineries.
+		*/
+		bool HarvesterCanQueueJump(UnitClass* currentHarvester, UnitClass* incomingHarvester) const;
+
+		/*
+		**	Project Aeloria (Moderate cleanup) - Rally Point System
+		**
+		**	These helpers centralize rally point behavior:
+		**	- HasRallyPoint()     : Quick check if a valid rally point is set
+		**	- ClearRallyPoint()   : Clear the current rally point
+		**	- SetRallyPoint()     : Central setter (future network event hook point)
+		**	- SendUnitToRallyPoint(): Send a unit to the rally point (handles harvester InitHarvest logic)
+		*/
+		bool HasRallyPoint() const;
+		void ClearRallyPoint();
+		void SetRallyPoint(TARGET target);
+		void SendUnitToRallyPoint(TechnoClass* unit);
 
 		/*---------------------------------------------------------------------
 		**	Constructors, Destructors, and overloaded operators.

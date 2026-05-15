@@ -199,6 +199,20 @@ RadioMessageType BuildingClass::Receive_Message(RadioClass * from, RadioMessageT
 					return(RADIO_NEGATIVE);
 
 				case STRUCT_REFINERY:
+					/*
+					** Project Aeloria / Rampastring QoL - Harvester Queue Jumping
+					**
+					** This is the core logic that makes multiple harvesters at the same refinery feel
+					** much smarter. When a new harvester requests docking (RADIO_HELLO):
+					**
+					**   1. If the refinery is free → allow docking.
+					**   2. If another harvester is already docking, compare distances.
+					**   3. If the new harvester is significantly closer (by MinHarvesterQueueJumpDistance),
+					**      kick the current one out (RADIO_OVER_OUT) and let the closer one dock.
+					**
+					** This dramatically reduces harvester idle time and "traffic jams" at refineries.
+					** The Rule.MinHarvesterQueueJumpDistance tunable controls how aggressive this is.
+					*/
 					if (from->What_Am_I() == RTTI_UNIT &&
 						((UnitClass *)from)->Class->IsToHarvest) {
 						if (ScenarioInit) {
@@ -212,9 +226,8 @@ RadioMessageType BuildingClass::Receive_Message(RadioClass * from, RadioMessageT
 						if (In_Radio_Contact()) {
 							TechnoClass* whom = Contact_With_Whom();
 
-							int oldDistance = ::Distance(::Coord_Cell(Center_Coord()), ::Coord_Cell(whom->Center_Coord()));
-							int newDistance = ::Distance(::Coord_Cell(Center_Coord()), ::Coord_Cell(from->Center_Coord()));
-							if (newDistance + Rule.MinHarvesterQueueJumpDistance < oldDistance) {
+							// Use the new extracted helper for clarity
+							if (HarvesterCanQueueJump((UnitClass*)whom, (UnitClass*)from)) {
 								Transmit_Message(RADIO_OVER_OUT, whom);
 								return RADIO_ROGER;
 							}
@@ -388,15 +401,8 @@ RadioMessageType BuildingClass::Receive_Message(RadioClass * from, RadioMessageT
 			}
 			TechnoClass::Receive_Message(from, message, param);
 
-			if (Can_Have_Rally_Point() && Target_Legal(RallyPoint)) {
-				Queue_Mission(from->As_Target(), MISSION_MOVE, TARGET_NONE, Target_For_Rally_Point());
-				if (from->What_Am_I() == RTTI_UNIT) {
-					UnitClass* unit = (UnitClass*)from;
-					if (unit->Class->IsToHarvest) {
-						unit->InitHarvest = true;
-					}
-				}
-
+			if (HasRallyPoint()) {
+				SendUnitToRallyPoint(from);
 				return RADIO_ROGER;
 			}
 
@@ -534,7 +540,7 @@ void BuildingClass::Draw_It(int x, int y, WindowNumberType window) const
 	}
 
 	// Draw rally point
-	if (Can_Have_Rally_Point() && Is_Selected_By_Player() && Is_Owned_By_Player() && RallyPoint && Target_Legal(RallyPoint))
+	if (HasRallyPoint() && Is_Selected_By_Player() && Is_Owned_By_Player())
 	{
 		int startX, startY, endX, endY;
 		Map.Coord_To_Pixel(Coord_Add(Coord, Class->ExitCoordinate), startX, startY);
@@ -1821,7 +1827,7 @@ void BuildingClass::Active_Click_With(ActionType action, ObjectClass * object)
 	}
 
 	if (action == ACTION_MOVE && Can_Have_Rally_Point()) {
-		RallyPoint = object->As_Target();
+		SetRallyPoint(object->As_Target());
 	}
 }
 
@@ -1862,10 +1868,7 @@ void BuildingClass::Active_Click_With(ActionType action, CELL cell)
             OutList.Add(EventClass(ANIM_MOVE_FLASH, PlayerPtr->Class->House, coord, 1 << PlayerPtr->Class->House));
 		}
 		else if (Can_Have_Rally_Point()) {
-			// TODO a proper, multiplayer-compatible way would
-			// be adding a new event to set the rally point
-			// (or modifying the handling of MEGAMISSION)
-			RallyPoint = ::As_Target(cell);
+			SetRallyPoint(::As_Target(cell));
 			Map.Flag_To_Redraw(true);
 		}
 	}
@@ -2009,7 +2012,7 @@ int BuildingClass::Exit_Object(TechnoClass * base)
 					ScenarioInit++;
 					cell = Find_Exit_Cell(base);
 					if (cell != 0 && base->Unlimbo(Cell_Coord(cell), Direction(Cell_Coord(cell)))) {
-						if (Can_Have_Rally_Point() && Target_Legal(RallyPoint)) {
+						if (HasRallyPoint()) {
 							base->Assign_Mission(MISSION_MOVE);
 							base->Assign_Destination(Target_For_Rally_Point());
 						}
@@ -2081,7 +2084,7 @@ int BuildingClass::Exit_Object(TechnoClass * base)
 				case STRUCT_TENT:
 				case STRUCT_KENNEL:
 
-					if (Can_Have_Rally_Point() && Target_Legal(RallyPoint)) {
+					if (HasRallyPoint()) {
 						cell = Map.Nearby_Location(As_Cell(RallyPoint), SPEED_FOOT);
 					}
 					else {
@@ -3461,6 +3464,7 @@ MoveType BuildingClass::Can_Enter_Cell(CELL cell, FacingType) const
 	}
 
 	if (Can_Have_Rally_Point()) {
+		// When setting a rally point, we only care that the cell is walkable by the unit type being produced.
 		return Map[cell].Is_Clear_To_Move(Class->ToBuild == RTTI_VESSELTYPE ? SPEED_FLOAT : SPEED_FOOT,
 			true, true, -1, MZONE_NORMAL) ? MOVE_OK : MOVE_NO;
 	}
@@ -4340,7 +4344,7 @@ int BuildingClass::Mission_Repair(void)
 							if (IsOwnedByPlayer) Speak(VOX_UNIT_REPAIRED, House);
 
 							// Rampastring 06.10.2020: Tell repaired unit to move away
-							if (Can_Have_Rally_Point() && Target_Legal(RallyPoint)) {
+							if (HasRallyPoint()) {
 								TechnoClass* contact = Contact_With_Whom();
 								
 								contact->Assign_Mission(MISSION_MOVE);
@@ -6150,14 +6154,32 @@ unsigned BuildingClass::Spied_By() const
 	return spiedby;
 }
 
-// Rampastring 20200608
+/***********************************************************************************************
+ * BuildingClass::Can_Have_Rally_Point -- Determines if this building supports rally points.   *
+ *                                                                                             *
+ *    Project Aeloria Note: This function was added by Rampastring (based on CFE Patch work)   *
+ *    to enable the popular "Rally Points on Production Buildings" Quality of Life feature.    *
+ *                                                                                             *
+ *    A building can have a rally point if it produces units (barracks, war factory, shipyard, *
+ *    sub pen, helipad, airfield) or if it is a Repair Bay. When a unit finishes production    *
+ *    or repair, it will automatically move to the rally point instead of idling at the exit.  *
+ *                                                                                             *
+ *    TODO (Future / Experimental): Consider making this data-driven via a flag in the INI     *
+ *    rather than hardcoded, to support easier modding and future building types.              *
+ *=============================================================================================*/
 bool BuildingClass::Can_Have_Rally_Point() const 
 {
-	// TODO check attribute for TS-like heap initialization
+	if (!Rule.RallyPointsEnabled) {
+		return false;
+	}
+
+	// Repair Bays get special treatment even though they don't produce units.
+	// Units that finish repairing should move away to the rally point.
 	if (*this == STRUCT_REPAIR) {
 		return true;
-	}	
+	}
 
+	// Any building type that can produce units (land, infantry, or naval) supports rally points.
 	switch (Class->ToBuild) 
 	{
 		case RTTI_UNITTYPE:
@@ -6173,19 +6195,88 @@ bool BuildingClass::Can_Have_Rally_Point() const
 void BuildingClass::Set_Unselected_By_Player(HouseClass* player)
 {
 	TechnoClass::Set_Unselected_By_Player(player);
-	if (Can_Have_Rally_Point() && RallyPoint)
+	if (HasRallyPoint())
 	{
 		Map.Flag_To_Redraw(true);
 	}
 }
 
-/* 
- * Returns the rally point as a target
- * Original code from cfehunter, ported to RA by Rampastring
- * (additional SpeedType arg for Nearby_Location)
- */
+/***********************************************************************************************
+ * BuildingClass::Target_For_Rally_Point -- Returns a safe, usable rally point target.         *
+ *                                                                                             *
+ *    Project Aeloria:
+ *    If the player set the rally point on a raw cell, this method finds a nearby valid cell
+ *    that the produced unit type can actually occupy. This prevents units from trying to
+ *    path to an invalid location.
+ *
+ *    Uses the correct SpeedType (foot vs float) depending on whether the building produces
+ *    land or naval units.
+ *=============================================================================================*/
 TARGET BuildingClass::Target_For_Rally_Point() const
 {
-	return Is_Target_Cell(RallyPoint) ? ::As_Target(Map.Nearby_Location(As_Cell(RallyPoint),
-		Class->ToBuild == RTTI_VESSELTYPE ? SPEED_FLOAT : SPEED_FOOT)) : RallyPoint;
+	if (Is_Target_Cell(RallyPoint)) {
+		SpeedType speed = (Class->ToBuild == RTTI_VESSELTYPE) ? SPEED_FLOAT : SPEED_FOOT;
+		return ::As_Target(Map.Nearby_Location(As_Cell(RallyPoint), speed));
+	}
+
+	return RallyPoint;
+}
+
+/***********************************************************************************************
+ * BuildingClass::HarvesterCanQueueJump -- Determines if an incoming harvester should bump     *
+ *                                         the current one at this refinery.                   *
+ *                                                                                             *
+ *    Project Aeloria (Moderate Cleanup):
+ *    Extracted the queue jumping decision into its own method for clarity.
+ *    This logic was previously inline inside the RADIO_HELLO handler for refineries.
+ *
+ *    Returns true if the new harvester is close enough to the refinery compared to the
+ *    current one (by Rule.MinHarvesterQueueJumpDistance) that it should take priority.
+ *=============================================================================================*/
+bool BuildingClass::HarvesterCanQueueJump(UnitClass* currentHarvester, UnitClass* incomingHarvester) const
+{
+	if (!currentHarvester || !incomingHarvester) {
+		return false;
+	}
+
+	int currentDistance = ::Distance(::Coord_Cell(Center_Coord()), ::Coord_Cell(currentHarvester->Center_Coord()));
+	int newDistance     = ::Distance(::Coord_Cell(Center_Coord()), ::Coord_Cell(incomingHarvester->Center_Coord()));
+
+	return (newDistance + Rule.MinHarvesterQueueJumpDistance < currentDistance);
+}
+
+/*
+**	Project Aeloria (Moderate cleanup) - Rally Point Helpers
+**	These make the scattered rally point logic much cleaner and more maintainable.
+*/
+bool BuildingClass::HasRallyPoint() const
+{
+	return Target_Legal(RallyPoint);
+}
+
+void BuildingClass::ClearRallyPoint()
+{
+	RallyPoint = TARGET_NONE;
+}
+
+void BuildingClass::SetRallyPoint(TARGET target)
+{
+	// Central place to set rally points.
+	// TODO: In the future, this should send a network event for multiplayer instead of direct assignment.
+	RallyPoint = target;
+}
+
+void BuildingClass::SendUnitToRallyPoint(TechnoClass* unit)
+{
+	if (!unit || !HasRallyPoint()) return;
+
+	Queue_Mission(unit->As_Target(), MISSION_MOVE, TARGET_NONE, Target_For_Rally_Point());
+
+	// Special harvester behavior: after reaching rally point from a refinery, immediately look for more ore
+	if (unit->What_Am_I() == RTTI_UNIT) {
+		UnitClass* u = (UnitClass*)unit;
+		if (u->Class->IsToHarvest) {
+			u->InitHarvest = true;
+		}
+	}
 }
