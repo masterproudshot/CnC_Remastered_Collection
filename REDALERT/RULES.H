@@ -927,6 +927,14 @@ class RulesClass {
 		int EngineerInstantCapture;
 
 		/*
+		**	Project Aeloria:
+		**	Zoom level control settings.
+		**	These live under [AeloriaZoom].
+		*/
+		int MaxZoomLevel;      // Highest zoom factor index allowed (from GameConstants)
+		fixed ZoomSpeed;       // Speed of zoom transitions (future use)
+
+		/*
 		**	Project Aeloria / Rampastring QoL:
 		**	Modern chain wall building settings.
 		**	These live under [AeloriaWalls] (with fallback to [MoreQoL]).

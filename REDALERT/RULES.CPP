@@ -280,6 +280,10 @@ RulesClass::RulesClass(void) :
 
 		// Engineer Instant Capture (Project Aeloria)
 		EngineerInstantCapture(0),
+
+		// Zoom settings (Project Aeloria)
+		MaxZoomLevel(30),      // Default: allow many zoom levels (from the big GameConstants list)
+		ZoomSpeed(0x00010000), // 1.0 fixed point (normal speed)
 	MaxWallExtensionDistance(4),
 	WallSellPriceDivisor(3),
 	AutoRepairFacilityKickOut(true),
@@ -404,6 +408,7 @@ bool RulesClass::General(CCINIClass & ini)
 	static char const * const AELORIA_WALLS = "AeloriaWalls";
 	static char const * const AELORIA_QMOVE = "AeloriaQMove";
 	static char const * const AELORIA_ENGINEERS = "AeloriaEngineers";
+	static char const * const AELORIA_ZOOM = "AeloriaZoom";
 
 	if(ini.Is_Present(AFTERMATH)) {
 //debugprint( "NewUnitsEnabled previously %i\n", NewUnitsEnabled );
@@ -477,6 +482,14 @@ bool RulesClass::General(CCINIClass & ini)
 		const char* section = ini.Is_Present(AELORIA_ENGINEERS) ? AELORIA_ENGINEERS : MOREQOL;
 
 		EngineerInstantCapture = ini.Get_Int(section, "EngineerInstantCapture", EngineerInstantCapture);
+	}
+
+	// Project Aeloria: Zoom settings
+	if (ini.Is_Present(AELORIA_ZOOM) || ini.Is_Present(MOREQOL)) {
+		const char* section = ini.Is_Present(AELORIA_ZOOM) ? AELORIA_ZOOM : MOREQOL;
+
+		MaxZoomLevel = ini.Get_Int(section, "MaxZoomLevel", MaxZoomLevel);
+		ZoomSpeed    = ini.Get_Fixed(section, "ZoomSpeed", ZoomSpeed);
 	}
 
 	if (ini.Is_Present(GENERAL)) {
