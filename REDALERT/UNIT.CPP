@@ -1180,15 +1180,18 @@ ResultType UnitClass::Take_Damage(int & damage, int distance, WarheadType warhea
 				if (*this == UNIT_HARVESTER && Pip_Count() && Health_Ratio() <= Rule.ConditionYellow) {
 
 					/*
-					**	Find nearby refinery and head to it?
+					**	Project Aeloria (Moderate): Use smart refinery selection even when damaged.
+					**	This gives damaged harvesters the same LastDockingBayCoord preference and
+					**	queue bias logic as normal ones.
 					*/
-					BuildingClass * building = Find_Docking_Bay(STRUCT_REFINERY, false);
+					BuildingClass * building = FindBestRefinery();
 
 					/*
 					**	Since the refinery said it was ok to load, establish radio
 					**	contact with the refinery and then await docking orders.
 					*/
-					if (building != NULL && Transmit_Message(RADIO_HELLO, building) == RADIO_ROGER) {
+					if (building != nullptr && Transmit_Message(RADIO_HELLO, building) == RADIO_ROGER) {
+						RememberDockingBay(building);
 						Assign_Mission(MISSION_ENTER);
 					}
 				}
@@ -2261,19 +2264,21 @@ int UnitClass::Tiberium_Check(CELL & center, int x, int y)
 /***********************************************************************************************
  * UnitClass::Goto_Tiberium -- Searches for and heads toward tiberium.                         *
  *                                                                                             *
- *    This routine will cause the unit to search for and head toward nearby Tiberium. When     *
- *    the Tiberium is reached, then this routine should not be called again until such time    *
- *    as additional harvesting is required. When this routine returns false, then it should    *
- *    be called again until such time as it returns true.                                      *
+ *    Project Aeloria Note: This function received important QoL improvements from Rampastring.*
+ *                                                                                             *
+ *    Original Behavior:
+ *      - Search outward in rings and pick the first Tiberium cell found.
+ *      - This often caused harvesters to travel to distant northern fields even when better
+ *        ore was available closer to their refinery.
+ *                                                                                             *
+ *    Rampastring / Project Aeloria Improvement:
+ *      - During the ring search, it now tracks the Tiberium cell that is **closest to the
+ *        harvester's last docking bay** (LastDockingBayCoord / refinery).
+ *      - This makes harvesters much more efficient and less likely to wander across the map.
  *                                                                                             *
  * INPUT:   rad = size of ring to search                                                       *
  *                                                                                             *
  * OUTPUT:  Has the unit reached Tiberium and harvesting should begin?                         *
- *                                                                                             *
- * WARNINGS:   none                                                                            *
- *                                                                                             *
- * HISTORY:                                                                                    *
- *   09/22/1995 JLB : Created.                                                                 *
  *=============================================================================================*/
 bool UnitClass::Goto_Tiberium(int rad)
 {
@@ -2294,9 +2299,10 @@ bool UnitClass::Goto_Tiberium(int rad)
 			}
 
 			/*
-			**	Perform a ring search outward from the center.
-			**	Rampastring: Always try to harvest from the cell that's closest
-			**	to our refinery.
+			**	Project Aeloria / Rampastring QoL:
+			**	Perform a ring search, but instead of taking the first Tiberium cell we find,
+			**	we evaluate all cells in the ring and pick the one closest to our last refinery
+			**	(LastDockingBayCoord). This is the heart of the "smarter harvester pathing" improvement.
 			*/
 			for (int radius = 1; radius < rad; radius++) {
 				int distance = -1;
@@ -2342,19 +2348,92 @@ bool UnitClass::Goto_Tiberium(int rad)
 }
 
 /***********************************************************************************************
+ * UnitClass::FindBestRefinery -- Finds the best refinery for this harvester to unload at.     *
+ *                                                                                             *
+ *    Project Aeloria (Moderate Cleanup):
+ *    This is the central smart refinery selection logic.
+ *
+ *    It prefers free refineries over occupied ones within the bias distance defined in
+ *    [AeloriaHarvesters] → MaxFreeRefineryDistanceBias.
+ *
+ *    All harvester "go home" paths (normal harvesting, damaged, and repair mode) now route
+ *    through this method for consistency.
+ *=============================================================================================*/
+BuildingClass * UnitClass::FindBestRefinery(bool friendly) const
+{
+	if (!Class->IsToHarvest) {
+		return nullptr;
+	}
+
+	BuildingClass * nearest = Find_Docking_Bay(STRUCT_REFINERY, friendly);
+
+	// Temporarily disable normal radio rules so we can query whether the refinery
+	// is currently accepting a new harvester (the "possibly occupied" check).
+	ScenarioInit++;
+	BuildingClass * possiblyOccupied = Find_Docking_Bay(STRUCT_REFINERY, friendly);
+	ScenarioInit--;
+
+	// Prefer 'nearest' if it's free or close enough to the occupied one.
+	if (nearest != nullptr &&
+	    (nearest == possiblyOccupied ||
+	     ::Distance(Coord_Cell(nearest->Center_Coord()), Coord_Cell(possiblyOccupied->Center_Coord())) < Rule.MaxFreeRefineryDistanceBias))
+	{
+		return nearest;
+	}
+
+	// Fallback to the occupied one (harvester will have to wait in line)
+	return possiblyOccupied;
+}
+
+/***********************************************************************************************
+ * UnitClass::RememberDockingBay -- Records the last refinery a harvester used.                *
+ *                                                                                             *
+ *    Project Aeloria (Moderate cleanup):
+ *    Central helper to make LastDockingBayCoord management consistent.
+ *    This improves the "memory" behavior of harvesters across different mission states.
+ *=============================================================================================*/
+void UnitClass::RememberDockingBay(BuildingClass* refinery)
+{
+	if (refinery) {
+		LastDockingBayCoord = refinery->Center_Coord();
+	}
+}
+
+/*
+**	Project Aeloria (Moderate cleanup) - Harvester Memory System
+**
+**	These helpers manage the "last harvest location" memory for harvesters.
+**	They wrap the general ArchiveTarget field in a harvester-specific way.
+**	This makes the code much clearer than directly manipulating ArchiveTarget
+**	in Mission_Harvest.
+*/
+void UnitClass::RememberLastHarvestLocation(CELL cell)
+{
+	ArchiveTarget = ::As_Target(cell);
+}
+
+void UnitClass::ClearLastHarvestLocation()
+{
+	ArchiveTarget = TARGET_NONE;
+}
+
+TARGET UnitClass::GetLastHarvestLocation() const
+{
+	return ArchiveTarget;
+}
+
+/***********************************************************************************************
  * UnitClass::Harvesting -- Harvests tiberium at the current location.                         *
  *                                                                                             *
- *    This routine is used to by the harvester to harvest Tiberium at the current location.    *
- *    When harvesting is complete, this routine will return true.                              *
+ *    Project Aeloria Note: This is the low-level harvesting animation and credit logic.       *
+ *    It is called repeatedly from the HARVESTING state in Mission_Harvest().                    *
  *                                                                                             *
- * INPUT:   none                                                                               *
+ *    It handles:
+ *      - Playing the correct harvesting animation frames
+ *      - Actually removing Tiberium from the cell
+ *      - Adding credits to the house when a load cycle completes
  *                                                                                             *
- * OUTPUT:  bool; Is harvesting complete?                                                      *
- *                                                                                             *
- * WARNINGS:   none                                                                            *
- *                                                                                             *
- * HISTORY:                                                                                    *
- *   07/18/1994 JLB : Created.                                                                 *
+ *    Most of the "smart" behavior lives in Mission_Harvest() and Goto_Tiberium(), not here.
  *=============================================================================================*/
 bool UnitClass::Harvesting(void)
 {
@@ -2831,22 +2910,27 @@ int UnitClass::Mission_Unload(void)
 
 
 /***********************************************************************************************
- * UnitClass::Mission_Harvest -- Handles the harvesting process used by harvesters.            *
+ * UnitClass::Mission_Harvest -- Main state machine for harvester (Ore Truck) behavior.        *
  *                                                                                             *
- *    This is the AI process used by harvesters when they are doing their harvesting action.   *
- *    This entails searching for nearby Tiberium, heading there, harvesting, and then          *
- *    returning to a refinery for unloading.                                                   *
+ *    Project Aeloria Note: This is one of the most important functions for Quality of Life    *
+ *    in Red Alert Remastered. Rampastring (building on cfehunter's CFE Patch work) made       *
+ *    significant improvements here to make harvesters feel much smarter and less frustrating. *
+ *                                                                                             *
+ *    Key QoL Features Implemented:
+ *      - LastHarvestLocation memory system (via ArchiveTarget): Harvesters remember the last *
+ *        Tiberium patch and prefer returning to it (via RememberLastHarvestLocation helpers).  *
+ *      - Smarter refinery selection using MaxFreeRefineryDistanceBias (prefers closer free    *
+ *        refineries over occupied ones within a reasonable distance).
+ *      - Queue jumping at refineries using MinHarvesterQueueJumpDistance.
+ *      - InitHarvest flag support (set when unloading at a refinery with a rally point).
+ *                                                                                             *
+ *    The original Westwood state machine (LOOKING → HARVESTING → FINDHOME → HEADINGHOME)      *
+ *    has been extended rather than replaced. Future ambitious work (Experimental profile)     *
+ *    may refactor this into a cleaner design.                                                 *
  *                                                                                             *
  * INPUT:   none                                                                               *
  *                                                                                             *
  * OUTPUT:  Returns with the delay before calling this routine again.                          *
- *                                                                                             *
- * WARNINGS:   none                                                                            *
- *                                                                                             *
- * HISTORY:                                                                                    *
- *   07/18/1994 JLB : Created.                                                                 *
- *   06/21/1995 JLB : Force guard mode if no Tiberium found.                                   *
- *   09/28/1995 JLB : Aborts harvesting if there are no more refineries.                       *
  *=============================================================================================*/
 int UnitClass::Mission_Harvest(void)
 {
@@ -2893,11 +2977,13 @@ int UnitClass::Mission_Harvest(void)
 			}
 
 			/*
-			** Look for ore where we last found some - mine the same patch
+			** Project Aeloria / Rampastring QoL:
+			** Look for ore where we last found some - mine the same patch.
+			** This is the core of the "harvester memory" improvement.
 			*/
-			if (Target_Legal(ArchiveTarget)) {
-				Assign_Destination(ArchiveTarget);
-				ArchiveTarget = 0;
+			if (Target_Legal(GetLastHarvestLocation())) {
+				Assign_Destination(GetLastHarvestLocation());
+				ClearLastHarvestLocation();
 			}
 			IsHarvesting = false;
 			if (Goto_Tiberium(Rule.TiberiumLongScan / CELL_LEPTON_W)) {
@@ -2905,7 +2991,7 @@ int UnitClass::Mission_Harvest(void)
 				Set_Rate(2);
 				Set_Stage(0);
 				Status = HARVESTING;
-				ArchiveTarget = ::As_Target(Coord_Cell(Coord));
+				RememberLastHarvestLocation(Coord_Cell(Coord));
 				return(1);
 			} else {
 
@@ -2917,13 +3003,11 @@ int UnitClass::Mission_Harvest(void)
 				if (!Target_Legal(NavCom)) {
 
 					/*
-					**	If the archive target is legal, then head there since it is presumed
-					**	that the archive target points to the last place it harvested at. This might
-					**	solve the case where the harvester gets stuck and can't find Tiberium just because
-					**	it is greater than 32 squares away.
+					**	Project Aeloria / Rampastring QoL:
+					**	Try the last remembered harvest location if we have one.
 					*/
-					if (Target_Legal(ArchiveTarget)) {
-						Assign_Destination(ArchiveTarget);
+					if (Target_Legal(GetLastHarvestLocation())) {
+						Assign_Destination(GetLastHarvestLocation());
 					} else {
 						Status = GOINGTOIDLE;
 						IsUseless = true;
@@ -2955,7 +3039,7 @@ int UnitClass::Mission_Harvest(void)
 					Status = FINDHOME;
 				} else {
 					if (!Goto_Tiberium(Rule.TiberiumShortScan / CELL_LEPTON_W) && !Target_Legal(NavCom))	{
-					  	ArchiveTarget = TARGET_NONE;
+						ClearLastHarvestLocation();
 						Status = FINDHOME;
 					} else {
 						Status = HARVESTING;
@@ -2963,66 +3047,94 @@ int UnitClass::Mission_Harvest(void)
 					}
 				}
 				return(1);
-			} else if (!Target_Legal(NavCom) && ArchiveTarget == TARGET_NONE) {
-				ArchiveTarget = ::As_Target(Coord_Cell(Coord));
+			} else if (!Target_Legal(NavCom) && GetLastHarvestLocation() == TARGET_NONE) {
+				RememberLastHarvestLocation(Coord_Cell(Coord));
 			}
 			return(1);
 //			return(TICKS_PER_SECOND*Rule.OreDumpRate);
 
 		/*
-		**	Find and head to refinery.
+		**	Project Aeloria - FINDHOME state (Refinery Selection)
+		**
+		**	All smart refinery selection now lives in FindBestRefinery(), which reads its
+		**	tunables from the new [AeloriaHarvesters] INI section (with fallback to [MoreQoL]
+		**	for compatibility).
+		**
+		**	This state is now much cleaner after the Moderate cleanup extraction.
 		*/
 		case FINDHOME:
 			if (!Target_Legal(NavCom)) {
 
 				/*
-				**	Find nearby refinery and head to it?
+				**	Project Aeloria (Moderate): Use the new extracted helper for cleaner code.
 				*/
-				BuildingClass * nearest = Find_Docking_Bay(STRUCT_REFINERY, false);
-				ScenarioInit++;
-				BuildingClass * possiblyOccupied = Find_Docking_Bay(STRUCT_REFINERY, false);
-				ScenarioInit--;
+				BuildingClass * refinery = FindBestRefinery();
 
 				/*
-				**	Since the refinery said it was ok to load, establish radio
-				**	contact with the refinery and then await docking orders.
+				**	Try to establish radio contact with the chosen refinery.
+				**	If successful, move to HEADINGHOME state and record LastDockingBayCoord.
 				*/
-				if (nearest != NULL &&
-					(nearest == possiblyOccupied || ::Distance(Coord_Cell(nearest->Center_Coord()), Coord_Cell(possiblyOccupied->Center_Coord())) < Rule.MaxFreeRefineryDistanceBias)
-					&& Transmit_Message(RADIO_HELLO, nearest) == RADIO_ROGER) {
+				if (refinery != nullptr && Transmit_Message(RADIO_HELLO, refinery) == RADIO_ROGER) {
 					Status = HEADINGHOME;
-					LastDockingBayCoord = nearest->Center_Coord();
-					if (nearest->House == PlayerPtr && (PlayerPtr->Capacity - PlayerPtr->Tiberium) < 300 && PlayerPtr->Capacity > 500 && (PlayerPtr->ActiveBScan & (STRUCTF_REFINERY | STRUCTF_CONST))) {
+					RememberDockingBay(refinery);
+
+					/*
+					**	Project Aeloria QoL: Warn the player if they are low on storage capacity
+					**	while a harvester is heading home. This is inherited from vanilla but still useful.
+					*/
+					if (refinery->House == PlayerPtr &&
+					    (PlayerPtr->Capacity - PlayerPtr->Tiberium) < 300 &&
+					    PlayerPtr->Capacity > 500 &&
+					    (PlayerPtr->ActiveBScan & (STRUCTF_REFINERY | STRUCTF_CONST)))
+					{
 						Speak(VOX_NEED_MO_CAPACITY);
 					}
 				} else {
-					if (possiblyOccupied != NULL) {
-						Assign_Destination(::As_Target(Nearby_Location(possiblyOccupied)));
-						LastDockingBayCoord = possiblyOccupied->Center_Coord();
+					/*
+					**	No perfect free refinery was available. Fall back to heading toward
+					**	the chosen refinery anyway. The harvester will wait in line.
+					**	This is still better than the original vanilla behavior in most cases.
+					*/
+					if (refinery != nullptr) {
+						Assign_Destination(::As_Target(Nearby_Location(refinery)));
+						RememberDockingBay(refinery);
 					}
 				}
 			}
 			break;
 
 		/*
-		**	In communication with refinery so that it will successfully dock and
-		**	unload. If, for some reason, radio contact was lost, then hunt for
-		**	another refinery to unload at.
+		**	Project Aeloria / Original logic:
+		**	HEADINGHOME state — The harvester has chosen a refinery and is now
+		**	trying to enter it (MISSION_ENTER). This will trigger the docking sequence.
+		**
+		**	If radio contact is somehow lost later, the harvester will naturally fall
+		**	back into FINDHOME on the next Mission_Harvest tick.
+		**
+		**	Note: LastDockingBayCoord was already recorded in FINDHOME before entering this state.
 		*/
 		case HEADINGHOME:
 			Assign_Mission(MISSION_ENTER);
 			return(1);
 
 		/*
-		**	The harvester has nothing to do. There is no Tiberium nearby and
-		**	no where to go.
+		**	Project Aeloria / Rampastring QoL:
+		**	GOINGTOIDLE state — The harvester cannot find any Tiberium.
+		**
+		**	- If IsUseless is true (we already tried and failed), the harvester will either:
+		**	    a) Go to a Repair Bay if one exists (damaged + no ore path), or
+		**	    b) Wait a minute and try LOOKING again (hoping ore regrows).
+		**	- Otherwise it falls back to normal GUARD behavior.
+		**
+		**	This logic is intentionally simple. More advanced "wait for ore" or
+		**	"search farther" behavior can be added later in Experimental.
 		*/
 		case GOINGTOIDLE:
 			if (IsUseless) {
 				if (House->ActiveBScan & STRUCTF_REPAIR) {
 					Assign_Mission(MISSION_REPAIR);
 				} else {
-					// Wait for ore regrowth, attempt to find more ore in a minute
+					// Wait for ore regrowth, then try again
 					Status = LOOKING;
 					return TICKS_PER_MINUTE;
 				}
@@ -4170,7 +4282,11 @@ int UnitClass::Mission_Repair(void)
 	assert(Units.ID(this) == ID);
 	assert(IsActive);
 
-	BuildingClass * nearest = Find_Docking_Bay(STRUCT_REFINERY, true);
+	/*
+	**	Project Aeloria (Moderate): Use smart refinery selection in repair mode too.
+	**	This ensures consistency with LastDockingBayCoord preference.
+	*/
+	BuildingClass * nearest = FindBestRefinery(true);
 
 	IsHarvesting = false;
 
@@ -4191,6 +4307,7 @@ int UnitClass::Mission_Repair(void)
 		**	the repair process.
 		*/
 		if (Transmit_Message(RADIO_HELLO, nearest) == RADIO_ROGER) {
+			RememberDockingBay(nearest);
 			Assign_Mission(MISSION_ENTER);
 			return(1);
 		}

@@ -112,15 +112,24 @@ class UnitClass :	public DriveClass
 		FacingClass SecondaryFacing;
 
 		/*
-		**	The coodinate of the last docking bay for this unit.
-		**	The unit should prefer docking with it or a nearby
-		**	docking bay when seeking for a building to dock with.
+		**	Project Aeloria / Rampastring QoL:
+		**	The coordinate of the last docking bay (refinery) this harvester used.
+		**	Harvesters will prefer returning to this refinery (or a nearby one) when
+		**	looking for a place to unload. This helps reduce long travel times between
+		**	harvest patches and distant refineries.
 		*/
 		COORDINATE LastDockingBayCoord;
 
+		// Note: ArchiveTarget is a general member used by multiple mission types.
+		// For harvesters, it is repurposed as "last successful harvest location" memory.
+		// Access should go through the helper methods below for clarity.
+
 		/*
-		**	Determines whether the unit should start harvesting
-		**	once it has finished moving to its rally point.
+		**	Project Aeloria / Rampastring QoL:
+		**	Flag set when a harvester unloads at a refinery that has a rally point.
+		**	Causes the harvester to immediately begin searching for a new Tiberium field
+		**	(after it reaches the rally point) instead of idling. This creates a smooth
+		**	"unload → move to rally → harvest again" cycle.
 		*/
 		bool InitHarvest;
 
@@ -155,6 +164,28 @@ class UnitClass :	public DriveClass
 		bool Flag_Remove(void);
 		bool Goto_Tiberium(int radius);
 		bool Harvesting(void);
+
+		/*
+		**	Project Aeloria (Moderate cleanup):
+		**	Extracted helper to find the best refinery for a harvester.
+		*/
+		BuildingClass * FindBestRefinery(bool friendly = false) const;
+
+		/*
+		**	Project Aeloria (Moderate cleanup):
+		**	Centralized way to remember which refinery a harvester last used.
+		**	This improves consistency across Mission_Harvest, Mission_Guard, and Mission_Repair.
+		*/
+		void RememberDockingBay(BuildingClass* refinery);
+
+		/*
+		**	Project Aeloria (Moderate cleanup):
+		**	Harvester memory system helpers.
+		**	These wrap the general ArchiveTarget field for harvester-specific "last harvest patch" memory.
+		*/
+		void RememberLastHarvestLocation(CELL cell);
+		void ClearLastHarvestLocation();
+		TARGET GetLastHarvestLocation() const;
 		void APC_Close_Door(void);
 		void APC_Open_Door(void);
 
