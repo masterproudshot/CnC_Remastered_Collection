@@ -910,16 +910,13 @@ class RulesClass {
 		int MinHarvesterQueueJumpDistance;
 
 		/*
-		**	The maximum distance that walls will extend to when produced.
+		**	Project Aeloria / Rampastring QoL:
+		**	Modern chain wall building settings.
+		**	These live under [AeloriaWalls] (with fallback to [MoreQoL]).
 		*/
-		int MaxWallExtensionDistance;
+		int MaxWallExtensionDistance;   // How far a wall chain can extend in one action
+		int WallSellPriceDivisor;       // Prevents money exploits when selling chain-built walls
 
-		/*
-		**	Wall extension does not automatically increase the cost of walls.
-		**	As such, you can actually get multiple wall pieces for the price of one.
-		**	To offset it, a wall's sell price is divided by this.
-		*/
-		int WallSellPriceDivisor;
 
 		/*
 		**	Should repair facilities automatically kick

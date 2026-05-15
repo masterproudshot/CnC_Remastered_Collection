@@ -393,6 +393,7 @@ bool RulesClass::General(CCINIClass & ini)
 	static char const * const MOREQOL = "MoreQoL";
 	static char const * const AELORIA_HARVESTERS = "AeloriaHarvesters";
 	static char const * const AELORIA_RALLYPOINTS = "AeloriaRallyPoints";
+	static char const * const AELORIA_WALLS = "AeloriaWalls";
 
 	if(ini.Is_Present(AFTERMATH)) {
 //debugprint( "NewUnitsEnabled previously %i\n", NewUnitsEnabled );
@@ -442,6 +443,14 @@ bool RulesClass::General(CCINIClass & ini)
 		const char* section = ini.Is_Present(AELORIA_RALLYPOINTS) ? AELORIA_RALLYPOINTS : MOREQOL;
 
 		RallyPointsEnabled = ini.Get_Int(section, "RallyPointsEnabled", RallyPointsEnabled);
+	}
+
+	// Project Aeloria: Wall Building settings
+	if (ini.Is_Present(AELORIA_WALLS) || ini.Is_Present(MOREQOL)) {
+		const char* section = ini.Is_Present(AELORIA_WALLS) ? AELORIA_WALLS : MOREQOL;
+
+		MaxWallExtensionDistance = ini.Get_Int(section, "MaxWallExtensionDistance", MaxWallExtensionDistance);
+		WallSellPriceDivisor = ini.Get_Int(section, "WallSellPriceDivisor", WallSellPriceDivisor);
 	}
 
 	if (ini.Is_Present(GENERAL)) {

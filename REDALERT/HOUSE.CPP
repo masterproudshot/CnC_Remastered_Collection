@@ -3273,33 +3273,32 @@ bool HouseClass::Place_Object(RTTIType type, CELL cell)
  *=============================================================================================*/
 bool HouseClass::Extend_Wall(OverlayTypeClass const& wall, HousesType house, CELL cell, DirType dir, int step)
 {
-	// Step in the requested direction and abort if it is outside the map
+	// Move one step in the chosen direction
 	CELL adjacent = Adjacent_Cell(cell, dir);
+
+	// Stop if we go off the map
 	if (!Map.In_Radar(adjacent))
 		return false;
 
-	// Check whether the cell contains a connectable wall
+	// If there's already the same wall type here, we're connected — success
 	OverlayType overlay = Map[adjacent].Overlay;
 	if (overlay == wall.Type)
 		return true;
 
-	// Cell is blocked by something else
+	// If the cell is blocked, we can't build here
 	if (!Map[adjacent].Is_Clear_To_Build())
 		return false;
 
-	// Cell does not contain a connectable wall. Does the next?
+	// Recursively check if we can extend further
 	if (step > 1 && Extend_Wall(wall, house, adjacent, dir, step - 1))
 	{
-		// The next cell does indeed have a wall
-		// Place our new connector and tell the caller that there is now a new connectable wall
+		// We can connect — place the wall
 		if (wall.Create_And_Place(adjacent, house))
 		{
-			// Set the owner so players can sell line-built walls
-			// For some reason Create_And_Place does not do this for us
+			// Manually set owner so the player can sell the wall later
 			Map[adjacent].Owner = house;
 			return true;
 		}
-
 		return true;
 	}
 
