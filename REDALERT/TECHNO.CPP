@@ -159,7 +159,7 @@ const char* NewName[] = {
 	"Scout Ant",	  			"Kundschafter-Ameise",
 	"Warrior Ant",    		"Krieger-Ameise",
 	"Fire Ant",	  				"Feuer-Ameise",
-	"Queen Ant",	  			"Ameisenk”nigin",
+	"Queen Ant",	  			"Ameisenkï¿½nigin",
 	"ATS",						"Angriffs-U-Boot",
 	"Tesla Tank",	  			"Telsapanzer",
 	"Volkov",  					"Modell Volkov",
@@ -175,7 +175,7 @@ const char* NewName[] = {
 #ifdef FRENCH
 const char* NewName[] = {
 	"Scout Ant",	  			"Fourmi de Reconnaissance",
-	"Warrior Ant",    		"Fourmi GuerriŠre",
+	"Warrior Ant",    		"Fourmi Guerriï¿½re",
 	"Fire Ant",	  				"Fourmi Lance-Flammes",
 	"Queen Ant",	  			"Reine des Fourmis",
 	"ATS", 						"SMTA",
@@ -183,9 +183,9 @@ const char* NewName[] = {
 	"Volkov",  					"Volkov",
 	"Chitzkoi", 				"Cyber-Chien",
 	"Stavros",					"Stavros",
-	"F-A Longbow",				"HAA (H‚licoptŠre d'Assaut Avanc‚)",
-	"Civilian Specialist",	"Sp‚cialiste Civil",
-	"Alloy Facility",			"Usine M‚tallurgique",
+	"F-A Longbow",				"HAA (Hï¿½licoptï¿½re d'Assaut Avancï¿½)",
+	"Civilian Specialist",	"Spï¿½cialiste Civil",
+	"Alloy Facility",			"Usine Mï¿½tallurgique",
 	NULL,
 	};
 
@@ -3457,7 +3457,13 @@ void TechnoClass::Player_Assign_Mission(MissionType mission, TARGET target, TARG
 		if (PlayerPtr && House) {
 			if (PlayerPtr == House) {
 				if (mission == MISSION_MOVE && PlayerPtr->IsQueuedMovementToggle) {
-					mission = MISSION_QMOVE;
+
+					// Project Aeloria: Respect AirQMoveAllowed setting
+					if (What_Am_I() == RTTI_AIRCRAFT && !Rule.AirQMoveAllowed) {
+						// Air Q-Move is disabled in config â€” treat as normal move
+					} else {
+						mission = MISSION_QMOVE;
+					}
 				}
 			}
 		}

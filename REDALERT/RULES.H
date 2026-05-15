@@ -911,6 +911,14 @@ class RulesClass {
 
 		/*
 		**	Project Aeloria / Rampastring QoL:
+		**	Q-Move (Queue Move) settings. These live under [AeloriaQMove].
+		*/
+		int QmoveLoopsAllowed;     // Allow units to loop queued move orders
+		int AirQMoveAllowed;       // Allow air units to use Q-Move
+		int AirQRecallAllowed;     // Allow recalling air units with Q-Move?
+
+		/*
+		**	Project Aeloria / Rampastring QoL:
 		**	Modern chain wall building settings.
 		**	These live under [AeloriaWalls] (with fallback to [MoreQoL]).
 		*/

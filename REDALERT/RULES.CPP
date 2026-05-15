@@ -272,6 +272,11 @@ RulesClass::RulesClass(void) :
 	ResourceBarDisplayMode(RB_SELECTED),
 	MaxFreeRefineryDistanceBias(10),
 	MinHarvesterQueueJumpDistance(7),
+
+		// Q-Move settings (Project Aeloria)
+		QmoveLoopsAllowed(1),
+		AirQMoveAllowed(1),
+		AirQRecallAllowed(1),
 	MaxWallExtensionDistance(4),
 	WallSellPriceDivisor(3),
 	AutoRepairFacilityKickOut(true),
@@ -394,6 +399,7 @@ bool RulesClass::General(CCINIClass & ini)
 	static char const * const AELORIA_HARVESTERS = "AeloriaHarvesters";
 	static char const * const AELORIA_RALLYPOINTS = "AeloriaRallyPoints";
 	static char const * const AELORIA_WALLS = "AeloriaWalls";
+	static char const * const AELORIA_QMOVE = "AeloriaQMove";
 
 	if(ini.Is_Present(AFTERMATH)) {
 //debugprint( "NewUnitsEnabled previously %i\n", NewUnitsEnabled );
@@ -451,6 +457,15 @@ bool RulesClass::General(CCINIClass & ini)
 
 		MaxWallExtensionDistance = ini.Get_Int(section, "MaxWallExtensionDistance", MaxWallExtensionDistance);
 		WallSellPriceDivisor = ini.Get_Int(section, "WallSellPriceDivisor", WallSellPriceDivisor);
+	}
+
+	// Project Aeloria: Q-Move settings
+	if (ini.Is_Present(AELORIA_QMOVE) || ini.Is_Present(MOREQOL)) {
+		const char* section = ini.Is_Present(AELORIA_QMOVE) ? AELORIA_QMOVE : MOREQOL;
+
+		QmoveLoopsAllowed  = ini.Get_Int(section, "QmoveLoopsAllowed", QmoveLoopsAllowed);
+		AirQMoveAllowed    = ini.Get_Int(section, "AirQMoveAllowed", AirQMoveAllowed);
+		AirQRecallAllowed  = ini.Get_Int(section, "AirQRecallAllowed", AirQRecallAllowed);
 	}
 
 	if (ini.Is_Present(GENERAL)) {
