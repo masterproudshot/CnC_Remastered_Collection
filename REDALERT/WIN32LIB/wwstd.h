@@ -45,11 +45,15 @@
 #endif // _WIN32
 #define WIN32 1
 #define WIN32_LEAN_AND_MEAN
+#define WINDOWS_IGNORE_PACKING_MISMATCH
 #include <windows.h>
 #include <windowsx.h>
+#undef WINDOWS_IGNORE_PACKING_MISMATCH
 #else
+#define WINDOWS_IGNORE_PACKING_MISMATCH
 #include <windows.h>
 #include <windowsx.h>
+#undef WINDOWS_IGNORE_PACKING_MISMATCH
 #endif
 
 // Note: SKB 4/11/94
@@ -253,7 +257,7 @@ typedef int bool;
 
 
 // Inline Routines
-//ÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍ
+//ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
 //
 // These Template functions are generally used
 // by classes when they havce over loaded > and <.
