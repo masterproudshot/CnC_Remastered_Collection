@@ -909,6 +909,9 @@ class RulesClass {
 		*/
 		int MinHarvesterQueueJumpDistance;
 
+		// Project Aeloria
+		int RallyPointsEnabled;
+
 		/*
 		**	Project Aeloria / Rampastring QoL:
 		**	Q-Move (Queue Move) settings. These live under [AeloriaQMove].

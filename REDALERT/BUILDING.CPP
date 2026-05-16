@@ -402,7 +402,7 @@ RadioMessageType BuildingClass::Receive_Message(RadioClass * from, RadioMessageT
 			TechnoClass::Receive_Message(from, message, param);
 
 			if (HasRallyPoint()) {
-				SendUnitToRallyPoint(from);
+				SendUnitToRallyPoint(static_cast<TechnoClass*>(from));
 				return RADIO_ROGER;
 			}
 

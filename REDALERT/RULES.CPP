@@ -273,6 +273,9 @@ RulesClass::RulesClass(void) :
 	MaxFreeRefineryDistanceBias(10),
 	MinHarvesterQueueJumpDistance(7),
 
+		// Project Aeloria
+		RallyPointsEnabled(1),
+
 		// Q-Move settings (Project Aeloria)
 		QmoveLoopsAllowed(1),
 		AirQMoveAllowed(1),

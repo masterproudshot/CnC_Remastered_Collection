@@ -52,4 +52,7 @@ char Dipthong[16][8]={
 	{'l','e','o','i','r','a','t','p'},
 	{'e','a','o','i','p',' ','b','m'},
 };
-
+
+// Note: This file contains legacy binary data. Warnings are suppressed to allow compilation in modern Visual Studio.
+#pragma warning(disable: 4819)  // character encoding warning
+#pragma warning(disable: 4996)  // deprecated function warning
