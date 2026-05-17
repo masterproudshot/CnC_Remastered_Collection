@@ -1274,6 +1274,31 @@ void CellClass::Draw_It(int x, int y, bool objects) const
 		}
 
 		/*
+		**	Early-out if the Class pointer is not yet valid (can happen very early
+		**	during scenario load before TypeClasses are fully constructed).
+		**	This is the second line of defense inside CellClass::Draw_It (the main
+		**	caller that iterates cell objects and invokes their Draw_It methods).
+		**	The per-class guards in the object Draw_It implementations are primary.
+		**	Pruning here also protects Sort_Y() calls (and Visual_Character etc)
+		**	on partially-constructed objects for all drawable types with a Class member
+		**	(Aircraft/Building/Infantry/Unit/Vessel/Terrain/Anim/Bullet).
+		*/
+		for (int i = optr.Count() - 1; i >= 0; i--) {
+			ObjectClass * o = optr[i];
+			switch (o->What_Am_I()) {
+				case RTTI_AIRCRAFT: if (!Is_Drawable((AircraftClass*)o)) optr.Delete(i); break;
+				case RTTI_BUILDING: if (!Is_Drawable((BuildingClass*)o)) optr.Delete(i); break;
+				case RTTI_INFANTRY: if (!Is_Drawable((InfantryClass*)o)) optr.Delete(i); break;
+				case RTTI_UNIT: if (!Is_Drawable((UnitClass*)o)) optr.Delete(i); break;
+				case RTTI_VESSEL: if (!Is_Drawable((VesselClass*)o)) optr.Delete(i); break;
+				case RTTI_TERRAIN: if (!Is_Drawable((TerrainClass*)o)) optr.Delete(i); break;
+				case RTTI_ANIM:   if (!Is_Drawable((AnimClass*)o))   optr.Delete(i); break;
+				case RTTI_BULLET: if (!Is_Drawable((BulletClass*)o)) optr.Delete(i); break;
+				default: break;
+			}
+		}
+
+		/*
 		**	Sort the object list so that objects will be drawn from
 		**	back to front.
 		*/

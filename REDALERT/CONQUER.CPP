@@ -3433,6 +3433,27 @@ extern void DLL_Draw_Line_Intercept(int x, int y, int x1, int y1, unsigned char 
 
 void CC_Draw_Shape(const ObjectClass *object, void const * shapefile, int shapenum, int x, int y, WindowNumberType window, ShapeFlags_Type flags, void const * fadingdata, void const * ghostdata, DirType rotation, long virtualscale, int width, int height)
 {
+	if (object) {
+		// Build 1 diagnostic: log the object and the value at the runtime +8 offset the user has been observing
+		uintptr_t at_plus_8 = *(uintptr_t*)((const char*)object + 8);
+		Aeloria_Debug_Log("CC_Draw_Shape got Object this=%p RTTI=%d at+8=0x%08lx",
+		                  (void*)object, object->What_Am_I(), (unsigned long)at_plus_8);
+
+		/*
+		**	Project Aeloria â€” TEMPORARY BAND-AID (belt-and-suspenders at the actual crash site)
+		**	Even if Class_Is_Valid() let something through, we refuse to call the blitter
+		**	with a garbage effective pointer. This is the last line of defense before
+		**	Buffer_Frame_To_Page / the C# interop path.
+		**
+		**	See Is_Plausible_Class_Pointer in OBJECT.H and plan.md Expert Panel section.
+		*/
+		if (!Is_Plausible_Class_Pointer(at_plus_8)) {
+			Aeloria_Debug_Log("REJECTED at CC_Draw_Shape (last-line defense) this=%p RTTI=%d at+8=0x%08lx",
+			                  (void*)object, object->What_Am_I(), (unsigned long)at_plus_8);
+			return;   // Do not draw â€” prevents the 0xC0000005 that used to occur here
+		}
+	}
+
 	if (window == WINDOW_VIRTUAL) {
 		if (width == 0) width = Get_Build_Frame_Width(shapefile);
 		if (height == 0) height = Get_Build_Frame_Height(shapefile);
@@ -3445,6 +3466,26 @@ void CC_Draw_Shape(const ObjectClass *object, void const * shapefile, int shapen
 
 void CC_Draw_Shape(const ObjectClass *object, const char *shape_file_name, void const * shapefile, int shapenum, int x, int y, WindowNumberType window, ShapeFlags_Type flags, void const * fadingdata, void const * ghostdata, DirType rotation, long virtualscale, char override_owner)
 {
+	if (object) {
+		uintptr_t at_plus_8 = *(uintptr_t*)((const char*)object + 8);
+		Aeloria_Debug_Log("CC_Draw_Shape got Object this=%p RTTI=%d at+8=0x%08lx (name overload)",
+		                  (void*)object, object->What_Am_I(), (unsigned long)at_plus_8);
+
+		/*
+		**	Project Aeloria â€” TEMPORARY BAND-AID (belt-and-suspenders at the actual crash site)
+		**	Even if Class_Is_Valid() let something through, we refuse to call the blitter
+		**	with a garbage effective pointer. This is the last line of defense before
+		**	Buffer_Frame_To_Page / the C# interop path.
+		**
+		**	See Is_Plausible_Class_Pointer in OBJECT.H and plan.md Expert Panel section.
+		*/
+		if (!Is_Plausible_Class_Pointer(at_plus_8)) {
+			Aeloria_Debug_Log("REJECTED at CC_Draw_Shape (last-line defense) this=%p RTTI=%d at+8=0x%08lx",
+			                  (void*)object, object->What_Am_I(), (unsigned long)at_plus_8);
+			return;   // Do not draw â€” prevents the 0xC0000005 that used to occur here
+		}
+	}
+
 	if (window == WINDOW_VIRTUAL) {
 		int width = Get_Build_Frame_Width(shapefile);
 		int height = Get_Build_Frame_Height(shapefile);
@@ -3639,7 +3680,16 @@ void CC_Draw_Shape(void const * shapefile, int shapenum, int x, int y, WindowNum
 
 			if (draw_window.Lock()) {
 				if ((flags & (SHAPE_GHOST|SHAPE_FADING)) == (SHAPE_GHOST|SHAPE_FADING)) {
-					Buffer_Frame_To_Page(x, y, width, height, buffer, draw_window, flags | SHAPE_TRANS, ghostdata, fadingdata, 1, predoffset);
+					// Defensive: ensure ghost/fading data and buffer are valid before calling
+					// the blitter which may dereference the source pointer.
+					const void *gd = ghostdata ? ghostdata : DisplayClass::SpecialGhost;
+					const void *fd = fadingdata ? fadingdata : DisplayClass::FadingShade;
+
+					if (gd != nullptr && fd != nullptr && buffer != nullptr) {
+						Buffer_Frame_To_Page(x, y, width, height, buffer, draw_window, flags | SHAPE_TRANS, gd, fd, 1, predoffset);
+					} else {
+						// Invalid data: skip ghost+fade path to avoid access violation.
+					}
 				} else {
 					if (flags & SHAPE_FADING) {
 						Buffer_Frame_To_Page(x, y, width, height, buffer, draw_window, flags | SHAPE_TRANS, fadingdata, 1, predoffset);
@@ -4700,7 +4750,7 @@ bool Force_CD_Available( int cd_desired )				//	ajw
 			if( cd_desired == CD_DVD )
 			{
 				#ifdef FRENCH
-			   	sprintf(buffer, "InsŠrez le %s",  _cd_name[4]);
+			   	sprintf(buffer, "Insï¿½rez le %s",  _cd_name[4]);
 				#else
 				#ifdef GERMAN
 				sprintf(buffer, "Bitte %s",  _cd_name[4]);
@@ -4712,7 +4762,7 @@ bool Force_CD_Available( int cd_desired )				//	ajw
 			else if( cd_desired == CD_COUNTERSTRIKE || cd_desired == CD_AFTERMATH )
 			{
 				#ifdef FRENCH
-			   	sprintf(buffer, "InsŠrez le %s",  _cd_name[cd_desired]);
+			   	sprintf(buffer, "Insï¿½rez le %s",  _cd_name[cd_desired]);
 				#else
 				#ifdef GERMAN
 				sprintf(buffer, "Bitte %s",  _cd_name[cd_desired]);
@@ -5096,7 +5146,7 @@ bool Force_CD_Available(int cd)
 			#endif
 
 				#ifdef FRENCH
-			   	sprintf(buffer, "InsŠrez le %s",  _cd_name[cd]);
+			   	sprintf(buffer, "Insï¿½rez le %s",  _cd_name[cd]);
 				#else
 				#ifdef GERMAN
 				sprintf(buffer, "Bitte %s",  _cd_name[cd]);
@@ -5109,7 +5159,7 @@ bool Force_CD_Available(int cd)
 				{
 				#ifdef DVD
 				#ifdef FRENCH
-			   	sprintf(buffer, "InsŠrez le %s", _cd_name[4]);
+			   	sprintf(buffer, "Insï¿½rez le %s", _cd_name[4]);
 				#else
 				#ifdef GERMAN 
 				sprintf(buffer, "Bitte %s", _cd_name[4]);

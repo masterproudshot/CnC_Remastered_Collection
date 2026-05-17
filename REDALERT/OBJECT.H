@@ -160,6 +160,7 @@ class ObjectClass : public AbstractClass
 		bool Is_Techno(void) const {return(RTTI == RTTI_BUILDING || RTTI == RTTI_UNIT || RTTI == RTTI_INFANTRY || RTTI == RTTI_VESSEL || RTTI == RTTI_AIRCRAFT);};
 		virtual int Get_Ownable(void) const;
 		virtual ObjectTypeClass const & Class_Of(void) const = 0;
+		virtual bool Class_Is_Valid(void) const { return false; }
 		virtual char const * Name(void) const;
 		virtual int Full_Name(void) const;
 		virtual bool Can_Repair(void) const;
@@ -270,5 +271,78 @@ class ObjectClass : public AbstractClass
 		enum {FLIGHT_LEVEL=256};
 
 };
+
+/*
+**	Project Aeloria — TEMPORARY BAND-AID for early-lifecycle object corruption (ScenarioInit window)
+**
+**	After the 2026 packing/ODR fix, some objects (Terrain Raw=15, Units, etc.) are still reaching
+**	the first Map.Render() with a plausible declared Class.Raw() but garbage at the runtime offset
+**	the drawing code actually dereferences (+8 from most-derived this, observed as 0x00210000,
+**	0x80738000, other 0x80xxxxxx / 0x81xxxxxx patterns).
+**
+**	This cheap predicate is the evidence-based filter extracted from live debug data.
+**	It is intentionally placed in OBJECT.H so it can be shared by:
+**	  - All 8 Class_Is_Valid() overrides
+**	  - The two CC_Draw_Shape(ObjectClass*) entry points (last-line defense)
+**	  - Future creation-time or Cell pruning checks
+**
+**	High-byte rejection (0x00/0x80/0x81) + basic alignment covers every crash pattern seen
+**	in the Aeloria_Debug.log and debugger watches as of 2026-05-17.
+**
+**	THIS IS A TEMPORARY MITIGATION, NOT A ROOT-CAUSE FIX.
+**	The real problem is that the drawing pipeline (and C#/interop blitter path) still assumes
+**	a legacy memory layout for the Class pointer inside instance objects during the narrow
+**	"objects placed but not fully initialized" window after CNC_Start_Instance_Variation.
+**
+**	When the root cause is finally addressed (consistent layout, epoch flag, or moving the
+**	effective pointer read), delete this helper and all call sites. Leave the band-aid comments
+**	in the git history as documentation of the post-packing symptom.
+**
+**	See plan.md "Expert Panel Review" section (May 2026) for the full rationale from the
+**	4-expert panel (Low-Level/ABI, C++ Legacy, Game Systems, QE).
+*/
+inline bool Is_Plausible_Class_Pointer(uintptr_t ptr)
+{
+	if (ptr == 0) return false;
+
+	// Reject the exact garbage patterns observed in every crash session:
+	//   0x00210000 family (low values)
+	//   0x8073xxxx / 0x80xxxxxx / 0x81xxxxxx (high-byte sentinels)
+	unsigned char high = (unsigned char)((ptr >> 24) & 0xFF);
+	if (high == 0x00 || high == 0x80 || high == 0x81) return false;
+
+	// Basic alignment sanity (TypeClass* should be at least 4-byte aligned on Win32)
+	if ((ptr & 0x3) != 0) return false;
+
+	return true;
+}
+
+/*
+**	Project Aeloria (Draw Guard helper):
+**	Centralized minimal helper to reduce duplication of the `if (!Class.Is_Valid()) return;`
+**	early-outs across Draw_It() implementations (and potentially other drawing paths).
+**	Implemented as a templated free function in the ObjectClass header (most general location)
+**	because the 'Class' CCPtr member is declared only in the concrete derived classes
+**	(e.g. UnitClass, TerrainClass). The template is instantiated with the concrete type at
+**	the call site (inside each Draw_It), providing direct access to its Class and inherited
+**	Get_Image_Data(). Combines both the Class and image validity checks per the suggested
+**	signature. Uses Is_ prefix per project STYLE.H convention for boolean queries.
+**	Placed here (not TechnoClass) for full coverage including TerrainClass.
+*/
+template<class T>
+inline bool Is_Drawable(const T * obj)
+{
+	if (!obj) return false;
+
+	// Delegate all validity logic to the object itself.
+	// Each class that has a Class member implements Class_Is_Valid()
+	// with the appropriate checks (ID > 0, pointer sanity, TypeClass fields, etc.).
+	if (!obj->Class_Is_Valid()) return false;
+
+	// Safe to call Get_Image_Data() now
+	if (obj->Get_Image_Data() == NULL) return false;
+
+	return true;
+}
 
 #endif

@@ -89,6 +89,29 @@ class AnimClass : public ObjectClass, public StageClass {
 		virtual COORDINATE Sort_Y(void) const;
 		virtual LayerType In_Which_Layer(void) const;
 		virtual ObjectTypeClass const & Class_Of(void) const {return *Class;};
+		bool Class_Is_Valid(void) const override {
+			if (!Class.Is_Valid() || Class.Raw() <= 0) return false;
+			const AnimTypeClass* t = Class;
+			if (!t) return false;
+			if (t->RTTI != RTTI_ANIMTYPE || t->MaxStrength <= 0) return false;
+
+			/*
+			**	Project Aeloria — TEMPORARY BAND-AID (see Is_Plausible_Class_Pointer in OBJECT.H
+			**	and the full "Expert Panel Review" section in plan.md for rationale).
+			**	This replaces the weaker range check that let 0x80738000 and similar through.
+			*/
+			uintptr_t effective = *(uintptr_t*)((const char*)this + 8);
+			if (!Is_Plausible_Class_Pointer(effective)) {
+				// Safe direct output (Aeloria_Debug_Log not visible from this header)
+				char _buf[160];
+				sprintf(_buf, "REJECTED Class_Is_Valid this=%p RTTI=%d Class.Raw=%d at+8=0x%08X\r\n",
+				        this, What_Am_I(), Class.Raw(), (unsigned)effective);
+				OutputDebugStringA(_buf);
+				return false;
+			}
+
+			return true;
+		}
 		virtual short const * Occupy_List(bool = false) const;
 		virtual short const * Overlap_List(void) const;
 		virtual void Draw_It(int x, int y, WindowNumberType window) const;

@@ -1098,6 +1098,12 @@ void TechnoClass::Draw_It(int x, int y, WindowNumberType window) const
 	assert(IsActive);
 
 	/*
+	**	Early-out if the Class pointer is not yet valid (can happen very early
+	**	during scenario load before TypeClasses are fully constructed).
+	*/
+	if (!Is_Drawable(this)) return;
+
+	/*
 	**	Tells the door logic that it has been drawn.
 	*/
 	((TechnoClass *)this)->Clear_Redraw_Flag();
