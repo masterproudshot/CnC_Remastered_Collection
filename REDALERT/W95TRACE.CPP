@@ -18,7 +18,7 @@
     Implementation of Win95 tracing facility to mimic that of NT
 */
 
-#include <windows.h>
+#include "Win32Lib/win32_windows.h"
 #include <stdio.h>
 #include <stdarg.h>
 #include <process.h>

@@ -18,7 +18,7 @@
 
 #include "connmgr.h"
 #include "mplayer.h"
-#include <windows.h>
+#include "Win32Lib/win32_windows.h"
 
 // maximum number of connections
 #define CONNECT_MAX    7

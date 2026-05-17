@@ -27,7 +27,7 @@ extern "C" {
 #include <assert.h>
 }
 
-#include <windows.h>
+#include "Win32Lib/win32_windows.h"
 
 #define     STATUS_OK    1
 #define     STATUS_BAD   0

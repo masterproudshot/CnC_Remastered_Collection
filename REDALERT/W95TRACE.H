@@ -22,7 +22,7 @@
 #ifndef __TRACEW95__
 #define __TRACEW95__
 
-#include <windows.h>
+#include "Win32Lib/win32_windows.h"
 
 // redefine all the MFC macros to point to us
 

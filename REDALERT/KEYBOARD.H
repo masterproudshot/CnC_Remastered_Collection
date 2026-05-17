@@ -33,7 +33,7 @@
 #ifndef KEYBOARD_H
 #define KEYBOARD_H
 
-#include	<windows.h>
+#include "Win32Lib/win32_windows.h"
 
 /*
 **	The "bool" integral type was defined by the C++ comittee in

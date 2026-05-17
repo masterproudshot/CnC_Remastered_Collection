@@ -42,6 +42,24 @@ class MapEditClass;
 class HouseClass;
 class WeaponTypeClass;
 
+/*
+** Project Aeloria / Pack Guard
+**
+** The entire *TypeClass hierarchy (and several other core game structs) must have
+** exactly 1-byte packing for binary compatibility with original savegames, scenario
+** files, and the multiplayer protocol. The 1990s code shipped its C++ object layouts
+** as the on-disk / on-wire format.
+**
+** Modern VS + Windows SDK + the project's /Zp1 setting triggers winnt.h static_asserts
+** unless WINDOWS_IGNORE_PACKING_MISMATCH is defined. Previous attempts to scope that
+** macro (Forced Include, per-FUNCTION.H define/undef, etc.) still produced layout
+** corruption in UnitTypeClass etc. because of leaky absolute #pragma pack statements
+** in the audio/Win32Lib layer and non-uniform include order.
+**
+** Therefore we now make the required packing EXPLICIT and LOCAL around the data that
+** actually participates in serialization. This is the only robust, future-proof fix.
+*/
+#pragma pack(push, 1)
 
 /***************************************************************************
 **	This is the abstract type class. It holds information common to all
@@ -2058,6 +2076,8 @@ class SmudgeTypeClass : public ObjectTypeClass
 		virtual void Display(int x, int y, WindowNumberType window, HousesType house=HOUSE_NONE) const;
 		#endif
 };
+
+#pragma pack(pop)
 
 #endif
 

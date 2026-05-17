@@ -34,7 +34,7 @@
 
 #include <stddef.h>
 
-#pragma pack(4)
+#pragma pack(push, 4)	// Project Aeloria: converted leaky absolute pack to balanced push/pop to protect TypeClass layout
 extern   WORD     _sosDIGIData_Start;
 extern   WORD     _sosDIGIData_End;
 extern   WORD     _wSOSDriverLinear[];
@@ -119,7 +119,7 @@ extern   WORD  wDetectParam;
 }
 #endif
 
-#pragma pack()
+#pragma pack(pop)	// Project Aeloria: converted leaky absolute pack to balanced push/pop to protect TypeClass layout
 
 #endif
 

@@ -32,7 +32,7 @@
 #ifndef  _SOS_FUNCTIONS
 #define  _SOS_FUNCTIONS
 
-#pragma pack(4)
+#pragma pack(push, 4)	// Project Aeloria: converted leaky absolute pack to balanced push/pop to protect TypeClass layout
 
 WORD sosDIGILockMemory          (  VOID  );
 WORD sosDIGIUnLockMemory        (  VOID  );
@@ -210,7 +210,7 @@ VOID  sosDIGILoad_End( VOID );
 VOID  sosDIGICntl_Start( VOID );
 VOID  sosDIGICntl_End( VOID );
 
-#pragma pack()
+#pragma pack(pop)	// Project Aeloria: converted leaky absolute pack to balanced push/pop to protect TypeClass layout
 
 #endif
 

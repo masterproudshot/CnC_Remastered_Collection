@@ -37,7 +37,7 @@
 #include	"..\wwflat32\include\keyboard.h"
 #else
 
-#include	<windows.h>
+#include "Win32Lib/win32_windows.h"
 
 /*
 **	The "bool" integral type was defined by the C++ comittee in

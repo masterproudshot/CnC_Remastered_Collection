@@ -13,6 +13,17 @@
 // GNU General Public License along with permitted additional restrictions 
 // with this program. If not, see https://github.com/electronicarts/CnC_Remastered_Collection
 
+// Project Aeloria: Define at the absolute top of FUNCTION.H so it is active for every
+// translation unit before any #include (STL headers, other system headers, etc. can
+// transitively pull in windows.h). We #undef right after the actual windows.h include.
+// Use an idempotent guard so repeated inclusion or other headers won't redefine this.
+#ifndef __WINDOWS_IGNORE_PACKING_MISMATCH_DEFINED_HERE
+#define __WINDOWS_IGNORE_PACKING_MISMATCH_DEFINED_HERE 1
+#ifndef WINDOWS_IGNORE_PACKING_MISMATCH
+#define WINDOWS_IGNORE_PACKING_MISMATCH
+#endif
+#endif
+
 /* $Header: /CounterStrike/FUNCTION.H 2     3/13/97 2:05p Steve_tall $*/
 /***********************************************************************************************
  ***              C O N F I D E N T I A L  ---  W E S T W O O D  S T U D I O S               ***
@@ -124,13 +135,7 @@ UnitTypeClass      �   BuildingTypeClass      �  VesselTypeClass
 
 #ifdef WIN32
 //#define WIN32_LEAN_AND_MEAN
-// Project Aeloria: Scope the packing mismatch workaround ONLY to the Windows headers.
-// Defining this globally (e.g. via vcxproj) corrupts layout of game structs like UnitTypeClass.
-// We define it immediately before windows.h and undef immediately after so winnt.h's static
-// assert is satisfied, but game classes retain their expected #pragma pack(1) layouts.
-#define WINDOWS_IGNORE_PACKING_MISMATCH
-#include	<windows.h>
-#undef WINDOWS_IGNORE_PACKING_MISMATCH
+#include "Win32Lib/win32_windows.h"
 #define WWFILE_H
 #define RAWFILE_H
 #define MONOC_H
@@ -1085,6 +1090,13 @@ extern DynamicVectorClass<EgoClass *> whatever;
 ** Debug output. ST - 6/27/2019 10:00PM
 */
 void GlyphX_Debug_Print(const char *debug_text);
+
+/*
+** Project Aeloria diagnostic logging (guaranteed visibility during crashing early loads).
+** Writes with immediate fflush to a plain text file the user can tail in Notepad++.
+** Also forwards to GlyphX + OutputDebugStringA.
+*/
+void Aeloria_Debug_Log(const char *fmt, ...);
 
 void Disable_Uncompressed_Shapes (void);
 void Enable_Uncompressed_Shapes (void);

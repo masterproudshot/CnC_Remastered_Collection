@@ -33,7 +33,7 @@
 #define  _SOS_DEFINED
 #include "sosdefs.h"
 
-#pragma pack(4)
+#pragma pack(push, 4)	// Project Aeloria: converted leaky absolute pack to balanced push/pop to protect TypeClass layout
 
 // error definition for sound operating system
 #define  _SOS_ERR          -1
@@ -528,11 +528,11 @@ enum
 // define for special 18.2 callback rate to dos
 #define  _TIMER_DOS_RATE   0xff00
 
-#pragma pack()
+#pragma pack(pop)	// Project Aeloria: converted leaky absolute pack to balanced push/pop to protect TypeClass layout
 
 #pragma aux int_3 = "int 3"
 
-#pragma pack( 1 )
+#pragma pack(push, 1)	// Project Aeloria: converted leaky absolute pack to balanced push/pop to protect TypeClass layout
 typedef struct
 {
 	unsigned       region_size;
@@ -554,7 +554,7 @@ typedef struct
 
 } VDS_STRUCT;
 
-#pragma pack()
+#pragma pack(pop)	// Project Aeloria: converted leaky absolute pack to balanced push/pop to protect TypeClass layout
 
 #include "sosdata.h"
 #include "sosfnct.h"

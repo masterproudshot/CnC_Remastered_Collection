@@ -44,7 +44,7 @@
 //*******************************************************************
 #if (0) // ST - 5/8/2019
 
-#include <windows.h>
+#include "Win32Lib/win32_windows.h"
 #include <string.h>
 #include <stdio.h>
 #include <math.h>

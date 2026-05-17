@@ -45,16 +45,8 @@
 #endif // _WIN32
 #define WIN32 1
 #define WIN32_LEAN_AND_MEAN
-#define WINDOWS_IGNORE_PACKING_MISMATCH
-#include <windows.h>
-#include <windowsx.h>
-#undef WINDOWS_IGNORE_PACKING_MISMATCH
-#else
-#define WINDOWS_IGNORE_PACKING_MISMATCH
-#include <windows.h>
-#include <windowsx.h>
-#undef WINDOWS_IGNORE_PACKING_MISMATCH
 #endif
+#include "win32_windows.h"
 
 // Note: SKB 4/11/94
 // Before this library is done, this needs to be able to be set to TRUE.

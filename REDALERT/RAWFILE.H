@@ -45,7 +45,7 @@
 #include	<stdlib.h>
 
 #ifdef WIN32
-#include	<windows.h>
+#include "Win32Lib/win32_windows.h"
 
 #define	NULL_HANDLE		INVALID_HANDLE_VALUE
 #define	HANDLE_TYPE		HANDLE

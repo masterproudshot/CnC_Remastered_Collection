@@ -56,7 +56,7 @@
 //**********************************************************************
 #if (0) // ST - 5/8/2019
 /* header files */
-#include <windows.h>
+#include "Win32Lib/win32_windows.h"
 #include <assert.h>
 #include "dibapi.h"
 #include "dibutil.h"

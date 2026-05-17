@@ -38,9 +38,24 @@
 #ifndef _WIN32 // Denzil 6/2/98 Watcom 11.0 complains without this check
 #define _WIN32
 #endif // _WIN32
-#include <windows.h>
+#include "win32_windows.h"
 #include <windowsx.h>
+
+// ddraw.h internally #includes <windows.h> (and winnt.h under the hood).
+// We must define WINDOWS_IGNORE_PACKING_MISMATCH immediately before
+// #include <ddraw.h> to suppress the SDK's C2338 static_assert (triggered
+// by /Zp1 packing + modern WinSDK). win32_windows.h is the sole source
+// of truth for defining/undefining this macro for the entire REDALERT tree.
+
+#ifndef WINDOWS_IGNORE_PACKING_MISMATCH
+#define WINDOWS_IGNORE_PACKING_MISMATCH
+#define __WINDOWS_IGNORE_PACKING_MISMATCH_DEFINED_HERE 1
+#endif
 #include <ddraw.h>
+#if defined(__WINDOWS_IGNORE_PACKING_MISMATCH_DEFINED_HERE)
+#undef WINDOWS_IGNORE_PACKING_MISMATCH
+#undef __WINDOWS_IGNORE_PACKING_MISMATCH_DEFINED_HERE
+#endif
 
 extern	LPDIRECTDRAWSURFACE	PaletteSurface;
 

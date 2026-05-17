@@ -19,7 +19,7 @@
 #include "function.h"
 
 #ifdef MCIMPEG
-#include <windows.h>
+#include "Win32Lib/win32_windows.h"
 #include <windowsx.h>
 #include <mmsystem.h>
 #include <digitalv.h>

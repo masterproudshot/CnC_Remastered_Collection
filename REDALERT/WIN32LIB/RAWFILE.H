@@ -44,12 +44,11 @@
 #define _WIN32
 #endif // _WIN32
 #endif
-#include <windows.h>
+#include "win32_windows.h"
 
 //#include	<wwlib32.h>
 #include	<limits.h>
 #include	<errno.h>
-#include	<windows.h>
 //#include	<algo.h>
 #include	"wwfile.h"
 

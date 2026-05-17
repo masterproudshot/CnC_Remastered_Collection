@@ -51,7 +51,7 @@
 
 #ifdef WIN32
 
-#include <WINDOWS.H>
+#include "Win32Lib/win32_windows.h"
 #include "ccdde.h"
 #include <stdio.h>
 #include <timer.h>

@@ -41,7 +41,7 @@
 #define _WIN32
 #endif // _WIN32
 #endif
-#include <windows.h>
+#include "win32_windows.h"
 #include <windowsx.h>
 
 /*=========================================================================*/
