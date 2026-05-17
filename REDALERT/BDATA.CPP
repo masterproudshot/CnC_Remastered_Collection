@@ -3261,10 +3261,14 @@ void BuildingTypeClass::Prep_For_Add(void)
  *=============================================================================================*/
 bool BuildingTypeClass::Create_And_Place(CELL cell, HousesType house) const
 {
-	BuildingClass * ptr;
-
-	ptr = new BuildingClass(Type, house);
+	BuildingClass * ptr = new BuildingClass(Type, house);
 	if (ptr != NULL) {
+		char buf[256];
+		sprintf(buf, "CREATED: Building (via Create_And_Place) classid=%d house=%d Class.Raw=%ld ScenarioInit=%d",
+		        (int)Type, (int)house, (long)ptr->Class.Raw(), ScenarioInit);
+		GlyphX_Debug_Print(buf);
+		OutputDebugStringA(buf);
+		OutputDebugStringA("\r\n");
 		return(ptr->Unlimbo(Cell_Coord(cell), DIR_N));
 	}
 	return(false);
@@ -3295,7 +3299,16 @@ ObjectClass * BuildingTypeClass::Create_One_Of(HouseClass * house) const
 	if (house != NULL) {
 		htype = house->Class->House;
 	}
-	return(new BuildingClass(Type, htype));
+	BuildingClass * b = new BuildingClass(Type, htype);
+	if (b) {
+		char buf[256];
+		sprintf(buf, "CREATED: Building (via Create_One_Of) classid=%d house=%d Class.Raw=%ld ScenarioInit=%d",
+		        (int)Type, (int)htype, (long)b->Class.Raw(), ScenarioInit);
+		GlyphX_Debug_Print(buf);
+		OutputDebugStringA(buf);
+		OutputDebugStringA("\r\n");
+	}
+	return b;
 }
 
 

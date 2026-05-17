@@ -451,7 +451,16 @@ void AircraftTypeClass::One_Time(void)
  *=============================================================================================*/
 ObjectClass * AircraftTypeClass::Create_One_Of(HouseClass * house) const
 {
-	return(new AircraftClass(Type, house->Class->House));
+	AircraftClass * a = new AircraftClass(Type, house->Class->House);
+	if (a) {
+		char buf[256];
+		sprintf(buf, "CREATED: Aircraft (via Create_One_Of) classid=%d house=%d Class.Raw=%ld ScenarioInit=%d",
+		        (int)Type, (int)house->Class->House, (long)a->Class.Raw(), ScenarioInit);
+		GlyphX_Debug_Print(buf);
+		OutputDebugStringA(buf);
+		OutputDebugStringA("\r\n");
+	}
+	return a;
 }
 
 

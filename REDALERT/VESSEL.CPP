@@ -387,6 +387,15 @@ void VesselClass::Draw_It(int x, int y, WindowNumberType window) const
 	assert(IsActive);
 
 	/*
+	**	Early-out if the Class pointer is not yet valid (can happen very early
+	**	during scenario load before TypeClasses are fully constructed).
+	*/
+	if (!Is_Drawable(this)) return;
+
+	Aeloria_Debug_Log("Vessel guard passed this=%p Class.Raw=%ld - proceeding to draw", (void*)this, Class.Raw());
+
+	Aeloria_Debug_Log("Vessel about to call Get_Image_Data this=%p Class.Raw=%ld", (void*)this, Class.Raw());
+	/*
 	**	Verify the legality of the unit class.
 	*/
 	void const * shapefile = Get_Image_Data();
@@ -411,6 +420,7 @@ void VesselClass::Draw_It(int x, int y, WindowNumberType window) const
 		/*
 		**	Actually perform the draw. Overlay an optional shimmer effect as necessary.
 		*/
+		Aeloria_Debug_Log("Vessel about to call Techno_Draw_Object this=%p Class.Raw=%ld", (void*)this, Class.Raw());
 		Techno_Draw_Object(shapefile, Shape_Number(), x, y, window, rotation, scale);
 
 		/*

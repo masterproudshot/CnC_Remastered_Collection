@@ -301,6 +301,15 @@ void TerrainClass::Draw_It(int x, int y, WindowNumberType window) const
 	assert(Terrains.ID(this) == ID);
 	assert(IsActive);
 
+	/*
+	**	Early-out if the Class pointer is not yet valid (can happen very early
+	**	during scenario load before TypeClasses are fully constructed).
+	*/
+	if (!Is_Drawable(this)) return;
+
+	Aeloria_Debug_Log("Terrain guard passed this=%p Class.Raw=%ld - proceeding to draw", (void*)this, Class.Raw());
+
+	Aeloria_Debug_Log("Terrain about to call Get_Image_Data() this=%p Class.Raw=%ld", (void*)this, Class.Raw());
 	void const * shapedata;
 
 	shapedata = Get_Image_Data();
@@ -326,6 +335,7 @@ void TerrainClass::Draw_It(int x, int y, WindowNumberType window) const
 		**Terrain is always theater specific so flag it as such for Build_Frame
 		*/
 		IsTheaterShape = true;
+		Aeloria_Debug_Log("Terrain about to call CC_Draw_Shape this=%p Class.Raw=%ld", (void*)this, Class.Raw());
 		// Add 'this' parameter to call new shape draw intercept. ST - 5/22/2019
 		CC_Draw_Shape(this, shapedata, shapenum, x, y, window, flags|SHAPE_WIN_REL|SHAPE_GHOST, Map.FadingLight, Map.UnitShadow);
 		IsTheaterShape = false;
@@ -746,6 +756,7 @@ void TerrainClass::Read_INI(CCINIClass & ini)
 
 		if (terrain != TERRAIN_NONE) {
 			tptr = new TerrainClass(terrain, cell);
+			Aeloria_Debug_Log("CREATED: Terrain type=%d Class.Raw=%ld", (int)terrain, (long)tptr->Class.Raw());
 		}
 	}
 }

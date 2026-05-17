@@ -568,6 +568,15 @@ void InfantryClass::Draw_It(int x, int y, WindowNumberType window) const
 	assert(IsActive);
 
 	/*
+	**	Early-out if the Class pointer is not yet valid (can happen very early
+	**	during scenario load before TypeClasses are fully constructed).
+	*/
+	if (!Is_Drawable(this)) return;
+
+	Aeloria_Debug_Log("Infantry guard passed this=%p Class.Raw=%ld - proceeding to draw", (void*)this, Class.Raw());
+
+	Aeloria_Debug_Log("Infantry about to call Get_Image_Data() this=%p Class.Raw=%ld", (void*)this, Class.Raw());
+	/*
 	**	Verify the legality of the unit class by seeing if there is shape imagery for it. If
 	**	there is no shape image, then it certainly can't be drawn -- bail.
 	*/
@@ -581,6 +590,7 @@ void InfantryClass::Draw_It(int x, int y, WindowNumberType window) const
 	/*
 	**	Actually draw the root body of the unit.
 	*/
+	Aeloria_Debug_Log("Infantry about to call Techno_Draw_Object this=%p Class.Raw=%ld", (void*)this, Class.Raw());
 	Techno_Draw_Object(shapefile, Shape_Number(window), x, y, window);
 
 	FootClass::Draw_It(x, y, window);
@@ -3507,6 +3517,8 @@ void InfantryClass::Read_INI(CCINIClass & ini)
 				if (HouseClass::As_Pointer(inhouse) != NULL) {
 					infantry = new InfantryClass(classid, inhouse);
 					if (infantry != NULL) {
+						Aeloria_Debug_Log("CREATED: Infantry classid=%d house=%d Class.Raw=%ld",
+						        (int)classid, (int)inhouse, (long)infantry->Class.Raw());
 
 						/*
 						**	3rd token: strength.

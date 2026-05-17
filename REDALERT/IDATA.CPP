@@ -1227,7 +1227,16 @@ void InfantryTypeClass::Init_Heap(void)
  *=============================================================================================*/
 ObjectClass * InfantryTypeClass::Create_One_Of(HouseClass * house) const
 {
-	return(new InfantryClass(Type, house->Class->House));
+	InfantryClass * i = new InfantryClass(Type, house->Class->House);
+	if (i) {
+		char buf[256];
+		sprintf(buf, "CREATED: Infantry (via Create_One_Of) classid=%d house=%d Class.Raw=%ld ScenarioInit=%d",
+		        (int)Type, (int)house->Class->House, (long)i->Class.Raw(), ScenarioInit);
+		GlyphX_Debug_Print(buf);
+		OutputDebugStringA(buf);
+		OutputDebugStringA("\r\n");
+	}
+	return i;
 }
 
 
@@ -1253,6 +1262,12 @@ bool InfantryTypeClass::Create_And_Place(CELL cell, HousesType house) const
 {
 	InfantryClass * i = new InfantryClass(Type, house);
 	if (i != NULL) {
+		char buf[256];
+		sprintf(buf, "CREATED: Infantry (via Create_And_Place) classid=%d house=%d Class.Raw=%ld ScenarioInit=%d",
+		        (int)Type, (int)house, (long)i->Class.Raw(), ScenarioInit);
+		GlyphX_Debug_Print(buf);
+		OutputDebugStringA(buf);
+		OutputDebugStringA("\r\n");
 		COORDINATE coord = Map[cell].Closest_Free_Spot(Cell_Coord(cell));
 		if (coord) {
 			return(i->Unlimbo(coord, DIR_E));

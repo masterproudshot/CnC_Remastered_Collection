@@ -800,7 +800,14 @@ void TerrainTypeClass::Prep_For_Add(void)
  *=============================================================================================*/
 bool TerrainTypeClass::Create_And_Place(CELL cell, HousesType ) const
 {
-	if (new TerrainClass(Type, cell)) {
+	TerrainClass * tptr = new TerrainClass(Type, cell);
+	if (tptr) {
+		char buf[256];
+		sprintf(buf, "CREATED: Terrain (via Create_And_Place) type=%d Class.Raw=%ld ScenarioInit=%d",
+		        (int)Type, (long)tptr->Class.Raw(), ScenarioInit);
+		GlyphX_Debug_Print(buf);
+		OutputDebugStringA(buf);
+		OutputDebugStringA("\r\n");
 		return(true);
 	}
 	return(false);
@@ -826,7 +833,16 @@ bool TerrainTypeClass::Create_And_Place(CELL cell, HousesType ) const
  *=============================================================================================*/
 ObjectClass * TerrainTypeClass::Create_One_Of(HouseClass *) const
 {
-	return(new TerrainClass(Type, -1));
+	TerrainClass * tptr = new TerrainClass(Type, -1);
+	if (tptr) {
+		char buf[256];
+		sprintf(buf, "CREATED: Terrain (via Create_One_Of) type=%d Class.Raw=%ld ScenarioInit=%d",
+		        (int)Type, (long)tptr->Class.Raw(), ScenarioInit);
+		GlyphX_Debug_Print(buf);
+		OutputDebugStringA(buf);
+		OutputDebugStringA("\r\n");
+	}
+	return tptr;
 }
 
 

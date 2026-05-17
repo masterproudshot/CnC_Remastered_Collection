@@ -555,6 +555,15 @@ void BulletClass::Draw_It(int x, int y, WindowNumberType window) const
 	assert(IsActive);
 
 	/*
+	**	Early-out if the Class pointer is not yet valid (can happen very early
+	**	during scenario load before TypeClasses are fully constructed).
+	*/
+	if (!Is_Drawable(this)) return;
+
+	Aeloria_Debug_Log("Bullet guard passed this=%p Class.Raw=%ld - proceeding to draw", (void*)this, Class.Raw());
+
+	Aeloria_Debug_Log("Bullet about to access Class->IsInvisible this=%p Class.Raw=%ld", (void*)this, Class.Raw());
+	/*
 	**	Certain projectiles aren't visible. This includes small bullets (which are actually
 	**	invisible) and flame thrower flames (which are rendered as an animation instead of a projectile).
 	*/

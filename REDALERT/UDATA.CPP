@@ -1160,6 +1160,12 @@ bool UnitTypeClass::Create_And_Place(CELL cell, HousesType house) const
 {
 	UnitClass * unit = new UnitClass(Type, house);
 	if (unit != NULL) {
+		char buf[256];
+		sprintf(buf, "CREATED: Unit (via Create_And_Place) classid=%d house=%d Class.Raw=%ld ScenarioInit=%d",
+		        (int)Type, (int)house, (long)unit->Class.Raw(), ScenarioInit);
+		GlyphX_Debug_Print(buf);
+		OutputDebugStringA(buf);
+		OutputDebugStringA("\r\n");
 		return(unit->Unlimbo(Cell_Coord(cell), Random_Pick(DIR_N, DIR_MAX)));
 	}
 	return(false);
@@ -1185,7 +1191,16 @@ bool UnitTypeClass::Create_And_Place(CELL cell, HousesType house) const
  *=============================================================================================*/
 ObjectClass * UnitTypeClass::Create_One_Of(HouseClass * house) const
 {
-	return(new UnitClass(Type, house->Class->House));
+	UnitClass * unit = new UnitClass(Type, house->Class->House);
+	if (unit) {
+		char buf[256];
+		sprintf(buf, "CREATED: Unit (via Create_One_Of) classid=%d house=%d Class.Raw=%ld ScenarioInit=%d",
+		        (int)Type, (int)house->Class->House, (long)unit->Class.Raw(), ScenarioInit);
+		GlyphX_Debug_Print(buf);
+		OutputDebugStringA(buf);
+		OutputDebugStringA("\r\n");
+	}
+	return unit;
 }
 
 

@@ -247,6 +247,15 @@ void AnimClass::Draw_It(int x, int y, WindowNumberType window) const
 	assert(Anims.ID(this) == ID);
 	assert(IsActive);
 
+	/*
+	**	Early-out if the Class pointer is not yet valid (can happen very early
+	**	during scenario load before TypeClasses are fully constructed).
+	*/
+	if (!Is_Drawable(this)) return;
+
+	Aeloria_Debug_Log("Anim guard passed this=%p Class.Raw=%ld - proceeding to draw", (void*)this, Class.Raw());
+
+	Aeloria_Debug_Log("Anim about to access Class->VirtualAnim this=%p Class.Raw=%ld", (void*)this, Class.Raw());
 	bool render_legacy = !IsInvisible && (Class->VirtualAnim == ANIM_NONE || window != WINDOW_VIRTUAL);
 	bool render_virtual = Target_Legal(VirtualAnimTarget) && window == WINDOW_VIRTUAL;
 

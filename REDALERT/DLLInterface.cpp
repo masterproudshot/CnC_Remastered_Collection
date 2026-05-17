@@ -13,7 +13,6 @@
 // GNU General Public License along with permitted additional restrictions 
 // with this program. If not, see https://github.com/electronicarts/CnC_Remastered_Collection
 
-
 /*
 ** DLLInterfac.cpp
 **
@@ -583,6 +582,91 @@ void On_Defeated_Message(const char* message, float timeout_seconds)
 void GlyphX_Debug_Print(const char *debug_text)
 {
 	DLLExportClass::On_Debug_Output(debug_text);
+}
+
+/*
+** Project Aeloria - guaranteed file logger for diagnostics when OutputDebugString / GlyphX
+** are invisible (InstanceServerG.exe hosting model).
+** Always flushes. User can open this file in Notepad++ *before* launching and watch it grow.
+*/
+static FILE* s_aeloria_log = NULL;
+
+void Aeloria_Debug_Log(const char *fmt, ...)
+{
+	if (!fmt) return;
+
+	// Lazy open on first use (try several likely locations)
+	if (!s_aeloria_log) {
+		char userPath[MAX_PATH];
+		char candidate[MAX_PATH];
+
+		// Best option: use the user's actual profile directory (C:\Users\jacks etc.)
+		if (GetEnvironmentVariableA("USERPROFILE", userPath, sizeof(userPath)) > 0) {
+			_snprintf(candidate, sizeof(candidate), "%s\\Aeloria_Debug.log", userPath);
+			s_aeloria_log = fopen(candidate, "a");
+			if (s_aeloria_log) {
+				fprintf(s_aeloria_log, "\n\n=== Aeloria Debug Log started (USERPROFILE) %s ===\n", __DATE__);
+				fflush(s_aeloria_log);
+			}
+		}
+
+		// Explicitly try the path the user is currently using (C:\Users\jacks)
+		if (!s_aeloria_log) {
+			s_aeloria_log = fopen("C:\\Users\\jacks\\Aeloria_Debug.log", "a");
+			if (s_aeloria_log) {
+				fprintf(s_aeloria_log, "\n\n=== Aeloria Debug Log started (explicit jacks path) %s ===\n", __DATE__);
+				fflush(s_aeloria_log);
+			}
+		}
+
+		// Try a couple of other common writable places
+		if (!s_aeloria_log) {
+			const char* candidates[] = {
+				"C:\\Users\\Public\\Aeloria_Debug.log",
+				"C:\\Aeloria_Debug.log",
+				NULL
+			};
+			for (int i = 0; candidates[i] && !s_aeloria_log; ++i) {
+				s_aeloria_log = fopen(candidates[i], "a");
+				if (s_aeloria_log) {
+					fprintf(s_aeloria_log, "\n\n=== Aeloria Debug Log started %s ===\n", __DATE__);
+					fflush(s_aeloria_log);
+				}
+			}
+		}
+
+		// Last resort: current working directory of the process
+		if (!s_aeloria_log) {
+			s_aeloria_log = fopen("Aeloria_Debug.log", "a");
+			if (s_aeloria_log) {
+				fprintf(s_aeloria_log, "\n\n=== Aeloria Debug Log (current working dir) started ===\n");
+				fflush(s_aeloria_log);
+			}
+		}
+
+		// If we still failed, at least scream into the debugger output
+		if (!s_aeloria_log) {
+			OutputDebugStringA("AELORIA: FAILED to open any log file for Aeloria_Debug_Log!\n");
+		}
+	}
+
+	if (!s_aeloria_log) return;
+
+	char buffer[512];
+	va_list args;
+	va_start(args, fmt);
+	vsnprintf(buffer, sizeof(buffer) - 1, fmt, args);
+	va_end(args);
+	buffer[sizeof(buffer) - 1] = '\0';
+
+	// Write with timestamp + ScenarioInit for correlation
+	fprintf(s_aeloria_log, "[%d] %s\n", ScenarioInit, buffer);
+	fflush(s_aeloria_log);   // Critical for crash-time visibility
+
+	// Also forward to existing channels (best effort)
+	GlyphX_Debug_Print(buffer);
+	OutputDebugStringA(buffer);
+	OutputDebugStringA("\r\n");
 }
 
 void On_Achievement_Event(const HouseClass* player_ptr, const char *achievement_type, const char *achievement_reason)
@@ -1383,6 +1467,21 @@ extern "C" __declspec(dllexport) bool __cdecl CNC_Start_Instance_Variation(int s
 	Map.Flag_To_Redraw(true);
 
 	Set_Palette(GamePalette.Get_Data());
+
+	// Diagnostic milestone - guaranteed file log (Aeloria_Debug_Log flushes immediately)
+	Aeloria_Debug_Log("FIRST RENDER AFTER LOAD (CNC_Start_Instance_Variation)");
+
+	// === Build 1 Diagnostic: offsetof of Class member in all 8 drawable classes ===
+	// This tells us the compiler's declared offset vs. the runtime +8 the user observes.
+	Aeloria_Debug_Log("OFFSETS: TerrainClass::Class = %zu", offsetof(TerrainClass, Class));
+	Aeloria_Debug_Log("OFFSETS: UnitClass::Class     = %zu", offsetof(UnitClass, Class));
+	Aeloria_Debug_Log("OFFSETS: InfantryClass::Class = %zu", offsetof(InfantryClass, Class));
+	Aeloria_Debug_Log("OFFSETS: BuildingClass::Class = %zu", offsetof(BuildingClass, Class));
+	Aeloria_Debug_Log("OFFSETS: AircraftClass::Class = %zu", offsetof(AircraftClass, Class));
+	Aeloria_Debug_Log("OFFSETS: VesselClass::Class   = %zu", offsetof(VesselClass, Class));
+	// AnimClass::Class and BulletClass::Class are private, so offsetof from here fails.
+	// We can add logs for them from inside their own .CPP files if needed.
+
 	Map.Render();
 
 	Set_Palette(GamePalette.Get_Data());

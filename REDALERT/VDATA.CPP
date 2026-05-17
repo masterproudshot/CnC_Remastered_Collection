@@ -481,7 +481,16 @@ void VesselTypeClass::Prep_For_Add(void)
  *=============================================================================================*/
 ObjectClass * VesselTypeClass::Create_One_Of(HouseClass * house) const
 {
-	return(new VesselClass(Type, house->Class->House));
+	VesselClass * v = new VesselClass(Type, house->Class->House);
+	if (v) {
+		char buf[256];
+		sprintf(buf, "CREATED: Vessel (via Create_One_Of) classid=%d house=%d Class.Raw=%ld ScenarioInit=%d",
+		        (int)Type, (int)house->Class->House, (long)v->Class.Raw(), ScenarioInit);
+		GlyphX_Debug_Print(buf);
+		OutputDebugStringA(buf);
+		OutputDebugStringA("\r\n");
+	}
+	return v;
 }
 
 
@@ -506,6 +515,12 @@ bool VesselTypeClass::Create_And_Place(CELL cell, HousesType house) const
 {
 	VesselClass * unit = new VesselClass(Type, house);
 	if (unit != NULL) {
+		char buf[256];
+		sprintf(buf, "CREATED: Vessel (via Create_And_Place) classid=%d house=%d Class.Raw=%ld ScenarioInit=%d",
+		        (int)Type, (int)house, (long)unit->Class.Raw(), ScenarioInit);
+		GlyphX_Debug_Print(buf);
+		OutputDebugStringA(buf);
+		OutputDebugStringA("\r\n");
 		return(unit->Unlimbo(Cell_Coord(cell), Random_Pick(DIR_N, DIR_MAX)));
 	}
 	delete unit;
