@@ -15,13 +15,25 @@
 
 // Project Aeloria: Define at the absolute top of FUNCTION.H so it is active for every
 // translation unit before any #include (STL headers, other system headers, etc. can
-// transitively pull in windows.h). We #undef right after the actual windows.h include.
-// Use an idempotent guard so repeated inclusion or other headers won't redefine this.
+// transitively pull in windows.h). Temporarily suppress the unavoidable legacy packing
+// alignment warnings (C4324/C4820) + 4996 so that builds with "Treat Warnings as Errors"
+// do not die with C2220. The guard is idempotent.
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable:4996)
+#pragma warning(disable:4324)
+#pragma warning(disable:4820)
+#endif
+
 #ifndef __WINDOWS_IGNORE_PACKING_MISMATCH_DEFINED_HERE
 #define __WINDOWS_IGNORE_PACKING_MISMATCH_DEFINED_HERE 1
 #ifndef WINDOWS_IGNORE_PACKING_MISMATCH
 #define WINDOWS_IGNORE_PACKING_MISMATCH
 #endif
+#endif
+
+#ifdef _MSC_VER
+#pragma warning(pop)
 #endif
 
 /* $Header: /CounterStrike/FUNCTION.H 2     3/13/97 2:05p Steve_tall $*/

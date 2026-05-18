@@ -307,9 +307,24 @@ void TerrainClass::Draw_It(int x, int y, WindowNumberType window) const
 	*/
 	if (!Is_Drawable(this)) return;
 
-	Aeloria_Debug_Log("Terrain guard passed this=%p Class.Raw=%ld - proceeding to draw", (void*)this, Class.Raw());
+	// Aggressive real-time suppression for non-player Terrain verbose spam.
+	// The old Frame-based throttle + counter was too weak because Frame moves extremely
+	// slowly at 5% game speed. After the first render + ~8 real seconds we permanently
+	// silence the per-object "guard passed / about to call / got Object" spam for
+	// everything that is not a human player object.
+	bool logVerbose = Aeloria_ShouldLogVerbose(this);
+	if (!Is_Player_Exempt(this) && !ShouldLogHeavyNonPlayerDiagnostics()) {
+		logVerbose = false;
+	}
 
-	Aeloria_Debug_Log("Terrain about to call Get_Image_Data() this=%p Class.Raw=%ld", (void*)this, Class.Raw());
+	if (logVerbose) {
+		if (Aeloria_ShouldLogOncePerObject(this, AEL_LOG_GUARD_PASSED)) {
+			Aeloria_Debug_Log("Terrain guard passed this=%p Class.Raw=%ld - proceeding to draw", (void*)this, Class.Raw());
+		}
+		if (Aeloria_ShouldLogOncePerObject(this, AEL_LOG_GET_IMAGE_DATA)) {
+			Aeloria_Debug_Log("Terrain about to call Get_Image_Data() this=%p Class.Raw=%ld", (void*)this, Class.Raw());
+		}
+	}
 	void const * shapedata;
 
 	shapedata = Get_Image_Data();
@@ -335,7 +350,9 @@ void TerrainClass::Draw_It(int x, int y, WindowNumberType window) const
 		**Terrain is always theater specific so flag it as such for Build_Frame
 		*/
 		IsTheaterShape = true;
-		Aeloria_Debug_Log("Terrain about to call CC_Draw_Shape this=%p Class.Raw=%ld", (void*)this, Class.Raw());
+		if (logVerbose && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_TERRAIN_ABOUT_TO_CC)) {
+			Aeloria_Debug_Log("Terrain about to call CC_Draw_Shape this=%p Class.Raw=%ld", (void*)this, Class.Raw());
+		}
 		// Add 'this' parameter to call new shape draw intercept. ST - 5/22/2019
 		CC_Draw_Shape(this, shapedata, shapenum, x, y, window, flags|SHAPE_WIN_REL|SHAPE_GHOST, Map.FadingLight, Map.UnitShadow);
 		IsTheaterShape = false;

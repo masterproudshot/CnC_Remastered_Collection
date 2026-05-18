@@ -4470,6 +4470,20 @@ void TechnoClass::Techno_Draw_Object(void const * shapefile, int shapenum, int x
 {
 	assert(IsActive);
 
+	/*
+	**	Pragmatic Option A diagnostic (May 2026):
+	**	Last-mile logging during the early-load grace frame. This captures the actual
+	**	parameters being passed to the blitter for any Techno object (including the
+	**	radar dish draws that are currently causing the privileged-instruction crash).
+	*/
+	if (g_AeloriaEnableVerboseDrawLogs && g_EarlyLoadGraceActive && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_GRACE_TECHNO_DRAW)) {
+		uintptr_t effective = *(uintptr_t*)((const char*)this + 8);
+		bool would_fail = !Is_Plausible_Class_Pointer(effective);
+		Aeloria_Debug_Log("GRACE FRAME TECHNO_DRAW: this=%p RTTI=%d would_fail_8=%d shapefile=%p num=%d x=%d y=%d",
+		                  (void*)this, What_Am_I(),
+		                  would_fail ? 1 : 0, shapefile, shapenum, x, y);
+	}
+
 	if (rotation != DIR_N || scale != 0x0100) {
 		Disable_Uncompressed_Shapes();
 	}

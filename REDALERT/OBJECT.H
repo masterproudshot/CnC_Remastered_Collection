@@ -36,6 +36,7 @@
 #define OBJECT_H
 
 #include	"abstract.h"
+#include	<map>
 
 class ObjectClass;
 class TechnoClass;
@@ -301,8 +302,90 @@ class ObjectClass : public AbstractClass
 **	See plan.md "Expert Panel Review" section (May 2026) for the full rationale from the
 **	4-expert panel (Low-Level/ABI, C++ Legacy, Game Systems, QE).
 */
+
+// Pragmatic Option A (May 2026): one-frame early-load grace flag.
+// When true (only during the very first Map.Render() after ScenarioInit drops to 0),
+// Is_Plausible_Class_Pointer returns true without checking the +8 offset.
+// This lets objects that pass the declared Class checks render on the first frame
+// (fixing the "no units on load" symptom) while the full +8 guard remains active
+// for every subsequent frame.
+extern bool g_EarlyLoadGraceActive;
+
+// Pragmatic Option A continuation — Phase B (May 2026): much longer player House exemption.
+// 18000 frames (~5 minutes of logic time) for human-owned objects during early load.
+// Combined with the "use safe default size instead of hard skip" relaxation for the human
+// house only, this restores normal visual speed (no more 5% throttling from suppressed draws)
+// while still protecting against blitter AVs on corrupted early-created player units.
+// Non-player objects (Terrain, etc.) remain under the strict shape sanity guard.
+extern HousesType g_HumanPlayerHouse;
+extern int g_PlayerExemptionFrames;
+
+// Phase B instrumentation (May 2026) — human player draw statistics during the long exemption window.
+extern int g_HumanPlayerDrawAttempts;
+extern int g_HumanPlayerFallbackUses;
+
+extern DWORD g_FirstRenderTick;   // Set at the very first Map.Render() after ScenarioInit
+
+// Project Aeloria: per-object, per-message-type "log once" tracker for verbose draw diagnostics
+// during the long human-player exemption window. Keyed by (this pointer) -> bitmask of seen tags.
+// This replaces the previous Frame%12 sampling so that after seeing each distinct message
+// ("guard passed", "about to call Techno_Draw_Object", "PLAYER EXEMPTION bypassing", etc.)
+// once per object we stay silent for that (obj, msg) pair. Keeps total log 50-500 lines
+// after minutes of play while preserving every counter increment and SEVERE/rate-limited events.
+extern std::map<uintptr_t, uint32_t> g_AeloriaObjectLogMask;
+
+// Global master kill-switch for the remaining verbose per-draw diagnostics ("got Object",
+// "guard passed", "about to call ...", GRACE FRAME, PLAYER EXEMPTION bypass, etc.).
+// When false, Aeloria_ShouldLogVerbose returns false immediately and all direct
+// once-per verbose log sites are also suppressed. This eliminates the first-60s I/O
+// tax and the multi-hundred-thousand-line log spam during playtests while leaving
+// SEVERE corruption reports, counters, creation logs, and the final window-expiration
+// stats line fully intact.
+// Default true so diagnosis builds stay chatty; set to false for clean play.
+extern bool g_AeloriaEnableVerboseDrawLogs;
+
+// Distinct message tags for the once-per-object suppression (bit positions).
+// Only the high-volume per-frame draw diagnostics get unique tags here.
+enum AeloriaLogTag {
+	AEL_LOG_NONE = 0,
+	AEL_LOG_GUARD_PASSED = 1,
+	AEL_LOG_GET_IMAGE_DATA = 2,
+	AEL_LOG_SHAPE_NUMBER = 3,
+	AEL_LOG_TECHNO_DRAW_OBJECT = 4,
+	AEL_LOG_DRAWING_UNIT_RADAR = 5,
+	AEL_LOG_GRACE_TECHNO_DRAW = 6,
+	AEL_LOG_CC_DRAW_GOT_OBJECT = 7,
+	AEL_LOG_GRACE_FINAL = 8,
+	AEL_LOG_GRACE_SKIP = 9,
+	AEL_LOG_PLAYER_EXEMPT_BYPASS = 10,
+	AEL_LOG_GRACE_RADAR_DISH = 11,
+	AEL_LOG_TERRAIN_ABOUT_TO_CC = 12,
+	AEL_LOG_PLAYER_PHASE_B_SEVERE = 13,
+	// Room for more
+	AEL_LOG_MAX = 31
+};
+
+// Real-time based gate for heavy diagnostic spam on non-player objects.
+// After the first render + ~8 real seconds, we permanently quiet the repetitive
+// "guard passed / about to call / GRACE FRAME FINAL / SKIP" logs for everything
+// that is not a human player object. This is the only way to stop the flood
+// when the game is running at 5% speed (Frame advances too slowly).
+inline bool ShouldLogHeavyNonPlayerDiagnostics()
+{
+    if (g_FirstRenderTick == 0) return true;
+    return (GetTickCount() - g_FirstRenderTick) < 8000;   // 8 real seconds
+}
+const int PLAYER_EXEMPTION_FRAME_COUNT = 18000;  // ~5 minutes of logic frames for human player objects (B-phase: long enough for full opening + early base building at normal visual speed)
+
 inline bool Is_Plausible_Class_Pointer(uintptr_t ptr)
 {
+	// Pragmatic Option A: during the single first-render grace frame we trust the
+	// declared Class checks (already performed by the caller) and skip the +8 probe.
+	// This restores visibility of starting forces on load without weakening the
+	// guard for normal gameplay.
+	if (g_EarlyLoadGraceActive)
+		return true;
+
 	if (ptr == 0) return false;
 
 	// Reject the exact garbage patterns observed in every crash session:
@@ -316,6 +399,49 @@ inline bool Is_Plausible_Class_Pointer(uintptr_t ptr)
 
 	return true;
 }
+
+/*
+**	Project Aeloria player exemption helper (tiny, always-approve owner path + timeout).
+**	Returns true only for human player's Techno (and other) objects while the short
+**	countdown or initial grace is active. Owner() is safe here (visible on ObjectClass).
+**	Used in CONQUER.CPP skip paths for loud bypass logging + relaxed checks.
+**	No log inside helper (would be too noisy); caller logs on actual exemption events.
+*/
+inline bool Is_Player_Exempt(const ObjectClass* obj)
+{
+	if (obj == nullptr || g_HumanPlayerHouse == HOUSE_NONE)
+		return false;
+	if (g_PlayerExemptionFrames <= 0 && !g_EarlyLoadGraceActive)
+		return false;
+	HousesType owner = obj->Owner();
+	return (owner == g_HumanPlayerHouse);
+}
+
+/*
+**	Project Aeloria logging throttle (May 2026, final log-once policy).
+**	Per the approved "log once per object per message" plan: each distinct verbose draw diagnostic
+**	(guard passed, about-to-call Techno_Draw, PLAYER EXEMPTION bypass, GRACE FRAME*, DRAWING UNIT radar, etc.)
+**	is emitted at most once per object pointer during the exemption window. Achieves the target of
+**	50-500 line logs after minutes of play instead of hundreds of thousands.
+**
+**	Player objects: ShouldLogVerbose returns true; the per-tag once filter in ShouldLogOncePerObject
+**	does the actual dedup (using g_AeloriaObjectLogMask bitmask).
+**	Non-player: real-time ShouldLogHeavyNonPlayerDiagnostics() + opening burst.
+**	Counters, SEVERE (rate-limited), and window-expiration stats are never suppressed.
+*/
+inline bool Aeloria_ShouldLogVerbose(const ObjectClass* obj)
+{
+	if (obj == nullptr) return false;
+	if (!g_AeloriaEnableVerboseDrawLogs) return false;  // Master toggle off -> silence all per-draw spam (first-60s I/O + hundreds of k lines)
+	if (Is_Player_Exempt(obj)) return true;   // Full verbosity decision now delegated to Aeloria_ShouldLogOncePerObject (log each msg type once per object)
+	if (Frame < 600) return true;             // Full detail for the first 10 seconds (non-player only)
+	return false;
+}
+
+// Returns true only the *first* time this (object pointer, message tag) pair is seen while the
+// player exemption window is active. Subsequent identical messages for the same `this` are suppressed.
+// Non-player objects fall back to the normal verbose/heavy gate logic (already rate-limited by real time).
+bool Aeloria_ShouldLogOncePerObject(const void* obj, int tag);
 
 /*
 **	Project Aeloria (Draw Guard helper):

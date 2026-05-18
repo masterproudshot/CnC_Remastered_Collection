@@ -411,9 +411,13 @@ void AircraftClass::Draw_It(int x, int y, WindowNumberType window) const
 	*/
 	if (!Is_Drawable(this)) return;
 
-	Aeloria_Debug_Log("Aircraft guard passed this=%p Class.Raw=%ld - proceeding to draw", (void*)this, Class.Raw());
+	if (g_AeloriaEnableVerboseDrawLogs && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_GUARD_PASSED)) {
+		Aeloria_Debug_Log("Aircraft guard passed this=%p Class.Raw=%ld - proceeding to draw", (void*)this, Class.Raw());
+	}
 
-	Aeloria_Debug_Log("Aircraft about to call Get_Image_Data this=%p Class.Raw=%ld", (void*)this, Class.Raw());
+	if (g_AeloriaEnableVerboseDrawLogs && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_GET_IMAGE_DATA)) {
+		Aeloria_Debug_Log("Aircraft about to call Get_Image_Data this=%p Class.Raw=%ld", (void*)this, Class.Raw());
+	}
 	/*
 	**	Verify the legality of the unit class.
 	*/
@@ -455,7 +459,9 @@ void AircraftClass::Draw_It(int x, int y, WindowNumberType window) const
 		/*
 		**	Draw the root body of the unit.
 		*/
-		Aeloria_Debug_Log("Aircraft about to call Techno_Draw_Object this=%p Class.Raw=%ld", (void*)this, Class.Raw());
+		if (g_AeloriaEnableVerboseDrawLogs && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_TECHNO_DRAW_OBJECT)) {
+			Aeloria_Debug_Log("Aircraft about to call Techno_Draw_Object this=%p Class.Raw=%ld", (void*)this, Class.Raw());
+		}
 		Techno_Draw_Object(shapefile, shapenum, x, y+jitter, window, rotation);
 
 		/*
@@ -475,7 +481,9 @@ void AircraftClass::Draw_It(int x, int y, WindowNumberType window) const
 		/*
 		**	Draw the root body of the unit.
 		*/
-		Aeloria_Debug_Log("Aircraft about to call Techno_Draw_Object this=%p Class.Raw=%ld", (void*)this, Class.Raw());
+		if (g_AeloriaEnableVerboseDrawLogs && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_TECHNO_DRAW_OBJECT)) {
+			Aeloria_Debug_Log("Aircraft about to call Techno_Draw_Object this=%p Class.Raw=%ld", (void*)this, Class.Raw());
+		}
 		Techno_Draw_Object(shapefile, shapenum, x, y+jitter, window, rotation);
 	}
 

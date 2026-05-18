@@ -573,9 +573,13 @@ void InfantryClass::Draw_It(int x, int y, WindowNumberType window) const
 	*/
 	if (!Is_Drawable(this)) return;
 
-	Aeloria_Debug_Log("Infantry guard passed this=%p Class.Raw=%ld - proceeding to draw", (void*)this, Class.Raw());
+	if (g_AeloriaEnableVerboseDrawLogs && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_GUARD_PASSED)) {
+		Aeloria_Debug_Log("Infantry guard passed this=%p Class.Raw=%ld - proceeding to draw", (void*)this, Class.Raw());
+	}
 
-	Aeloria_Debug_Log("Infantry about to call Get_Image_Data() this=%p Class.Raw=%ld", (void*)this, Class.Raw());
+	if (g_AeloriaEnableVerboseDrawLogs && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_GET_IMAGE_DATA)) {
+		Aeloria_Debug_Log("Infantry about to call Get_Image_Data() this=%p Class.Raw=%ld", (void*)this, Class.Raw());
+	}
 	/*
 	**	Verify the legality of the unit class by seeing if there is shape imagery for it. If
 	**	there is no shape image, then it certainly can't be drawn -- bail.
@@ -590,7 +594,9 @@ void InfantryClass::Draw_It(int x, int y, WindowNumberType window) const
 	/*
 	**	Actually draw the root body of the unit.
 	*/
-	Aeloria_Debug_Log("Infantry about to call Techno_Draw_Object this=%p Class.Raw=%ld", (void*)this, Class.Raw());
+	if (g_AeloriaEnableVerboseDrawLogs && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_TECHNO_DRAW_OBJECT)) {
+		Aeloria_Debug_Log("Infantry about to call Techno_Draw_Object this=%p Class.Raw=%ld", (void*)this, Class.Raw());
+	}
 	Techno_Draw_Object(shapefile, Shape_Number(window), x, y, window);
 
 	FootClass::Draw_It(x, y, window);

@@ -30,6 +30,7 @@
 #include <string>
 #include <vector>
 #include <set>
+#include <map>
 
 #include	"function.h"
 #include "externs.h"
@@ -591,6 +592,37 @@ void GlyphX_Debug_Print(const char *debug_text)
 */
 static FILE* s_aeloria_log = NULL;
 
+// Pragmatic Option A (May 2026): one-frame grace for the very first render after load.
+// When true, Is_Plausible_Class_Pointer skips the +8 check so objects that pass the
+// declared Class checks can still draw on the initial frame (fixes "no units on load").
+// Cleared immediately after the first Map.Render() returns.
+bool g_EarlyLoadGraceActive = false;
+
+// Player House exemption timeout (pragmatic Option A — Phase B).
+// Long window (18000 frames) for human-owned objects during early load.
+// Phase B adds the "use safe default size instead of hard skip" relaxation for the human house only,
+// which directly attacks the 5% speed symptom (most previous draws were being suppressed even inside the window).
+// Non-player objects continue to be filtered normally by the strict shape sanity guard.
+HousesType g_HumanPlayerHouse = HOUSE_NONE;
+int g_PlayerExemptionFrames = 0;
+
+// Phase B instrumentation (May 2026): measure the real cost of the safety net on the human player.
+// These are incremented in the two CC_Draw_Shape overloads in CONQUER.CPP.
+int g_HumanPlayerDrawAttempts = 0;   // times we reached a draw attempt for a human-owned object during the window
+int g_HumanPlayerFallbackUses   = 0;   // times we had to use the safe default size because Get_Build_Frame_* returned <=0
+
+DWORD g_FirstRenderTick = 0;   // Set exactly once at the first Map.Render() after ScenarioInit drops to 0
+
+// Per-object per-message log-once tracker (see OBJECT.H for rationale).
+// Cleared on exemption window expiration so a future match would start fresh (rare).
+std::map<uintptr_t, uint32_t> g_AeloriaObjectLogMask;
+
+// Master verbose draw diagnostics toggle (see OBJECT.H declaration for full docs).
+// Default false (clean + fast for normal play). The launcher -DebugMode flag sets the
+// AELORIA_ENABLE_VERBOSE_DRAW_LOGS=1 environment variable to force this to true at runtime
+// (via the read in CNC_Init below). This is what makes "the debugmode flag flips the loggins switch on".
+bool g_AeloriaEnableVerboseDrawLogs = false;
+
 void Aeloria_Debug_Log(const char *fmt, ...)
 {
 	if (!fmt) return;
@@ -669,6 +701,33 @@ void Aeloria_Debug_Log(const char *fmt, ...)
 	OutputDebugStringA("\r\n");
 }
 
+/*
+**	Project Aeloria: "log once per object per message type" implementation.
+**	Called from all the high-volume Draw_It / CC_Draw_Shape / Techno_Draw sites for the
+**	specific per-frame diagnostic strings. For human-player objects during the exemption,
+**	each distinct tag is allowed exactly once; everything after is silent for that object.
+**	Non-exempt objects use the prior verbose gate (mostly silent after 8s real time).
+*/
+bool Aeloria_ShouldLogOncePerObject(const void* obj, int tag)
+{
+	if (obj == nullptr || tag <= 0 || tag >= AEL_LOG_MAX) return false;
+
+	const ObjectClass* o = reinterpret_cast<const ObjectClass*>(obj);
+	if (!Is_Player_Exempt(o)) {
+		return Aeloria_ShouldLogVerbose(o);
+	}
+
+	// Player object under exemption: dedup per (this, tag)
+	uintptr_t key = reinterpret_cast<uintptr_t>(obj);
+	auto it = g_AeloriaObjectLogMask.find(key);
+	uint32_t mask = (it != g_AeloriaObjectLogMask.end()) ? it->second : 0u;
+	uint32_t bit = (1u << tag);
+	if (mask & bit) return false;
+
+	g_AeloriaObjectLogMask[key] = mask | bit;
+	return true;
+}
+
 void On_Achievement_Event(const HouseClass* player_ptr, const char *achievement_type, const char *achievement_reason)
 {
 	DLLExportClass::On_Achievement(player_ptr, achievement_type, achievement_reason);
@@ -712,6 +771,33 @@ extern "C" __declspec(dllexport) unsigned int __cdecl CNC_Version(unsigned int v
 **************************************************************************************************/
 extern "C" __declspec(dllexport) void __cdecl CNC_Init(const char *command_line, CNC_Event_Callback_Type event_callback)
 {
+	// Project Aeloria (May 2026): Respect the launcher -DebugMode flag.
+	// When the launcher sees -DebugMode (or the user answers yes to the prompt),
+	// it sets the environment variable AELORIA_ENABLE_VERBOSE_DRAW_LOGS=1 before
+	// launching Steam. We read it here (very early, before any draw code runs)
+	// and force the verbose logging global on. This makes the DebugMode flag
+	// "flip the loggins switch on" exactly as requested.
+	{
+		char val[16] = {0};
+		bool envWasSet = GetEnvironmentVariableA("AELORIA_ENABLE_VERBOSE_DRAW_LOGS", val, sizeof(val)) > 0;
+
+		if (envWasSet) {
+			if (val[0] == '1' || _stricmp(val, "true") == 0 || _stricmp(val, "yes") == 0 || _stricmp(val, "on") == 0) {
+				g_AeloriaEnableVerboseDrawLogs = true;
+			} else {
+				g_AeloriaEnableVerboseDrawLogs = false;
+			}
+		}
+		// Always announce the final state very early (goes to DebugView / debugger even if our log file is quiet)
+		char stateMsg[128];
+		_snprintf(stateMsg, sizeof(stateMsg),
+		          "AELORIA: g_AeloriaEnableVerboseDrawLogs = %s (env var was %s, value='%s')\n",
+		          g_AeloriaEnableVerboseDrawLogs ? "TRUE (verbose logging ON)" : "FALSE (verbose logging suppressed)",
+		          envWasSet ? "present" : "absent",
+		          envWasSet ? val : "");
+		OutputDebugStringA(stateMsg);
+	}
+
 	DLLExportClass::Set_Content_Directory(NULL);
 
 	DLL_Startup(command_line);
@@ -1470,6 +1556,7 @@ extern "C" __declspec(dllexport) bool __cdecl CNC_Start_Instance_Variation(int s
 
 	// Diagnostic milestone - guaranteed file log (Aeloria_Debug_Log flushes immediately)
 	Aeloria_Debug_Log("FIRST RENDER AFTER LOAD (CNC_Start_Instance_Variation)");
+	g_FirstRenderTick = GetTickCount();
 
 	// === Build 1 Diagnostic: offsetof of Class member in all 8 drawable classes ===
 	// This tells us the compiler's declared offset vs. the runtime +8 the user observes.
@@ -1482,7 +1569,35 @@ extern "C" __declspec(dllexport) bool __cdecl CNC_Start_Instance_Variation(int s
 	// AnimClass::Class and BulletClass::Class are private, so offsetof from here fails.
 	// We can add logs for them from inside their own .CPP files if needed.
 
+	// Pragmatic Option A: enable one-frame grace so objects that pass the declared
+	// Class checks can render even if their +8 effective pointer is still bad.
+	// This is the minimal change that lets the player see starting units on load.
+	g_EarlyLoadGraceActive = true;
+	Aeloria_Debug_Log("EARLY LOAD GRACE: enabled for first Map.Render()");
+
+	if (PlayerPtr) {
+		Aeloria_Debug_Log("HUMAN PLAYER HOUSE: %d (PlayerPtr=%p, ActLike=%d)",
+		                  (int)PlayerPtr->Class->House, (void*)PlayerPtr, (int)PlayerPtr->ActLike);
+		g_HumanPlayerHouse = PlayerPtr->Class->House;  // Must match what Techno::Owner() returns (House->Class->House)
+		Aeloria_Debug_Log("HUMAN PLAYER HOUSE CAPTURED FOR EXEMPTION: %d", (int)g_HumanPlayerHouse);
+	} else {
+		Aeloria_Debug_Log("HUMAN PLAYER HOUSE: PlayerPtr is NULL at first render");
+		g_HumanPlayerHouse = HOUSE_NONE;
+	}
+
+	// Start the player exemption window *before* the first render (Phase B: 18000 frames + fallback-size relaxation).
+	// This gives the human player's early-created units (tanks, MCV, etc.) enough time
+	// under the relaxed guards to be visible and animate when the player starts giving orders.
+	g_PlayerExemptionFrames   = PLAYER_EXEMPTION_FRAME_COUNT;
+	g_HumanPlayerDrawAttempts = 0;
+	g_HumanPlayerFallbackUses = 0;
+	g_AeloriaObjectLogMask.clear();   // fresh per skirmish for the once-per-object logging
+
 	Map.Render();
+
+	g_EarlyLoadGraceActive = false;
+	Aeloria_Debug_Log("EARLY LOAD GRACE: disabled after first Map.Render()");
+	Aeloria_Debug_Log("PLAYER EXEMPTION (Phase B): 18000-frame window + safe-default-size relaxation active for human house %d", (int)g_HumanPlayerHouse);
 
 	Set_Palette(GamePalette.Get_Data());
 
@@ -1989,6 +2104,30 @@ extern "C" __declspec(dllexport) bool __cdecl CNC_Advance_Instance(uint64 player
 	**	counter.
 	*/
 	Frame++;
+
+	/*
+	**	Player House exemption timeout driver.
+	**	While the long countdown > 0 we keep g_EarlyLoadGraceActive true for the human player,
+	**	allowing their early-created units to draw (via the safe fallback path) even when
+	**	their shape data is still corrupted. This is the main lever that lets the player
+	**	see and use their starting forces for the opening minute(s) of the game.
+	**	Non-player objects remain under the normal strict guards.
+	*/
+	if (g_PlayerExemptionFrames > 0) {
+		g_PlayerExemptionFrames--;
+		g_EarlyLoadGraceActive = true;
+
+		if (g_PlayerExemptionFrames == 0) {
+			int attempts = g_HumanPlayerDrawAttempts;
+			int fallbacks = g_HumanPlayerFallbackUses;
+			double pct = (attempts > 0) ? (100.0 * fallbacks / attempts) : 0.0;
+			Aeloria_Debug_Log("PLAYER EXEMPTION WINDOW EXPIRED for human house %d after %d frames (Phase B stats: %d draw attempts, %d used fallback size, %.1f%% fallback rate)",
+			                  (int)g_HumanPlayerHouse, PLAYER_EXEMPTION_FRAME_COUNT, attempts, fallbacks, pct);
+			g_AeloriaObjectLogMask.clear();   // reset once-per-object tracking for any future window (or next skirmish)
+		}
+	} else {
+		g_EarlyLoadGraceActive = false;
+	}
 
 	/*
 	** Very rarely, the human players will get a message from the computer.

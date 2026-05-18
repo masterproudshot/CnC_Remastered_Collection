@@ -491,9 +491,13 @@ void BuildingClass::Draw_It(int x, int y, WindowNumberType window) const
 	*/
 	if (!Is_Drawable(this)) return;
 
-	Aeloria_Debug_Log("Building guard passed this=%p Class.Raw=%ld - proceeding to draw", (void*)this, Class.Raw());
+	if (g_AeloriaEnableVerboseDrawLogs && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_GUARD_PASSED)) {
+		Aeloria_Debug_Log("Building guard passed this=%p Class.Raw=%ld - proceeding to draw", (void*)this, Class.Raw());
+	}
 
-	Aeloria_Debug_Log("Building about to access Class->IsTheater / Get_Image_Data this=%p Class.Raw=%ld", (void*)this, Class.Raw());
+	if (g_AeloriaEnableVerboseDrawLogs && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_GET_IMAGE_DATA)) {
+		Aeloria_Debug_Log("Building about to access Class->IsTheater / Get_Image_Data this=%p Class.Raw=%ld", (void*)this, Class.Raw());
+	}
 	/*
 	**	The shape file to use for rendering depends on whether the building
 	**	is undergoing construction or not.
@@ -505,7 +509,9 @@ void BuildingClass::Draw_It(int x, int y, WindowNumberType window) const
 	**	Actually draw the building shape.
 	*/
 	IsTheaterShape = Class->IsTheater;	//Let Build_Frame know if this is a theater specific shape
-	Aeloria_Debug_Log("Building about to call Techno_Draw_Object this=%p Class.Raw=%ld", (void*)this, Class.Raw());
+	if (g_AeloriaEnableVerboseDrawLogs && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_TECHNO_DRAW_OBJECT)) {
+		Aeloria_Debug_Log("Building about to call Techno_Draw_Object this=%p Class.Raw=%ld", (void*)this, Class.Raw());
+	}
 	Techno_Draw_Object(shapefile, Shape_Number(), x, y, window);
 	IsTheaterShape = false;
 

@@ -3434,10 +3434,71 @@ extern void DLL_Draw_Line_Intercept(int x, int y, int x1, int y1, unsigned char 
 void CC_Draw_Shape(const ObjectClass *object, void const * shapefile, int shapenum, int x, int y, WindowNumberType window, ShapeFlags_Type flags, void const * fadingdata, void const * ghostdata, DirType rotation, long virtualscale, int width, int height)
 {
 	if (object) {
-		// Build 1 diagnostic: log the object and the value at the runtime +8 offset the user has been observing
+		// Build 1 diagnostic: only log for player objects or the very first 10 seconds (throttled after stability)
 		uintptr_t at_plus_8 = *(uintptr_t*)((const char*)object + 8);
-		Aeloria_Debug_Log("CC_Draw_Shape got Object this=%p RTTI=%d at+8=0x%08lx",
-		                  (void*)object, object->What_Am_I(), (unsigned long)at_plus_8);
+		bool logGot = Aeloria_ShouldLogVerbose(object) && Aeloria_ShouldLogOncePerObject(object, AEL_LOG_CC_DRAW_GOT_OBJECT);
+		// During the long player exemption, suppress this very noisy per-draw log for player objects
+		// (the "bypassing" + SEVERE once-per-object logs + final stats are sufficient for visibility).
+		if (logGot && Is_Player_Exempt(object) && g_PlayerExemptionFrames > 0) {
+			logGot = false;
+		}
+		if (logGot) {
+			Aeloria_Debug_Log("CC_Draw_Shape got Object this=%p RTTI=%d at+8=0x%08lx",
+			                  (void*)object, object->What_Am_I(), (unsigned long)at_plus_8);
+		}
+
+		/*
+		**	Pragmatic Option A diagnostic (May 2026):
+		**	During the early-load grace frame we are intentionally bypassing the Class guard,
+		**	but we still want to know exactly what is being handed to the blitter.
+		**	This is the absolute last log before Buffer_Frame_To_Page.
+		**	Now throttled — only for human player + opening burst.
+		*/
+		if (g_EarlyLoadGraceActive) {
+			bool logThis = Aeloria_ShouldLogVerbose(object);
+			if (!Is_Player_Exempt(object) && !ShouldLogHeavyNonPlayerDiagnostics()) {
+				logThis = false;
+			}
+			if (logThis && Aeloria_ShouldLogOncePerObject(object, AEL_LOG_GRACE_FINAL)) {
+				// Suppress the noisy GRACE FINAL for player-exempt objects during the long window (once-per is already limiting it).
+				if (!(Is_Player_Exempt(object) && g_PlayerExemptionFrames > 0)) {
+					uintptr_t effective = *(uintptr_t*)((const char*)object + 8);
+					bool would_fail = !Is_Plausible_Class_Pointer(effective);
+					HousesType owner = object ? object->Owner() : HOUSE_NONE;
+					Aeloria_Debug_Log("GRACE FRAME FINAL: this=%p RTTI=%d owner=%d would_fail_8=%d shape=%p num=%d w=%d h=%d flags=0x%08x",
+					                  (void*)object, object->What_Am_I(), (int)owner,
+					                  would_fail ? 1 : 0, shapefile, shapenum, width, height, (unsigned)flags);
+				}
+			}
+		}
+
+		/*
+		**	Pragmatic Option A extension (May 2026) — Shape sanity during grace + player House exemption
+		**	The Terrain Raw=7 case ... (see above). Now extended with narrow player-owned exemption
+		**	timeout (Is_Player_Exempt) so the human player's starting MCV/units (Class.Raw=1 etc.)
+		**	bypass the w/h=0 suppression during the short post-load window and draw via the
+		**	fallback Get_Build_Frame_Width path. Owner/House added to all GRACE logs (always-approve).
+		**	Non-player objects (Terrain etc.) continue to be suppressed.
+		*/
+		if (g_EarlyLoadGraceActive) {
+			HousesType owner = object ? object->Owner() : HOUSE_NONE;
+			if ((shapefile == nullptr || width <= 0 || height <= 0) && !Is_Player_Exempt(object)) {
+				// Only log Terrain suppression spam for the short real-time window after first render
+				bool logThis = Aeloria_ShouldLogVerbose(object);
+				if (!Is_Player_Exempt(object) && !ShouldLogHeavyNonPlayerDiagnostics()) {
+					logThis = false;
+				}
+				if (logThis) {
+					Aeloria_Debug_Log("GRACE FRAME SKIP BAD SHAPE: this=%p RTTI=%d owner=%d shape=%p num=%d w=%d h=%d -- suppressing draw to avoid blitter AV",
+					                  (void*)object, object->What_Am_I(), (int)owner, shapefile, shapenum, width, height);
+				}
+				return;
+			}
+			if (g_AeloriaEnableVerboseDrawLogs && Is_Player_Exempt(object) && Aeloria_ShouldLogOncePerObject(object, AEL_LOG_PLAYER_EXEMPT_BYPASS)) {
+				Aeloria_Debug_Log("PLAYER EXEMPTION: bypassing bad shape for human House object this=%p RTTI=%d owner=%d w=%d h=%d -- proceeding to fallback dim compute",
+				                  (void*)object, object->What_Am_I(), (int)owner, width, height);
+			}
+		}
 
 		/*
 		**	Project Aeloria — TEMPORARY BAND-AID (belt-and-suspenders at the actual crash site)
@@ -3446,8 +3507,9 @@ void CC_Draw_Shape(const ObjectClass *object, void const * shapefile, int shapen
 		**	Buffer_Frame_To_Page / the C# interop path.
 		**
 		**	See Is_Plausible_Class_Pointer in OBJECT.H and plan.md Expert Panel section.
+		**	Now also exempts player House objects (via timeout) so they reach the blitter.
 		*/
-		if (!Is_Plausible_Class_Pointer(at_plus_8)) {
+		if (!Is_Plausible_Class_Pointer(at_plus_8) && !Is_Player_Exempt(object)) {
 			Aeloria_Debug_Log("REJECTED at CC_Draw_Shape (last-line defense) this=%p RTTI=%d at+8=0x%08lx",
 			                  (void*)object, object->What_Am_I(), (unsigned long)at_plus_8);
 			return;   // Do not draw — prevents the 0xC0000005 that used to occur here
@@ -3457,8 +3519,52 @@ void CC_Draw_Shape(const ObjectClass *object, void const * shapefile, int shapen
 	if (window == WINDOW_VIRTUAL) {
 		if (width == 0) width = Get_Build_Frame_Width(shapefile);
 		if (height == 0) height = Get_Build_Frame_Height(shapefile);
+
+		// For human-player objects that have bad shape data during the long exemption window,
+		// still give the Remastered client a draw event every frame using safe dummy dimensions.
+		// This is what actually restores perceived speed for the player in the modern client.
+		if (Is_Player_Exempt(object) && (width <= 0 || height <= 0)) {
+			HousesType owner = object ? object->Owner() : HOUSE_NONE;
+			g_HumanPlayerFallbackUses++;
+			if (Aeloria_ShouldLogOncePerObject(object, AEL_LOG_PLAYER_PHASE_B_SEVERE)) {
+				Aeloria_Debug_Log("PLAYER EXEMPTION (Phase C, virtual): using safe 32x32 for human house %d (was w=%d h=%d) via DLL_Draw_Intercept",
+				                  (int)owner, width, height);
+			}
+			width  = 32;
+			height = 32;
+		}
+
 		DLL_Draw_Intercept(shapenum, x, y, width, height, (int)flags, object, rotation, virtualscale, NULL, HOUSE_NONE);
 		return;
+	}
+
+	/*
+	**	Phase B (May 2026) — human-player-only relaxation.
+	**	Instead of hard-skipping the blitter when dims are still bad for the human house,
+	**	we now use a safe conservative default size (32x32). This lets the draw happen on
+	**	every frame for the player's units, eliminating the 5% speed throttling that was
+	**	caused by the vast majority of their draws being suppressed even inside the window.
+	**	Non-player objects and non-exempt objects continue to be strictly protected.
+	*/
+	if (Is_Player_Exempt(object)) {
+		g_HumanPlayerDrawAttempts++;
+		if (width <= 0 || height <= 0) {
+			HousesType owner = object ? object->Owner() : HOUSE_NONE;
+			g_HumanPlayerFallbackUses++;
+
+			// Per-object once + global counter for stats. Each distinct player object emits the detailed SEVERE line at most once during the window.
+			if (Aeloria_ShouldLogOncePerObject(object, AEL_LOG_PLAYER_PHASE_B_SEVERE)) {
+				Aeloria_Debug_Log("PLAYER EXEMPTION (Phase B): SEVERE shape corruption for human house %d (w=%d h=%d) — drawing safe rect placeholder instead of blitter",
+				                  (int)owner, width, height);
+			}
+
+			// Safe cheap placeholder draw for the human player only.
+			// This gives the object a draw call every frame (restores perceived 5%→normal speed)
+			// without ever feeding structurally bad shape data to the dangerous blitter.
+			// The unit will appear as a small colored box on bad frames — good enough for animation timing and visibility.
+			LogicPage->Fill_Rect(x, y, x + 32, y + 32, 14);   // bright yellow — very visible
+			return;
+		}
 	}
 
 	CC_Draw_Shape(shapefile, shapenum, x, y, window, flags, fadingdata, ghostdata, rotation);
@@ -3468,8 +3574,61 @@ void CC_Draw_Shape(const ObjectClass *object, const char *shape_file_name, void 
 {
 	if (object) {
 		uintptr_t at_plus_8 = *(uintptr_t*)((const char*)object + 8);
-		Aeloria_Debug_Log("CC_Draw_Shape got Object this=%p RTTI=%d at+8=0x%08lx (name overload)",
-		                  (void*)object, object->What_Am_I(), (unsigned long)at_plus_8);
+		bool logGot = Aeloria_ShouldLogVerbose(object) && Aeloria_ShouldLogOncePerObject(object, AEL_LOG_CC_DRAW_GOT_OBJECT);
+		if (logGot && Is_Player_Exempt(object) && g_PlayerExemptionFrames > 0) {
+			logGot = false;
+		}
+		if (logGot) {
+			Aeloria_Debug_Log("CC_Draw_Shape got Object this=%p RTTI=%d at+8=0x%08lx (name overload)",
+			                  (void*)object, object->What_Am_I(), (unsigned long)at_plus_8);
+		}
+
+		/*
+		**	Pragmatic Option A diagnostic (May 2026):
+		**	Last log before the blitter during the grace frame (name overload path).
+		**	Owner/House now included for always-approve diagnostics.
+		**	Throttled after 5-minute stability to prevent 650k-line log floods.
+		*/
+		if (g_EarlyLoadGraceActive) {
+			bool logThis = Aeloria_ShouldLogVerbose(object);
+			if (!Is_Player_Exempt(object) && !ShouldLogHeavyNonPlayerDiagnostics()) {
+				logThis = false;
+			}
+			if (logThis && Aeloria_ShouldLogOncePerObject(object, AEL_LOG_GRACE_FINAL)) {
+				if (!(Is_Player_Exempt(object) && g_PlayerExemptionFrames > 0)) {
+					uintptr_t effective = *(uintptr_t*)((const char*)object + 8);
+					bool would_fail = !Is_Plausible_Class_Pointer(effective);
+					HousesType owner = object ? object->Owner() : HOUSE_NONE;
+					Aeloria_Debug_Log("GRACE FRAME FINAL (name): this=%p RTTI=%d owner=%d would_fail_8=%d shape=%p num=%d flags=0x%08x",
+					                  (void*)object, object->What_Am_I(), (int)owner,
+					                  would_fail ? 1 : 0, shapefile, shapenum, (unsigned)flags);
+				}
+			}
+		}
+
+		/*
+		**	Pragmatic Option A extension (May 2026) — Shape sanity during grace (name overload) + player exemption
+		**	Companion guard... Now applies Is_Player_Exempt so human player objects bypass during the timeout window.
+		**	Owner added to SKIP and FINAL logs.
+		*/
+		if (g_EarlyLoadGraceActive) {
+			HousesType owner = object ? object->Owner() : HOUSE_NONE;
+			if (shapefile == nullptr && !Is_Player_Exempt(object)) {
+				bool logThis = Aeloria_ShouldLogVerbose(object);
+				if (!Is_Player_Exempt(object) && !ShouldLogHeavyNonPlayerDiagnostics()) {
+					logThis = false;
+				}
+				if (logThis) {
+					Aeloria_Debug_Log("GRACE FRAME SKIP BAD SHAPE (name): this=%p RTTI=%d owner=%d shape=%p num=%d -- suppressing draw",
+					                  (void*)object, object->What_Am_I(), (int)owner, shapefile, shapenum);
+				}
+				return;
+			}
+			if (g_AeloriaEnableVerboseDrawLogs && Is_Player_Exempt(object) && Aeloria_ShouldLogOncePerObject(object, AEL_LOG_PLAYER_EXEMPT_BYPASS)) {
+				Aeloria_Debug_Log("PLAYER EXEMPTION (name): bypassing bad shape for human House object this=%p RTTI=%d owner=%d",
+				                  (void*)object, object->What_Am_I(), (int)owner);
+			}
+		}
 
 		/*
 		**	Project Aeloria — TEMPORARY BAND-AID (belt-and-suspenders at the actual crash site)
@@ -3478,8 +3637,9 @@ void CC_Draw_Shape(const ObjectClass *object, const char *shape_file_name, void 
 		**	Buffer_Frame_To_Page / the C# interop path.
 		**
 		**	See Is_Plausible_Class_Pointer in OBJECT.H and plan.md Expert Panel section.
+		**	Player exemption also applied here.
 		*/
-		if (!Is_Plausible_Class_Pointer(at_plus_8)) {
+		if (!Is_Plausible_Class_Pointer(at_plus_8) && !Is_Player_Exempt(object)) {
 			Aeloria_Debug_Log("REJECTED at CC_Draw_Shape (last-line defense) this=%p RTTI=%d at+8=0x%08lx",
 			                  (void*)object, object->What_Am_I(), (unsigned long)at_plus_8);
 			return;   // Do not draw — prevents the 0xC0000005 that used to occur here
@@ -3489,8 +3649,48 @@ void CC_Draw_Shape(const ObjectClass *object, const char *shape_file_name, void 
 	if (window == WINDOW_VIRTUAL) {
 		int width = Get_Build_Frame_Width(shapefile);
 		int height = Get_Build_Frame_Height(shapefile);
+
+		// Same safe placeholder treatment for the name overload (used by Techno_Draw_Object_Virtual).
+		// Ensures player-owned buildings (and other objects) still get a draw event in the Remastered client
+		// even when their shape data is bad during the long exemption window.
+		if (Is_Player_Exempt(object) && (width <= 0 || height <= 0)) {
+			HousesType owner = object ? object->Owner() : HOUSE_NONE;
+			g_HumanPlayerFallbackUses++;
+			if (Aeloria_ShouldLogOncePerObject(object, AEL_LOG_PLAYER_PHASE_B_SEVERE)) {
+				Aeloria_Debug_Log("PLAYER EXEMPTION (Phase C, virtual name): using safe 32x32 for human house %d (was w=%d h=%d)",
+				                  (int)owner, width, height);
+			}
+			width  = 32;
+			height = 32;
+		}
+
 		DLL_Draw_Intercept(shapenum, x, y, width, height, (int)flags, object, rotation, virtualscale, shape_file_name, override_owner);
 		return;
+	}
+
+	/*
+	**	Phase B (name overload) — human-player-only relaxation.
+	**	Same treatment as the main overload: count the attempt, and if dims are still bad
+	**	for the human house, use safe default size instead of hard-skipping. This is what
+	**	restores normal animation/build speed for the player's units.
+	*/
+	if (Is_Player_Exempt(object)) {
+		g_HumanPlayerDrawAttempts++;
+		int w = Get_Build_Frame_Width(shapefile);
+		int h = Get_Build_Frame_Height(shapefile);
+		if (w <= 0 || h <= 0) {
+			HousesType owner = object ? object->Owner() : HOUSE_NONE;
+			g_HumanPlayerFallbackUses++;
+
+			if (Aeloria_ShouldLogOncePerObject(object, AEL_LOG_PLAYER_PHASE_B_SEVERE)) {
+				Aeloria_Debug_Log("PLAYER EXEMPTION (Phase B, name): SEVERE shape corruption for human house %d (w=%d h=%d) — drawing safe rect placeholder instead of blitter",
+				                  (int)owner, w, h);
+			}
+
+			// Safe placeholder rect for the human player (same reason as the main overload).
+			LogicPage->Fill_Rect(x, y, x + 32, y + 32, 14);
+			return;
+		}
 	}
 
 	CC_Draw_Shape(shapefile, shapenum, x, y, window, flags, fadingdata, ghostdata, rotation);

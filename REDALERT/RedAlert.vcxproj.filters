@@ -1816,6 +1816,7 @@
     <None Include="Win32Lib\WWMEM.INC">
       <Filter>Source Files\win32lib</Filter>
     </None>
+    <None Include="KEYFBUFF.ASM.bak" />
   </ItemGroup>
   <ItemGroup>
     <MASM Include="KEYFBUFF.ASM">

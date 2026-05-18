@@ -2095,7 +2095,9 @@ void UnitClass::Draw_It(int x, int y, WindowNumberType window) const
 	*/
 	if (!Is_Drawable(this)) return;
 
-	Aeloria_Debug_Log("Unit guard passed this=%p Class.Raw=%ld - proceeding to draw", (void*)this, Class.Raw());
+	if (Aeloria_ShouldLogVerbose(this) && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_GUARD_PASSED)) {
+		Aeloria_Debug_Log("Unit guard passed this=%p Class.Raw=%ld - proceeding to draw", (void*)this, Class.Raw());
+	}
 
 	int			shapenum;		// Working shape number.
 	void const	* shapefile;		// Working shape file pointer.
@@ -2107,7 +2109,9 @@ void UnitClass::Draw_It(int x, int y, WindowNumberType window) const
 	/*
 	**	Verify the legality of the unit class.
 	*/
-	Aeloria_Debug_Log("Unit about to call Get_Image_Data() this=%p Class.Raw=%ld", (void*)this, Class.Raw());
+	if (Aeloria_ShouldLogVerbose(this) && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_GET_IMAGE_DATA)) {
+		Aeloria_Debug_Log("Unit about to call Get_Image_Data() this=%p Class.Raw=%ld", (void*)this, Class.Raw());
+	}
 	shapefile = Get_Image_Data();
 	if (shapefile == NULL) return;
 
@@ -2117,7 +2121,9 @@ void UnitClass::Draw_It(int x, int y, WindowNumberType window) const
 	*/
 	const bool is_hidden = (Visual_Character() == VISUAL_HIDDEN) && (window != WINDOW_VIRTUAL);
 	if (!is_hidden) {
-		Aeloria_Debug_Log("Unit about to call Shape_Number() this=%p Class.Raw=%ld", (void*)this, Class.Raw());
+		if (g_AeloriaEnableVerboseDrawLogs && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_SHAPE_NUMBER)) {
+			Aeloria_Debug_Log("Unit about to call Shape_Number() this=%p Class.Raw=%ld", (void*)this, Class.Raw());
+		}
 		shapenum = Shape_Number();
 
 		/*
@@ -2130,17 +2136,34 @@ void UnitClass::Draw_It(int x, int y, WindowNumberType window) const
 		/*
 		**	Actually perform the draw. Overlay an optional shimmer effect as necessary.
 		*/
-		Aeloria_Debug_Log("Unit about to call Techno_Draw_Object this=%p Class.Raw=%ld", (void*)this, Class.Raw());
+		if (g_AeloriaEnableVerboseDrawLogs && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_TECHNO_DRAW_OBJECT)) {
+			Aeloria_Debug_Log("Unit about to call Techno_Draw_Object this=%p Class.Raw=%ld", (void*)this, Class.Raw());
+		}
 		Techno_Draw_Object(shapefile, shapenum, x, y, window, rotation, scale);
 
 		/*
 		**	If there is a rotating radar dish, draw it now.
 		**	(Late diagnostic log - this is the exact point that has been crashing for weeks)
 		*/
-		Aeloria_Debug_Log("DRAWING UNIT this=%p Class.Raw=%ld IsRadarEquipped access about to happen",
-		                  (void*)this, Class.Raw());
+		if (g_AeloriaEnableVerboseDrawLogs && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_DRAWING_UNIT_RADAR)) {
+			Aeloria_Debug_Log("DRAWING UNIT this=%p Class.Raw=%ld IsRadarEquipped access about to happen",
+			                  (void*)this, Class.Raw());
+		}
 
 		if (Class->IsRadarEquipped) {
+			/*
+			**	Pragmatic Option A diagnostic (May 2026):
+			**	During the early-load grace frame, log the exact parameters we are about to
+			**	pass to the blitter for the radar dish. This is the last mile before
+			**	Buffer_Frame_To_Page and is critical to understand the privileged-instruction
+			**	crash we are now seeing even when the +8 Class check is intentionally bypassed.
+			*/
+			if (g_AeloriaEnableVerboseDrawLogs && g_EarlyLoadGraceActive && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_GRACE_RADAR_DISH)) {
+				bool would_fail = !Is_Plausible_Class_Pointer( *(uintptr_t*)((const char*)this + 8) );
+				Aeloria_Debug_Log("GRACE FRAME RADAR DISH: this=%p Raw=%ld would_fail_8=%d shapenum=%d",
+				                  (void*)this, Class.Raw(), would_fail ? 1 : 0, shapenum);
+			}
+
 			if (*this == UNIT_MGG) {
 				int x2 = x, y2 = y;
 				shapenum = 32 + (Frame & 7);
