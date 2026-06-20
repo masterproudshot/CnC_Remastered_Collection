@@ -593,7 +593,10 @@ void DriveClass::Assign_Destination(TARGET target)
 	**	If the player clicked on refinery but it is not busy, then assign
 	**	it to unload at the refinery.
 	*/
-	if (b != NULL && *b == STRUCT_REFINERY && What_Am_I() == RTTI_UNIT && ((UnitTypeClass *)Techno_Type_Class())->IsToHarvest) {
+	UnitTypeClass const* utype = (What_Am_I() == RTTI_UNIT)
+	    ? static_cast<UnitTypeClass const*>(Aeloria_Safe_Techno_Type(this))
+	    : nullptr;
+	if (b != NULL && *b == STRUCT_REFINERY && utype && utype->IsToHarvest) {
 		if (Contact_With_Whom() != b && !b->In_Radio_Contact()) {
 			/*
 			**	Establish radio contact protocol. If the facility responds correctly,
@@ -647,10 +650,16 @@ bool DriveClass::While_Moving(void)
 {
 	assert(IsActive);
 
+	TechnoTypeClass const* ttype = Aeloria_Safe_Techno_Type(this);
+	if (!ttype) {
+		SpeedAccum = 0;
+		return(false);
+	}
+
 	/*
 	**	Perform quick legality checks.
 	*/
-	if (!IsDriving || TrackNumber == -1 || (IsRotating && !Techno_Type_Class()->IsTurretEquipped)) {
+	if (!IsDriving || TrackNumber == -1 || (IsRotating && !ttype->IsTurretEquipped)) {
 		SpeedAccum = 0;		// Kludge?  No speed should accumulate if movement is on hold.
 		return(false);
 	}
@@ -660,7 +669,7 @@ bool DriveClass::While_Moving(void)
 	**	visibly move on the map, then process accordingly.
 	** Slow the unit down if he's carrying a flag.
 	*/
-	MPHType maxspeed = MPHType(min(Techno_Type_Class()->MaxSpeed * SpeedBias * House->GroundspeedBias, (int)MPH_LIGHT_SPEED));
+	MPHType maxspeed = MPHType(min(ttype->MaxSpeed * SpeedBias * House->GroundspeedBias, (int)MPH_LIGHT_SPEED));
 	if (IsFormationMove) maxspeed = FormationMaxSpeed;
 
 	int actual;			// Working movement addition value.
@@ -891,6 +900,12 @@ void DriveClass::Per_Cell_Process(PCPType why)
 bool DriveClass::Start_Of_Move(void)
 {
 	assert(IsActive);
+
+	TechnoTypeClass const* ttype = Aeloria_Safe_Techno_Type(this);
+	if (!ttype) {
+		Stop_Driver();
+		return(false);
+	}
 
 	FacingType		facing;				// Direction movement will commence.
 	DirType			dir;				// Desired actual facing toward destination.
@@ -1135,7 +1150,7 @@ bool DriveClass::Start_Of_Move(void)
 		**	Determine the speed that the unit can travel to the desired square.
 		*/
 		ground = Map[destcell].Land_Type();
-		speed = Ground[ground].Cost[Techno_Type_Class()->Speed] * 255;
+		speed = Ground[ground].Cost[ttype->Speed] * 255;
 
 		/* change speed if it's related to a team move */
 		if (IsFormationMove) speed = Ground[ground].Cost[FormationSpeed] * 255;
@@ -1341,8 +1356,10 @@ void DriveClass::AI(void)
 			}
 #else
 		if (PrimaryFacing.Is_Rotating()) {
+			TechnoTypeClass const* ttype = Aeloria_Safe_Techno_Type(this);
+			if (!ttype) return;
 			Mark(MARK_CHANGE_REDRAW);
-			if (PrimaryFacing.Rotation_Adjust(Techno_Type_Class()->ROT * House->GroundspeedBias)) {
+			if (PrimaryFacing.Rotation_Adjust(ttype->ROT * House->GroundspeedBias)) {
 				Mark(MARK_CHANGE_REDRAW);
 			}
 #endif

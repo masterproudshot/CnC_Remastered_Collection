@@ -3157,10 +3157,14 @@ bool HouseClass::Place_Object(RTTIType type, CELL cell)
 							IsBuiltSomething = true;
 							break;
 
-						case RTTI_BUILDING:
-							JustBuiltStructure = ((BuildingClass*)pending)->Class->Type;
+						case RTTI_BUILDING: {
+							BuildingClass* pending_building = (BuildingClass*)pending;
+							Aeloria_Repair_Early_Class_Pointer(pending_building);
+							BuildingTypeClass const* safe_type = static_cast<BuildingTypeClass const*>(Aeloria_Safe_Techno_Type(pending_building));
+							JustBuiltStructure = safe_type ? safe_type->Type : STRUCT_NONE;
 							IsBuiltSomething = true;
 							break;
+						}
 
 						case RTTI_AIRCRAFT:
 							JustBuiltAircraft = ((AircraftClass*)pending)->Class->Type;
@@ -3197,8 +3201,20 @@ bool HouseClass::Place_Object(RTTIType type, CELL cell)
 					*/
 					OverlayType otype = OVERLAY_NONE;
 					HousesType house = tech->House->Class->House;
-					if (tech->What_Am_I() == RTTI_BUILDING)
-						otype = ((BuildingClass*)tech)->Class->Overlay_Type();
+					if (tech->What_Am_I() == RTTI_BUILDING) {
+						BuildingClass* pending_building = (BuildingClass*)tech;
+						Aeloria_Repair_Early_Class_Pointer(pending_building);
+						Aeloria_Seed_Human_Building_Stability(pending_building);
+						BuildingTypeClass const* safe_type = static_cast<BuildingTypeClass const*>(Aeloria_Safe_Techno_Type(pending_building));
+						if (safe_type) {
+							otype = safe_type->Overlay_Type();
+						}
+						uintptr_t at8 = *(uintptr_t*)((const char*)pending_building + 8);
+						bool badAt8 = !Is_Plausible_Class_Pointer(at8);
+						Aeloria_Debug_Log("LEGACY_PLACE this=%p raw=%d type_enum=%d bad_at8=%d frame=%u",
+						                  (void*)pending_building, pending_building->Class.Raw(),
+						                  safe_type ? (int)safe_type->Type : -1, badAt8 ? 1 : 0, Frame);
+					}
 
 					if (tech->Unlimbo(Cell_Coord(cell))) {
 						factory->Completed();
@@ -3339,7 +3355,14 @@ bool HouseClass::Manual_Place(BuildingClass * builder,  BuildingClass * object)
 		Map.Repair_Mode_Control(0);
 		Map.Sell_Mode_Control(0);
 
-		Map.PendingObject = object->Class;
+		Aeloria_Repair_Early_Class_Pointer(object);
+		Aeloria_Seed_Human_Building_Stability(object);
+		BuildingTypeClass const* safe_type = static_cast<BuildingTypeClass const*>(Aeloria_Safe_Techno_Type(object));
+		if (!safe_type) {
+			return(false);
+		}
+
+		Map.PendingObject = safe_type;
 		Map.PendingObjectPtr = object;
 		Map.PendingHouse = Class->House;
 
@@ -8216,6 +8239,33 @@ void HouseClass::Check_Pertinent_Structures(void)
 			UnitClass * unit = Units.Ptr(index);
 
 			if (unit && unit->IsActive && *unit == UNIT_MCV && unit->House == this) {
+				if (!unit->IsInLimbo && unit->Strength > 0) {
+					any_good_buildings = true;
+					break;
+				}
+			}
+		}
+	}
+
+	// Custom skirmish / north-star maps can start with infantry and vehicles but no base.
+	// Fire_Sale already treats any living units+infantry as "still in the fight"; mirror that
+	// here so Destroy-Structures win mode does not Flag_To_Die after SavourDelay (~frame 27).
+	if (!any_good_buildings) {
+		for (int index = 0; index < Infantry.Count(); index++) {
+			InfantryClass * infantry = Infantry.Ptr(index);
+			if (infantry && infantry->IsActive && infantry->House == this) {
+				if (!infantry->IsInLimbo && infantry->Strength > 0) {
+					any_good_buildings = true;
+					break;
+				}
+			}
+		}
+	}
+
+	if (!any_good_buildings) {
+		for (int index = 0; index < Units.Count(); index++) {
+			UnitClass * unit = Units.Ptr(index);
+			if (unit && unit->IsActive && unit->House == this) {
 				if (!unit->IsInLimbo && unit->Strength > 0) {
 					any_good_buildings = true;
 					break;

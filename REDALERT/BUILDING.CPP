@@ -106,6 +106,8 @@
 
 #include	"function.h"
 
+extern void DLL_Draw_Intercept(int shape_number, int x, int y, int width, int height, int flags, const ObjectClass *object, DirType rotation, long scale, const char *shape_file_name, char override_owner);
+
 /*
 ** New sidebar for GlyphX multiplayer. ST - 8/2/2019 2:35PM
 */
@@ -133,6 +135,40 @@ COORDINATE const BuildingClass::CenterOffset[BSIZE_COUNT] = {
 
 	0x02800280L,
 };
+
+static BuildingTypeClass const* Aeloria_Building_Safe_Type(BuildingClass const* building)
+{
+	if (!building) {
+		return nullptr;
+	}
+	Aeloria_Repair_Early_Class_Pointer(const_cast<BuildingClass*>(building));
+	return static_cast<BuildingTypeClass const*>(Aeloria_Safe_Techno_Type(building));
+}
+
+/***********************************************************************************************
+ * BuildingClass::operator StructType -- Safe structure type for corrupt human-deploy Class.   *
+ *=============================================================================================*/
+BuildingClass::operator StructType(void) const
+{
+	BuildingTypeClass const* safe = Aeloria_Building_Safe_Type(this);
+	return safe ? safe->Type : STRUCT_NONE;
+}
+
+/***********************************************************************************************
+ * BuildingClass::Fetch_Anim_Control -- Safe animation control lookup.                         *
+ *=============================================================================================*/
+BuildingTypeClass::AnimControlType const* BuildingClass::Fetch_Anim_Control(void)
+{
+	BuildingTypeClass const* safe = Aeloria_Building_Safe_Type(this);
+	if (safe) {
+		return &safe->Anims[BState];
+	}
+	static BuildingTypeClass::AnimControlType const* s_fallbackAnim = nullptr;
+	if (!s_fallbackAnim) {
+		s_fallbackAnim = &BuildingTypeClass::As_Reference(STRUCT_PILLBOX).Anims[BSTATE_IDLE];
+	}
+	return s_fallbackAnim;
+}
 
 
 /***********************************************************************************************
@@ -164,6 +200,10 @@ RadioMessageType BuildingClass::Receive_Message(RadioClass * from, RadioMessageT
 	assert(Buildings.ID(this) == ID);
 	assert(IsActive);
 
+	Aeloria_Repair_Early_Class_Pointer(this);
+	BuildingTypeClass const* safe_self = Aeloria_Building_Safe_Type(this);
+	StructType self_type = safe_self ? safe_self->Type : STRUCT_NONE;
+
 	switch (message) {
 
 		/*
@@ -175,9 +215,9 @@ RadioMessageType BuildingClass::Receive_Message(RadioClass * from, RadioMessageT
 			if (!House->Is_Ally(from)) return(RADIO_STATIC);
 
 			if (Mission == MISSION_CONSTRUCTION || Mission == MISSION_DECONSTRUCTION || BState == BSTATE_CONSTRUCTION) return RADIO_NEGATIVE;
-			if (Class->Type != STRUCT_REFINERY && ((!ScenarioInit && In_Radio_Contact() && Contact_With_Whom() != from))) return RADIO_NEGATIVE;
+			if (self_type != STRUCT_REFINERY && ((!ScenarioInit && In_Radio_Contact() && Contact_With_Whom() != from))) return RADIO_NEGATIVE;
 
-			switch (Class->Type) {
+			switch (self_type) {
 				case STRUCT_AIRSTRIP:
 					if (from->What_Am_I() == RTTI_AIRCRAFT && ((AircraftClass const *)from)->Class->IsFixedWing) {
 						return(RADIO_ROGER);
@@ -213,8 +253,10 @@ RadioMessageType BuildingClass::Receive_Message(RadioClass * from, RadioMessageT
 					** This dramatically reduces harvester idle time and "traffic jams" at refineries.
 					** The Rule.MinHarvesterQueueJumpDistance tunable controls how aggressive this is.
 					*/
-					if (from->What_Am_I() == RTTI_UNIT &&
-						((UnitClass *)from)->Class->IsToHarvest) {
+					{
+						UnitTypeClass const* from_utype = static_cast<UnitTypeClass const*>(
+							Aeloria_Safe_Techno_Type((TechnoClass*)from));
+					if (from->What_Am_I() == RTTI_UNIT && from_utype && from_utype->IsToHarvest) {
 						if (ScenarioInit) {
 							return(RADIO_ROGER);
 						}
@@ -237,6 +279,7 @@ RadioMessageType BuildingClass::Receive_Message(RadioClass * from, RadioMessageT
 
 						return((Contact_With_Whom() != from) ? RADIO_ROGER : RADIO_NEGATIVE);
 					}
+					}
 					break;
 
 				default:
@@ -252,7 +295,7 @@ RadioMessageType BuildingClass::Receive_Message(RadioClass * from, RadioMessageT
 			if (Mission == MISSION_DECONSTRUCTION) {
 				return(RADIO_NEGATIVE);
 			}
-			switch (Class->Type) {
+			switch (self_type) {
 				case STRUCT_REPAIR:
 					IsReadyToCommence = true;
 					Assign_Mission(MISSION_REPAIR);
@@ -316,7 +359,7 @@ RadioMessageType BuildingClass::Receive_Message(RadioClass * from, RadioMessageT
 			}
 
 			if (Transmit_Message(RADIO_NEED_TO_MOVE) == RADIO_ROGER) {
-				switch (Class->Type) {
+				switch (self_type) {
 					case STRUCT_AIRSTRIP:
 						param = As_Target();
 						break;
@@ -485,73 +528,99 @@ void BuildingClass::Draw_It(int x, int y, WindowNumberType window) const
 	assert(Buildings.ID(this) == ID);
 	assert(IsActive);
 
+	Aeloria_Repair_Early_Class_Pointer(const_cast<BuildingClass*>(this));
+
 	/*
 	**	Early-out if the Class pointer is not yet valid (can happen very early
 	**	during scenario load before TypeClasses are fully constructed).
 	*/
 	if (!Is_Drawable(this)) return;
 
-	if (g_AeloriaEnableVerboseDrawLogs && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_GUARD_PASSED)) {
-		Aeloria_Debug_Log("Building guard passed this=%p Class.Raw=%ld - proceeding to draw", (void*)this, Class.Raw());
-	}
+	uintptr_t at_plus_8 = *(uintptr_t*)((const char*)this + 8);
+	const bool bad_plus_8 = !Is_Plausible_Class_Pointer(at_plus_8);
+	const bool humanDeployed = Aeloria_IsHumanDeployedBuilding(this);
+	// Human MCV buildings keep plausible-but-wrong +8; construction anim must never hit legacy blitter.
+	const bool forceSafeClientDraw = bad_plus_8 || BState == BSTATE_CONSTRUCTION || humanDeployed;
 
-	if (g_AeloriaEnableVerboseDrawLogs && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_GET_IMAGE_DATA)) {
-		Aeloria_Debug_Log("Building about to access Class->IsTheater / Get_Image_Data this=%p Class.Raw=%ld", (void*)this, Class.Raw());
-	}
-	/*
-	**	The shape file to use for rendering depends on whether the building
-	**	is undergoing construction or not.
-	*/
-	void const * shapefile = Get_Image_Data();
-	if (shapefile == NULL) return;
+	BuildingTypeClass const* building_type = static_cast<BuildingTypeClass const*>(Aeloria_Safe_Techno_Type(this));
+	if (!building_type || building_type->RTTI != RTTI_BUILDINGTYPE) return;
 
-	/*
-	**	Actually draw the building shape.
-	*/
-	IsTheaterShape = Class->IsTheater;	//Let Build_Frame know if this is a theater specific shape
-	if (g_AeloriaEnableVerboseDrawLogs && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_TECHNO_DRAW_OBJECT)) {
-		Aeloria_Debug_Log("Building about to call Techno_Draw_Object this=%p Class.Raw=%ld", (void*)this, Class.Raw());
-	}
-	Techno_Draw_Object(shapefile, Shape_Number(), x, y, window);
-	IsTheaterShape = false;
+	if (forceSafeClientDraw) {
+		int drawW = 48;
+		int drawH = 48;
+		BuildingTypeClass const* safe = static_cast<BuildingTypeClass const*>(Aeloria_Safe_Techno_Type(this));
+		if (safe) {
+			safe->Dimensions(drawW, drawH);
+			if (drawW <= 0) drawW = 48;
+			if (drawH <= 0) drawH = 48;
+		}
+		int shapenum = Shape_Number();
+		DLL_Draw_Intercept(shapenum, x, y, drawW, drawH, AELORIA_CLIENT_DRAW_FLAGS_CENTER, const_cast<BuildingClass*>(this), DIR_N, 0x100, nullptr, (char)Owner());
+	} else {
+		if (!Class.Is_Valid()) return;
 
-	/*
-	** Patch for adding overlay onto weapon factory.  Only add the overlay if
-	** the building has more than 1 hp.  Also, if the building's in radio
-	** contact, he must be unloading a constructed vehicle, so draw that
-	** vehicle before drawing the overlay.
-	*/
-	if (BState != BSTATE_CONSTRUCTION) {
-
-		/*
-		**	A Tethered object is always rendered AFTER the building.
-		*/
-		if (*this == STRUCT_WEAP && IsTethered && In_Radio_Contact() && !Contact_With_Whom()->IsInLimbo && Contact_With_Whom()->What_Am_I() != RTTI_BUILDING) {
-			TechnoClass * contact = Contact_With_Whom();
-
-			assert(contact->IsActive);
-			int xxx = x + ((int)Lepton_To_Pixel((int)Coord_X(contact->Render_Coord())) - (int)Lepton_To_Pixel((int)Coord_X(Render_Coord())));
-			int yyy = y + ((int)Lepton_To_Pixel((int)Coord_Y(contact->Render_Coord())) - (int)Lepton_To_Pixel((int)Coord_Y(Render_Coord())));
-			contact->Draw_It(xxx, yyy, window);
-			contact->IsToDisplay = false;
+		if (g_AeloriaEnableVerboseDrawLogs && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_GUARD_PASSED)) {
+			Aeloria_Debug_Log("Building guard passed this=%p Class.Raw=%ld - proceeding to draw", (void*)this, Class.Raw());
 		}
 
-		/*
-		**	Draw the weapon factory custom overlay graphic.
-		*/
-		if ( (*this == STRUCT_WEAP || *this == STRUCT_FAKEWEAP)) {
-			int shapenum = Door_Stage();
-			if (Health_Ratio() <= Rule.ConditionYellow) shapenum += 4;
-			// Added override shape file name. ST - 8/1/2019 5:24PM
-			//Techno_Draw_Object(Class->WarFactoryOverlay, shapenum, x, y, window);
-			Techno_Draw_Object_Virtual(Class->WarFactoryOverlay, shapenum, x, y, window, DIR_N, 0x0100, "WEAP2");
+		if (g_AeloriaEnableVerboseDrawLogs && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_GET_IMAGE_DATA)) {
+			Aeloria_Debug_Log("Building about to access Class->IsTheater / Get_Image_Data this=%p Class.Raw=%ld", (void*)this, Class.Raw());
 		}
+		/*
+		**	The shape file to use for rendering depends on whether the building
+		**	is undergoing construction or not.
+		*/
+		void const * shapefile = Get_Image_Data();
+		if (shapefile == NULL) return;
 
 		/*
-		**	Draw any repair feedback graphic required.
+		**	Actually draw the building shape.
 		*/
-		if (IsRepairing && IsWrenchVisible) {
-			CC_Draw_Shape(ObjectTypeClass::SelectShapes, SELECT_WRENCH, x, y, window, SHAPE_CENTER|SHAPE_WIN_REL);
+		IsTheaterShape = building_type->IsTheater;	//Let Build_Frame know if this is a theater specific shape
+		if (g_AeloriaEnableVerboseDrawLogs && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_TECHNO_DRAW_OBJECT)) {
+			Aeloria_Debug_Log("Building about to call Techno_Draw_Object this=%p Class.Raw=%ld", (void*)this, Class.Raw());
+		}
+		Techno_Draw_Object(shapefile, Shape_Number(), x, y, window);
+		IsTheaterShape = false;
+
+		/*
+		** Patch for adding overlay onto weapon factory.  Only add the overlay if
+		** the building has more than 1 hp.  Also, if the building's in radio
+		** contact, he must be unloading a constructed vehicle, so draw that
+		** vehicle before drawing the overlay.
+		*/
+		if (BState != BSTATE_CONSTRUCTION) {
+
+			/*
+			**	A Tethered object is always rendered AFTER the building.
+			*/
+			if (*this == STRUCT_WEAP && IsTethered && In_Radio_Contact() && !Contact_With_Whom()->IsInLimbo && Contact_With_Whom()->What_Am_I() != RTTI_BUILDING) {
+				TechnoClass * contact = Contact_With_Whom();
+
+				assert(contact->IsActive);
+				int xxx = x + ((int)Lepton_To_Pixel((int)Coord_X(contact->Render_Coord())) - (int)Lepton_To_Pixel((int)Coord_X(Render_Coord())));
+				int yyy = y + ((int)Lepton_To_Pixel((int)Coord_Y(contact->Render_Coord())) - (int)Lepton_To_Pixel((int)Coord_Y(Render_Coord())));
+				contact->Draw_It(xxx, yyy, window);
+				contact->IsToDisplay = false;
+			}
+
+			/*
+			**	Draw the weapon factory custom overlay graphic.
+			*/
+			if ( (*this == STRUCT_WEAP || *this == STRUCT_FAKEWEAP)) {
+				int shapenum = Door_Stage();
+				if (Health_Ratio() <= Rule.ConditionYellow) shapenum += 4;
+				// Added override shape file name. ST - 8/1/2019 5:24PM
+				//Techno_Draw_Object(Class->WarFactoryOverlay, shapenum, x, y, window);
+				Techno_Draw_Object_Virtual(Class->WarFactoryOverlay, shapenum, x, y, window, DIR_N, 0x0100, "WEAP2");
+			}
+
+			/*
+			**	Draw any repair feedback graphic required.
+			*/
+			if (IsRepairing && IsWrenchVisible) {
+				CC_Draw_Shape(ObjectTypeClass::SelectShapes, SELECT_WRENCH, x, y, window, SHAPE_CENTER|SHAPE_WIN_REL);
+			}
 		}
 	}
 
@@ -623,6 +692,9 @@ int BuildingClass::Shape_Number(void) const
 	assert(Buildings.ID(this) == ID);
 	assert(IsActive);
 
+	Aeloria_Repair_Early_Class_Pointer(const_cast<BuildingClass*>(this));
+	BuildingTypeClass const* safe = Aeloria_Building_Safe_Type(this);
+
 	int shapenum = Fetch_Stage();
 
 	/*
@@ -635,8 +707,8 @@ int BuildingClass::Shape_Number(void) const
 		**	If the building is deconstructing, then the display frame progresses
 		**	from the end to the beginning. Reverse the shape number accordingly.
 		*/
-		if (Mission == MISSION_DECONSTRUCTION) {
-			shapenum = (Class->Anims[BState].Start+Class->Anims[BState].Count-1)-shapenum;
+		if (Mission == MISSION_DECONSTRUCTION && safe) {
+			shapenum = (safe->Anims[BState].Start + safe->Anims[BState].Count - 1) - shapenum;
 		}
 
 	} else {
@@ -670,7 +742,7 @@ int BuildingClass::Shape_Number(void) const
 		**	differently than normal buildings. They need to take into consideration
 		**	the direction the turret is facing.
 		*/
-		if (Class->IsTurretEquipped) {
+		if (safe && safe->IsTurretEquipped) {
 			shapenum = UnitClass::BodyShape[Dir_To_32(PrimaryFacing.Current())];
 
 			if (*this == STRUCT_SAM) {
@@ -892,6 +964,8 @@ void BuildingClass::AI(void)
 	assert(Buildings.ID(this) == ID);
 	assert(IsActive);
 
+	BuildingTypeClass const* safeType = Aeloria_Building_Safe_Type(this);
+
 	/*
 	**	Process building animation state changes. Transition to a following state
 	**	if there is one specified and the current animation sequence has expired.
@@ -937,8 +1011,8 @@ void BuildingClass::AI(void)
 	/*
 	**	Building ammo is instantly reloaded.
 	*/
-	if (!Ammo) {
-		Ammo = Class->MaxAmmo;
+	if (!Ammo && safeType) {
+		Ammo = safeType->MaxAmmo;
 	}
 
 	/*
@@ -1132,19 +1206,26 @@ bool BuildingClass::Unlimbo(COORDINATE coord, DirType dir)
 	assert(Buildings.ID(this) == ID);
 	assert(IsActive);
 
+	// Sidebar placement click can hit this before TechnoClass::Unlimbo repairs +8.
+	Aeloria_Seed_Human_Building_Stability(this);
+	BuildingTypeClass const* safe = Aeloria_Building_Safe_Type(this);
+	if (!safe) {
+		return(false);
+	}
+
 	/*
 	**	If this is a wall type building, then it never gets unlimboed. Instead, it gets
 	**	converted to an overlay type.
 	*/
-	if (Class->IsWall) {
+	if (safe->IsWall) {
 		if (Can_Enter_Cell(Coord_Cell(coord), FACING_NONE) == MOVE_OK) {
-			OverlayType otype = Class->Overlay_Type();
+			OverlayType otype = safe->Overlay_Type();
 			if (otype != OVERLAY_NONE) {
 				ObjectClass * o = OverlayTypeClass::As_Reference(otype).Create_One_Of(House);
 				if (o && o->Unlimbo(coord)) {
 					Map[coord].Owner = House->Class->House;
 					Transmit_Message(RADIO_OVER_OUT);
-					Map.Sight_From(Coord_Cell(coord), Class->SightRange, House);
+					Map.Sight_From(Coord_Cell(coord), safe->SightRange, House);
 					delete this;
 					return(true);
 				}
@@ -1162,8 +1243,8 @@ bool BuildingClass::Unlimbo(COORDINATE coord, DirType dir)
 		**	Ensure that the owning house knows about the
 		**	new object.
 		*/
-		House->BScan |= (1L << Class->Type);
-		House->ActiveBScan |= (1L << Class->Type);
+		House->BScan |= (1L << safe->Type);
+		House->ActiveBScan |= (1L << safe->Type);
 
 		/*
 		**	Recalculate the center point of the house's base.
@@ -1200,8 +1281,8 @@ bool BuildingClass::Unlimbo(COORDINATE coord, DirType dir)
 			Map.Flag_To_Redraw(false);
 		}
 
-		if ((Class->Ownable & (HOUSEF_GOOD | HOUSEF_BAD)) != (HOUSEF_GOOD | HOUSEF_BAD)) {
-			if (Class->Ownable & HOUSEF_GOOD) {
+		if ((safe->Ownable & (HOUSEF_GOOD | HOUSEF_BAD)) != (HOUSEF_GOOD | HOUSEF_BAD)) {
+			if (safe->Ownable & HOUSEF_GOOD) {
 				ActLike = HOUSE_GREECE;
 			} else {
 				ActLike = HOUSE_USSR;
@@ -2594,6 +2675,12 @@ void BuildingClass::Grand_Opening(bool captured)
 	assert(Buildings.ID(this) == ID);
 	assert(IsActive);
 
+	BuildingTypeClass const* safe = Aeloria_Building_Safe_Type(this);
+	if (!safe) {
+		Aeloria_Debug_Log("GRAND_OPENING_ABORT this=%p — no safe building type", (void*)this);
+		return;
+	}
+
 	if (!HasOpened || captured) {
 		HasOpened = true;
 
@@ -2601,19 +2688,26 @@ void BuildingClass::Grand_Opening(bool captured)
 		**	Adjust the owning house according to the power, drain, and Tiberium capacity that
 		**	this building has.
 		*/
-		House->Adjust_Drain(Class->Drain);
-		House->Adjust_Capacity(Class->Capacity);
+		House->Adjust_Drain(safe->Drain);
+		House->Adjust_Capacity(safe->Capacity);
 		House->IsRecalcNeeded = true;
 
 		/*	SPECIAL CASE:
 		**	Tiberium Refineries get a free harvester. Add a harvester to the
 		**	reinforcement list at this time.
 		*/
-		if (*this == STRUCT_REFINERY && !ScenarioInit && !captured && !Debug_Map && (!House->IsHuman || PurchasePrice == 0 || PurchasePrice > Class->Raw_Cost())) {
+		if (safe->Type == STRUCT_REFINERY && !ScenarioInit && !captured && !Debug_Map && (!House->IsHuman || PurchasePrice == 0 || PurchasePrice > safe->Raw_Cost())) {
+			Aeloria_Seed_Human_Building_Stability(this);
+			Aeloria_Repair_Early_Class_Pointer(this);
+			Aeloria_Debug_Log("GRAND_OPENING_REFINERY this=%p raw=%d frame=%u", (void*)this, Class.Raw(), Frame);
 			CELL cell = Coord_Cell(Adjacent_Cell(Center_Coord(), DIR_S));
 
 			UnitClass * unit = new UnitClass(UNIT_HARVESTER, House->Class->House);
 			if (unit != NULL) {
+				Aeloria_RelocateHarvesterStability(unit);
+				int units_id = Units.ID(unit);
+				Aeloria_Debug_Log("GRAND_OPENING_HARVESTER_ALLOC refinery=%p harvester=%p units_id=%d frame=%u",
+				                  (void*)this, (void*)unit, units_id, Frame);
 
 				bool success = true;
 
@@ -2637,7 +2731,8 @@ void BuildingClass::Grand_Opening(bool captured)
 					**	to the owner and then bail.
 					*/
 					if (unit->IsInLimbo) {
-						House->Refund_Money(unit->Class->Cost_Of());
+						// Never touch unit->Class-> here — pool-reused slots can have corrupt +8 after failed Unlimbo.
+						House->Refund_Money(UnitTypeClass::As_Reference(UNIT_HARVESTER).Cost_Of());
 						success = false;
 						delete unit;
 					}
@@ -2648,8 +2743,27 @@ void BuildingClass::Grand_Opening(bool captured)
 				**	If we placed the harvester successfully, then mark this
 				**	refinery as its last docking bay.
 				*/
-				if (success) {
+				if (success && unit->IsActive && !unit->IsInLimbo) {
 					unit->LastDockingBayCoord = Center_Coord();
+					Aeloria_RelocateHarvesterStability(unit);
+					int drawW = 48;
+					int drawH = 48;
+					UnitTypeClass const* utype = static_cast<UnitTypeClass const*>(Aeloria_Safe_Techno_Type(unit));
+					if (utype) {
+						utype->Dimensions(drawW, drawH);
+					}
+					if (drawW <= 0) drawW = 48;
+					if (drawH <= 0) drawH = 48;
+					int drawX = 0;
+					int drawY = 0;
+					Map.Coord_To_Pixel(unit->Center_Coord(), drawX, drawY);
+					int shapenum = UnitClass::BodyShape[Dir_To_32(unit->PrimaryFacing)];
+					DLL_Draw_Intercept(shapenum, drawX, drawY, drawW, drawH, AELORIA_CLIENT_DRAW_FLAGS_CENTER,
+					                   unit, DIR_N, 0x100, nullptr, (char)unit->Owner());
+					Aeloria_Debug_Log("GRAND_OPENING_HARVESTER_OK refinery=%p harvester=%p cell=%d frame=%u",
+					                  (void*)this, (void*)unit, (int)cell, Frame);
+				} else {
+					Aeloria_Debug_Log("GRAND_OPENING_HARVESTER_FAIL refinery=%p frame=%u", (void*)this, Frame);
 				}
 			} else {
 
@@ -2658,6 +2772,7 @@ void BuildingClass::Grand_Opening(bool captured)
 				**	the full refund price to the owning player.
 				*/
 				House->Refund_Money(UnitTypeClass::As_Reference(UNIT_HARVESTER).Cost_Of());
+				Aeloria_Debug_Log("GRAND_OPENING_HARVESTER_ALLOC_FAIL refinery=%p frame=%u", (void*)this, Frame);
 			}
 		}
 
@@ -2837,12 +2952,15 @@ ActionType BuildingClass::What_Action(ObjectClass const * object) const
 	assert(Buildings.ID(this) == ID);
 	assert(IsActive);
 
+	Aeloria_Repair_Early_Class_Pointer(const_cast<BuildingClass*>(this));
+	BuildingTypeClass const* safe_self = Aeloria_Building_Safe_Type(this);
+
 	ActionType action = TechnoClass::What_Action(object);
 
 	if (action == ACTION_SELF) {
 		int index;
-		if (Class->Is_Factory() && PlayerPtr == House && *House->Factory_Counter(Class->ToBuild) > 1) {
-			switch (Class->ToBuild) {
+		if (safe_self && safe_self->Is_Factory() && PlayerPtr == House && *House->Factory_Counter(safe_self->ToBuild) > 1) {
+			switch (safe_self->ToBuild) {
 				case RTTI_INFANTRYTYPE:
 				case RTTI_INFANTRY:
 					action = ACTION_NONE;
@@ -2918,7 +3036,7 @@ ActionType BuildingClass::What_Action(ObjectClass const * object) const
 			action = ACTION_NONE;
 		}
 
-		if (Class->PrimaryWeapon != NULL && !Class->PrimaryWeapon->Bullet->IsAntiGround &&
+		if (safe_self && safe_self->PrimaryWeapon != NULL && !safe_self->PrimaryWeapon->Bullet->IsAntiGround &&
 			object->What_Am_I() != RTTI_AIRCRAFT) 
 		{
 			action = ACTION_NONE;
@@ -2954,9 +3072,13 @@ ActionType BuildingClass::What_Action(CELL cell) const
 	assert(Buildings.ID(this) == ID);
 	assert(IsActive);
 
+	Aeloria_Repair_Early_Class_Pointer(const_cast<BuildingClass*>(this));
+
 	ActionType action = TechnoClass::What_Action(cell);
 
-	if (action == ACTION_MOVE && !Can_Have_Rally_Point() && (*this != STRUCT_CONST || !Is_MCV_Deploy())) {
+	BuildingTypeClass const* safe = static_cast<BuildingTypeClass const*>(Aeloria_Safe_Techno_Type(this));
+	StructType structType = safe ? safe->Type : STRUCT_NONE;
+	if (action == ACTION_MOVE && !Can_Have_Rally_Point() && (structType != STRUCT_CONST || !Is_MCV_Deploy())) {
 		action = ACTION_NONE;
 	}
 
@@ -2964,7 +3086,7 @@ ActionType BuildingClass::What_Action(CELL cell) const
 	**	Don't allow targeting of SAM sites, even if the CTRL key
 	**	is held down.
 	*/
-	if (action == ACTION_ATTACK && Class->PrimaryWeapon != NULL && !Class->PrimaryWeapon->Bullet->IsAntiGround) {
+	if (action == ACTION_ATTACK && safe && safe->PrimaryWeapon != NULL && !safe->PrimaryWeapon->Bullet->IsAntiGround) {
 //	if (action == ACTION_ATTACK && (*this == STRUCT_SAM || *this == STRUCT_AAGUN)) {
 		action = ACTION_NONE;
 	}
@@ -2995,6 +3117,8 @@ void BuildingClass::Begin_Mode(BStateType bstate)
 	assert(Buildings.ID(this) == ID);
 	assert(IsActive);
 
+	BuildingTypeClass const* safe = Aeloria_Building_Safe_Type(this);
+
 	QueueBState = bstate;
 	if (BState == BSTATE_NONE || bstate == BSTATE_CONSTRUCTION || ScenarioInit) {
 		BState = bstate;
@@ -3002,7 +3126,7 @@ void BuildingClass::Begin_Mode(BStateType bstate)
 		BuildingTypeClass::AnimControlType const * ctrl = Fetch_Anim_Control();
 
 		int rate = ctrl->Rate;
-		if (Class->IsRegulated && bstate != BSTATE_CONSTRUCTION) {
+		if (safe && safe->IsRegulated && bstate != BSTATE_CONSTRUCTION) {
 			rate = Options.Normalize_Delay(rate);
 		}
 		Set_Rate(rate);
@@ -3030,7 +3154,14 @@ COORDINATE BuildingClass::Center_Coord(void) const
 	assert(Buildings.ID(this) == ID);
 	assert(IsActive);
 
-	return(Coord_Add(Coord, CenterOffset[Class->Size]));
+	BuildingTypeClass const* safe = Aeloria_Building_Safe_Type(this);
+	BSizeType bsize = BSIZE_11;
+	if (safe) {
+		bsize = safe->Size;
+	} else if (Class.Is_Valid()) {
+		bsize = Class->Size;
+	}
+	return(Coord_Add(Coord, CenterOffset[bsize]));
 }
 
 
@@ -3669,6 +3800,14 @@ int BuildingClass::Mission_Construction(void)
 	};
 	switch (Status) {
 		case INITIAL:
+			{
+				// Human sidebar/MCV buildings: stability only, no bulk creation frame (5z-n3/n6).
+				if (g_HumanPlayerHouse != HOUSE_NONE && Owner() == g_HumanPlayerHouse) {
+					Aeloria_Seed_Human_Building_Stability(this);
+				} else {
+					Aeloria_Seed_Building_Creation(this);
+				}
+			}
 			Begin_Mode(BSTATE_CONSTRUCTION);
 			Transmit_Message(RADIO_BUILDING);
 			if (House->IsPlayerControl) {
@@ -3685,12 +3824,22 @@ int BuildingClass::Mission_Construction(void)
 				**	to the construction yard so that it can stop its
 				**	construction animation.
 				*/
+				BuildingTypeClass const* safe = Aeloria_Building_Safe_Type(this);
+				Aeloria_Debug_Log("CONSTRUCTION_COMPLETE this=%p type_enum=%d raw=%d frame=%u",
+				                  (void*)this, safe ? (int)safe->Type : -1, Class.Raw(), Frame);
+
 				Transmit_Message(RADIO_COMPLETE);		// "I'm finished."
 				Transmit_Message(RADIO_OVER_OUT);		// "You're free."
+				// Repair Class before Begin_Mode/Grand_Opening — Fetch_Anim_Control and
+				// Grand_Opening AV when +8 is corrupt on human MCV buildings.
+				Aeloria_Repair_Early_Class_Pointer(this);
 				Begin_Mode(BSTATE_IDLE);
 				Grand_Opening();
 				Assign_Mission(MISSION_GUARD);
-				PrimaryFacing = Class->StartFace;
+				if (safe) {
+					PrimaryFacing = safe->StartFace;
+				}
+				IsReadyToCommence = false;
 			}
 			break;
 
@@ -4692,7 +4841,8 @@ bool BuildingClass::Revealed(HouseClass * house)
 	if (TechnoClass::Revealed(house)) {
 
 		if (!ScenarioInit) {
-			House->JustBuiltStructure = Class->Type;
+			BuildingTypeClass const* safe = Aeloria_Building_Safe_Type(this);
+			House->JustBuiltStructure = safe ? safe->Type : (StructType)(*this);
 			House->IsBuiltSomething = true;
 		}
 		House->IsRecalcNeeded = true;
@@ -5913,6 +6063,7 @@ void BuildingClass::Repair_AI(void)
  *=============================================================================================*/
 void BuildingClass::Animation_AI(void)
 {
+	BuildingTypeClass const* safe = Aeloria_Building_Safe_Type(this);
 	bool stagechange = Graphic_Logic();
 	bool toloop = false;
 
@@ -5921,7 +6072,7 @@ void BuildingClass::Animation_AI(void)
 	*/
 	if (*this == STRUCT_SAM && stagechange) Mark(MARK_CHANGE);
 
-	if ((!Class->IsTurretEquipped && *this != STRUCT_TESLA) || Mission == MISSION_CONSTRUCTION || Mission == MISSION_DECONSTRUCTION) {
+	if ((!(safe && safe->IsTurretEquipped) && *this != STRUCT_TESLA) || Mission == MISSION_CONSTRUCTION || Mission == MISSION_DECONSTRUCTION) {
 		if (stagechange) {
 
 			/*
@@ -6031,7 +6182,12 @@ int BuildingClass::How_Many_Survivors(void) const
 void const * BuildingClass::Get_Image_Data(void) const
 {
 	if (BState == BSTATE_CONSTRUCTION) {
-		return(Class->Get_Buildup_Data());
+		Aeloria_Repair_Early_Class_Pointer(const_cast<BuildingClass*>(this));
+		BuildingTypeClass const* safe = Aeloria_Building_Safe_Type(this);
+		if (safe) {
+			return safe->Get_Buildup_Data();
+		}
+		return Class->Get_Buildup_Data();
 	}
 	return(TechnoClass::Get_Image_Data());
 }
@@ -6291,7 +6447,8 @@ void BuildingClass::SendUnitToRallyPoint(TechnoClass* unit)
 	// Special harvester behavior: after reaching rally point from a refinery, immediately look for more ore
 	if (unit->What_Am_I() == RTTI_UNIT) {
 		UnitClass* u = (UnitClass*)unit;
-		if (u->Class->IsToHarvest) {
+		UnitTypeClass const* utype = static_cast<UnitTypeClass const*>(Aeloria_Safe_Techno_Type(u));
+		if (utype && utype->IsToHarvest) {
 			u->InitHarvest = true;
 		}
 	}

@@ -338,6 +338,14 @@ bool FactoryClass::Set(TechnoTypeClass const & object, HouseClass & house)
 	Object = (TechnoClass *)object.Create_One_Of(&house);
 
 	/*
+	**	Seed safe type cache for human sidebar buildings while still in factory limbo
+	**	(Remastered placement skips Manual_Place; Place click must not AV on Class->).
+	*/
+	if (Object != NULL && house.IsHuman && Object->What_Am_I() == RTTI_BUILDING) {
+		Aeloria_Seed_Human_Building_Stability((BuildingClass*)Object);
+	}
+
+	/*
 	**	Buildings that are constructed, will default to rebuilding on so that
 	**	repair can commence and base rebuilding can occur.
 	*/

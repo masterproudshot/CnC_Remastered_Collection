@@ -88,6 +88,7 @@
 */
 #include "SidebarGlyphx.h"
 
+extern void DLL_Draw_Intercept(int shape_number, int x, int y, int width, int height, int flags, const ObjectClass *object, DirType rotation, long scale, const char *shape_file_name, char override_owner);
 
 int const InfantryClass::HumanShape[32] = {0,0,7,7,7,7,6,6,6,6,5,5,5,5,5,4,4,4,3,3,3,3,2,2,2,2,1,1,1,1,1,0};
 
@@ -357,6 +358,21 @@ ResultType InfantryClass::Take_Damage(int & damage, int distance, WarheadType wa
 	if (res == RESULT_NONE) return(res);
 
 	if (res == RESULT_DESTROYED) {
+		{
+			int typeEnum = -1;
+			InfantryTypeClass const* itype = static_cast<InfantryTypeClass const*>(Aeloria_Safe_Techno_Type(this));
+			if (itype) {
+				typeEnum = (int)itype->Type;
+			}
+			int warheadDeath = 0;
+			WarheadTypeClass const* wh = WarheadTypeClass::As_Pointer(warhead);
+			if (wh) {
+				warheadDeath = (int)wh->InfantryDeath;
+			}
+			Aeloria_Debug_Log("INFANTRY_DESTROYED this=%p owner=%d type_enum=%d frame=%u warhead_death=%d",
+			                  (void*)this, (int)Owner(), typeEnum, Frame, warheadDeath);
+		}
+		Aeloria_ClearObjectTracking(this);
 		if (*this == INFANTRY_TANYA) {
 			IsTanyaDead = true;
 		}
@@ -566,6 +582,60 @@ void InfantryClass::Draw_It(int x, int y, WindowNumberType window) const
 {
 	assert(Infantry.ID(this) == ID);
 	assert(IsActive);
+
+	Aeloria_Repair_Early_Class_Pointer(const_cast<InfantryClass*>(this));
+
+	InfantryTypeClass const* infantry_type = static_cast<InfantryTypeClass const*>(Aeloria_Safe_Techno_Type(this));
+	int drawW = 24;
+	int drawH = 24;
+	if (infantry_type != nullptr) {
+		infantry_type->Dimensions(drawW, drawH);
+	}
+	if (drawW <= 0) drawW = 24;
+	if (drawH <= 0) drawH = 24;
+	DirType rot = PrimaryFacing.Current();
+
+	// LAYERS export uses WINDOW_VIRTUAL. Never call Get_Image_Data / FootClass::Draw_It here —
+	// plausible-but-corrupt +8 (common on E3) AVs in Techno_Draw_Object or Class_Of().
+	if (window == WINDOW_VIRTUAL && infantry_type != nullptr) {
+		DLL_Draw_Intercept(0, x, y, drawW, drawH, AELORIA_CLIENT_DRAW_FLAGS_CENTER,
+		                   const_cast<InfantryClass*>(this), rot, 0x100, nullptr, (char)Owner());
+		return;
+	}
+
+	// Phase 5j: death choreography on MAIN must not call Get_Image_Data / FootClass::Draw_It —
+	// graduated produced infantry (cached MAIN draw) still have corrupt +8 (1231 session: die scream then AV).
+	if (window != WINDOW_VIRTUAL && Doing >= DO_GUN_DEATH && Doing <= DO_FIRE_DEATH) {
+		int typeEnum = infantry_type ? (int)infantry_type->Type : -1;
+		if (Aeloria_ShouldLogOncePerObject(this, AEL_LOG_INFANTRY_DEATH)) {
+			Aeloria_Debug_Log("INFANTRY_DEATH_DRAW this=%p owner=%d frame=%u doing=%d type_enum=%d",
+			                  (void*)this, (int)Owner(), Frame, (int)Doing, typeEnum);
+		}
+		DLL_Draw_Intercept(0, x, y, drawW, drawH, AELORIA_CLIENT_DRAW_FLAGS_CENTER,
+		                   const_cast<InfantryClass*>(this), rot, 0x100, nullptr, (char)Owner());
+		return;
+	}
+
+	// MAIN tactical: produced E3+ can pass plausible +8 while Class is still corrupt.
+	if (window != WINDOW_VIRTUAL
+	    && Aeloria_IsEarlyStartingUnitMainGuarded(static_cast<const ObjectClass*>(this))) {
+		DLL_Draw_Intercept(0, x, y, drawW, drawH, AELORIA_CLIENT_DRAW_FLAGS_CENTER,
+		                   const_cast<InfantryClass*>(this), rot, 0x100, nullptr, (char)Owner());
+		return;
+	}
+
+	if (infantry_type == nullptr) {
+		DLL_Draw_Intercept(0, x, y, drawW, drawH, AELORIA_CLIENT_DRAW_FLAGS_CENTER,
+		                   const_cast<InfantryClass*>(this), rot, 0x100, nullptr, (char)Owner());
+		return;
+	}
+
+	uintptr_t at_plus_8 = *(uintptr_t*)((const char*)this + 8);
+	if (!Is_Plausible_Class_Pointer(at_plus_8)) {
+		DLL_Draw_Intercept(0, x, y, drawW, drawH, AELORIA_CLIENT_DRAW_FLAGS_CENTER,
+		                   const_cast<InfantryClass*>(this), rot, 0x100, nullptr, (char)Owner());
+		return;
+	}
 
 	/*
 	**	Early-out if the Class pointer is not yet valid (can happen very early
@@ -1277,6 +1347,11 @@ void InfantryClass::AI(void)
 		return;
 	}
 
+	InfantryTypeClass const* infantry_type = static_cast<InfantryTypeClass const*>(Aeloria_Safe_Techno_Type(this));
+	if (!infantry_type) {
+		return;
+	}
+
 	if (IsUnloading) Mark(MARK_CHANGE_REDRAW);
 
 	/*
@@ -1317,7 +1392,7 @@ void InfantryClass::AI(void)
 	/*
 	**	Special hack to make sure the dog never attacks a cell.
 	*/
-	if (Class->IsDog && Target_Legal(TarCom) && Is_Target_Cell(TarCom)) {
+	if (infantry_type->IsDog && Target_Legal(TarCom) && Is_Target_Cell(TarCom)) {
 		Assign_Target(TARGET_NONE);
 	}
 
@@ -3464,7 +3539,11 @@ ObjectTypeClass const & InfantryClass::Class_Of(void) const
 	assert(Infantry.ID(this) == ID);
 	assert(IsActive);
 
-	return(*Class);
+	InfantryTypeClass const* infantry_type = Class;
+	if (infantry_type) {
+		return *infantry_type;
+	}
+	return InfantryTypeClass::As_Reference(INFANTRY_E1);
 }
 
 
@@ -3662,6 +3741,9 @@ void InfantryClass::Write_INI(CCINIClass & ini)
  *=============================================================================================*/
 void InfantryClass::Fear_AI(void)
 {
+	InfantryTypeClass const* infantry_type = static_cast<InfantryTypeClass const*>(Aeloria_Safe_Techno_Type(this));
+	if (!infantry_type) return;
+
 	/*
 	**	After a time, the infantry will gain courage.
 	*/
@@ -3674,7 +3756,7 @@ void InfantryClass::Fear_AI(void)
 		**	another clip into his pistol.
 		*/
 		if (Fear == 0 && Ammo == 0 && Is_Weapon_Equipped()) {
-			Ammo = Class->MaxAmmo;
+			Ammo = infantry_type->MaxAmmo;
 		}
 
 		/*
@@ -3690,7 +3772,7 @@ void InfantryClass::Fear_AI(void)
 			**	Drop to the ground if anxious. Don't drop to the ground while moving
 			**	and the special elite flag is active.
 			*/
-			if (!Class->IsDog && Height == 0 && Fear >= FEAR_ANXIOUS && ((!Target_Legal(NavCom) && !IsDriving))) {
+			if (!infantry_type->IsDog && Height == 0 && Fear >= FEAR_ANXIOUS && ((!Target_Legal(NavCom) && !IsDriving))) {
 				Do_Action(DO_LIE_DOWN);
 			}
 		}
@@ -3700,7 +3782,7 @@ void InfantryClass::Fear_AI(void)
 	**	When in darkness or in doubt,
 	**		run in circles, scream, and shout.
 	*/
-	if (Class->IsFraidyCat && Fear > FEAR_ANXIOUS && !IsFalling && !IsDriving && !Target_Legal(NavCom)) {
+	if (infantry_type->IsFraidyCat && Fear > FEAR_ANXIOUS && !IsFalling && !IsDriving && !Target_Legal(NavCom)) {
 		Scatter(0, true);
 	}
 }
@@ -3756,6 +3838,9 @@ bool InfantryClass::Edge_Of_World_AI(void)
  *=============================================================================================*/
 void InfantryClass::Firing_AI(void)
 {
+	InfantryTypeClass const* infantry_type = static_cast<InfantryTypeClass const*>(Aeloria_Safe_Techno_Type(this));
+	if (!infantry_type) return;
+
 	if (Target_Legal(TarCom)) {
 		int primary = What_Weapon_Should_I_Use(TarCom);
 
@@ -3785,7 +3870,7 @@ void InfantryClass::Firing_AI(void)
 							Assign_Target(TARGET_NONE);
 						}
 #endif
-					} else if (Class->IsDog) {
+					} else if (infantry_type->IsDog) {
 						Assign_Target(TARGET_NONE);
 					}
 					break;
@@ -3980,6 +4065,9 @@ void InfantryClass::Doing_AI(void)
  *=============================================================================================*/
 void InfantryClass::Movement_AI(void)
 {
+	InfantryTypeClass const* infantry_type = static_cast<InfantryTypeClass const*>(Aeloria_Safe_Techno_Type(this));
+	if (!infantry_type) return;
+
 	/*
 	**	Special hack check to ensure that infantry will never get stuck in a movement order if
 	**	there is no place to go.
@@ -4011,9 +4099,9 @@ void InfantryClass::Movement_AI(void)
 			**	that it can't travel to. In such a case, abort the movement process by clearing
 			**	the navigation computer.
 			*/
-			if ((!IsZoneCheat || Can_Enter_Cell(Coord_Cell(Coord)) != MOVE_NO) && !IsDriving && !IsTethered && Target_Legal(NavCom) && IsLocked && Map[Coord].Zones[Class->MZone] != Map[As_Cell(NavCom)].Zones[Class->MZone]) {
+			if ((!IsZoneCheat || Can_Enter_Cell(Coord_Cell(Coord)) != MOVE_NO) && !IsDriving && !IsTethered && Target_Legal(NavCom) && IsLocked && Map[Coord].Zones[infantry_type->MZone] != Map[As_Cell(NavCom)].Zones[infantry_type->MZone]) {
 // hack: if it's tanya, spy, or engineer, let 'em move there anyway.
-				if (!Class->IsCapture && Mission != MISSION_ENTER) {
+				if (!infantry_type->IsCapture && Mission != MISSION_ENTER) {
 //				if (*this != INFANTRY_TANYA && *this != INFANTRY_SPY && *this != INFANTRY_RENOVATOR) {
 					Assign_Destination(TARGET_NONE);
 				}

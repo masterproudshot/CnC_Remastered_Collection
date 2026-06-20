@@ -105,6 +105,7 @@ extern void Logic_Switch_Player_Context(ObjectClass *object);
 extern void Logic_Switch_Player_Context(HouseClass *object);
 extern void On_Special_Weapon_Targetting(const HouseClass* player_ptr, SpecialWeaponType weapon_type);
 extern bool Is_Legacy_Render_Enabled(void);
+extern void DLL_Draw_Intercept(int shape_number, int x, int y, int width, int height, int flags, const ObjectClass *object, DirType rotation, long scale, const char *shape_file_name, char override_owner);
 
 
 static int _GapShroudXTable[]={
@@ -435,6 +436,11 @@ void UnitClass::AI(void)
 		return;
 	}
 
+	const UnitTypeClass* unit_type = Class;
+	if (!unit_type) {
+		return;
+	}
+
 	/*
 	**	Hack check to ensure that a harvester won't harvest if it is not harvesting.
 	*/
@@ -486,7 +492,7 @@ void UnitClass::AI(void)
 	**	Transporters require special logic handled here since there isn't a MISSION_WAIT_FOR_PASSENGERS
 	**	mission that they can follow. Passenger loading is merely a part of their normal operation.
 	*/
-	if (Class->Max_Passengers() > 0) {
+	if (unit_type->Max_Passengers() > 0) {
 
 		/*
 		**	Double check that there is a passenger that is trying to load or unload.
@@ -515,7 +521,7 @@ void UnitClass::AI(void)
 	/*
 	**	Mobile gap generators regenerate their gap every so often (just in case).
 	*/
-	if (Class->IsGapper && !IsDriving && (Frame % TICKS_PER_SECOND) == 0) {
+	if (unit_type->IsGapper && !IsDriving && (Frame % TICKS_PER_SECOND) == 0) {
 		Shroud_Regen();
 	}
 }
@@ -538,10 +544,13 @@ void UnitClass::AI(void)
  *=============================================================================================*/
 void UnitClass::Rotation_AI(void)
 {
+	const UnitTypeClass* unit_type = Class;
+	if (!unit_type) return;
+
 	if (Target_Legal(TarCom) && !IsRotating) {
 		DirType dir = Direction(TarCom);
 
-		if (Class->IsTurretEquipped) {
+		if (unit_type->IsTurretEquipped) {
 			SecondaryFacing.Set_Desired(dir);
 		} else {
 
@@ -551,27 +560,27 @@ void UnitClass::Rotation_AI(void)
 			**	applies only to tracked vehicles. Wheeled vehicles never rotate to face the
 			**	target, since they aren't maneuverable enough.
 			*/
-			if ((Class->Speed == SPEED_TRACK /* || *this == UNIT_BIKE */ ) && !Target_Legal(NavCom) && !IsDriving && PrimaryFacing.Difference(dir)) {
+			if ((unit_type->Speed == SPEED_TRACK /* || *this == UNIT_BIKE */ ) && !Target_Legal(NavCom) && !IsDriving && PrimaryFacing.Difference(dir)) {
 				PrimaryFacing.Set_Desired(dir);
 			}
 		}
 	}
 
-	if (Class->IsRadarEquipped) {
+	if (unit_type->IsRadarEquipped) {
 		Mark(MARK_CHANGE_REDRAW);
 		SecondaryFacing.Set((DirType)(SecondaryFacing.Current() + 8));
 		Mark(MARK_CHANGE_REDRAW);
 	} else {
 
 		IsRotating = false;
-		if (Class->IsTurretEquipped) {
+		if (unit_type->IsTurretEquipped) {
 			if (IsTurretLockedDown) {
 				SecondaryFacing.Set_Desired(PrimaryFacing.Current());
 			}
 
 			if (SecondaryFacing.Is_Rotating()) {
 				Mark(MARK_CHANGE_REDRAW);
-				if (SecondaryFacing.Rotation_Adjust(Class->ROT+1)) {
+				if (SecondaryFacing.Rotation_Adjust(unit_type->ROT+1)) {
 					Mark(MARK_CHANGE_REDRAW);
 				}
 
@@ -579,7 +588,7 @@ void UnitClass::Rotation_AI(void)
 				**	If no further rotation is necessary, flag that the rotation
 				**	has stopped.
 				*/
-				if (!Class->IsRadarEquipped) {
+				if (!unit_type->IsRadarEquipped) {
 					IsRotating = SecondaryFacing.Is_Rotating();
 				}
 			} else {
@@ -642,13 +651,16 @@ bool UnitClass::Edge_Of_World_AI(void)
  *=============================================================================================*/
 void UnitClass::Reload_AI(void)
 {
-	if (*this == UNIT_V2_LAUNCHER && Ammo < Class->MaxAmmo) {
+	const UnitTypeClass* unit_type = Class;
+	if (!unit_type) return;
+
+	if (*this == UNIT_V2_LAUNCHER && Ammo < unit_type->MaxAmmo) {
 		if (IsDriving) {
 			Reload = Reload + 1;
 		} else {
 			if (Reload == 0) {
 				Ammo++;
-				if (Ammo < Class->MaxAmmo) {
+				if (Ammo < unit_type->MaxAmmo) {
 					Reload = TICKS_PER_SECOND*30;
 				}
 				Mark(MARK_CHANGE);
@@ -674,7 +686,10 @@ void UnitClass::Reload_AI(void)
  *=============================================================================================*/
 void UnitClass::Firing_AI(void)
 {
-	if (Target_Legal(TarCom) && Class->PrimaryWeapon != NULL) {
+	const UnitTypeClass* unit_type = Class;
+	if (!unit_type) return;
+
+	if (Target_Legal(TarCom) && unit_type->PrimaryWeapon != NULL) {
 
 		/*
 		**	Determine which weapon can fire. First check for the primary weapon. If that weapon
@@ -685,7 +700,7 @@ void UnitClass::Firing_AI(void)
 		FireErrorType ok = Can_Fire(TarCom, primary);
 		switch (ok) {
 			case FIRE_OK:
-				if (!((UnitClass *)this)->Class->IsFireAnim) {
+				if (!unit_type->IsFireAnim) {
 					Mark(MARK_OVERLAP_UP);
 					IsFiring = false;
 					Mark(MARK_OVERLAP_DOWN);
@@ -696,9 +711,9 @@ void UnitClass::Firing_AI(void)
 
 			case FIRE_FACING:
 #ifdef FIXIT_CSII	//	checked - ajw 9/28/98
-				if (Class->IsLockTurret || Class->Type == UNIT_DEMOTRUCK) {
+				if (unit_type->IsLockTurret || unit_type->Type == UNIT_DEMOTRUCK) {
 #else
-				if (Class->IsLockTurret) {
+				if (unit_type->IsLockTurret) {
 #endif
 					if (!Target_Legal(NavCom) && !IsDriving) {
 						PrimaryFacing.Set_Desired(Direction(TarCom));
@@ -945,6 +960,8 @@ bool UnitClass::Unlimbo(COORDINATE coord, DirType dir)
 	assert(Units.ID(this) == ID);
 	assert(IsActive);
 
+	Aeloria_Repair_Early_Class_Pointer(this);
+
 	/*
 	**	All units must start out facing one of the 8 major directions.
 	*/
@@ -956,8 +973,17 @@ bool UnitClass::Unlimbo(COORDINATE coord, DirType dir)
 		**	Ensure that the owning house knows about the
 		**	new object.
 		*/
-		House->UScan |= (1L << Class->Type);
-		House->ActiveUScan |= (1L << Class->Type);
+		UnitType unit_type = UNIT_NONE;
+		UnitTypeClass const* safe = static_cast<UnitTypeClass const*>(Aeloria_Safe_Techno_Type(this));
+		if (safe) {
+			unit_type = safe->Type;
+		} else if (Class.Is_Valid()) {
+			unit_type = Class->Type;
+		}
+		if (unit_type != UNIT_NONE) {
+			House->UScan |= (1L << unit_type);
+			House->ActiveUScan |= (1L << unit_type);
+		}
 
 		/*
 		**	If it starts off the edge of the map, then it already starts cloaked.
@@ -1369,7 +1395,8 @@ void UnitClass::Enter_Idle_Mode(bool initial)
 	} else {
 
 		if (!Is_Weapon_Equipped()) {
-			if (Class->IsToHarvest) {
+			UnitTypeClass const* safe_utype = static_cast<UnitTypeClass const*>(Aeloria_Safe_Techno_Type(this));
+			if (safe_utype && safe_utype->IsToHarvest) {
 				if (!In_Radio_Contact() && Mission != MISSION_HARVEST && MissionQueue != MISSION_HARVEST) {
 					if (initial || InitHarvest || !House->IsHuman || Map[Coord].Land_Type() == LAND_TIBERIUM) {
 						order = MISSION_HARVEST;
@@ -1962,6 +1989,11 @@ int UnitClass::Shape_Number(void) const
 	assert(Units.ID(this) == ID);
 	assert(IsActive);
 
+	const UnitTypeClass* unit_type = static_cast<const UnitTypeClass*>(Aeloria_Safe_Techno_Type(this));
+	if (!unit_type) {
+		return UnitClass::BodyShape[Dir_To_32(PrimaryFacing)];
+	}
+
 	int			shapenum;		// Working shape number.
 	int			facing = Dir_To_32(PrimaryFacing);
 	int			tfacing = Dir_To_32(SecondaryFacing);
@@ -1971,7 +2003,7 @@ int UnitClass::Shape_Number(void) const
 	/*
 	**	This handles the ant case.
 	*/
-	if (Class->Rotation == 8)  {
+	if (unit_type->Rotation == 8)  {
 
 		/*
 		**	The starting frame is based on the facing of the unit.
@@ -2001,8 +2033,8 @@ int UnitClass::Shape_Number(void) const
 	if (IsHarvesting && !PrimaryFacing.Is_Rotating() && !NavCom && !IsDriving) {
 //			static char _hstage[] = {0, 1, 2, 3, 4, 5, 6, 7, 0};
 		unsigned stage = Fetch_Stage();
-		if (stage >= ARRAY_SIZE(Class->Harvester_Load_List)) stage = ARRAY_SIZE(Class->Harvester_Load_List)-1;
-		shapenum = 32 + (((UnitClass::BodyShape[facing]+2)/4)*Class->Harvester_Load_Count)+Class->Harvester_Load_List[stage];
+		if (stage >= ARRAY_SIZE(unit_type->Harvester_Load_List)) stage = ARRAY_SIZE(unit_type->Harvester_Load_List)-1;
+		shapenum = 32 + (((UnitClass::BodyShape[facing]+2)/4)*unit_type->Harvester_Load_Count)+unit_type->Harvester_Load_List[stage];
 	} else {
 		/*
 		** If the harvester's dumping a load of ore, show that animation
@@ -2016,17 +2048,17 @@ int UnitClass::Shape_Number(void) const
 				}
 				shapenum = 32 + stage + (UnitClass::BodyShape[facing]/4)*8;
 			} else {
-				if (stage >= ARRAY_SIZE(Class->Harvester_Dump_List)) stage = ARRAY_SIZE(Class->Harvester_Dump_List)-1;
-				shapenum = Class->Harvester_Dump_List[stage]+96;
+				if (stage >= ARRAY_SIZE(unit_type->Harvester_Dump_List)) stage = ARRAY_SIZE(unit_type->Harvester_Dump_List)-1;
+				shapenum = unit_type->Harvester_Dump_List[stage]+96;
 			}
 #else
-			if (stage >= ARRAY_SIZE(Class->Harvester_Dump_List)) stage = ARRAY_SIZE(Class->Harvester_Dump_List)-1;
-			shapenum = Class->Harvester_Dump_List[stage]+96;
+			if (stage >= ARRAY_SIZE(unit_type->Harvester_Dump_List)) stage = ARRAY_SIZE(unit_type->Harvester_Dump_List)-1;
+			shapenum = unit_type->Harvester_Dump_List[stage]+96;
 #endif
 		} else {
 			shapenum = UnitClass::BodyShape[facing];
 
-			if (Class->IsAnimating) {
+			if (unit_type->IsAnimating) {
 				shapenum = Fetch_Stage();
 			}
 
@@ -2084,16 +2116,121 @@ int UnitClass::Shape_Number(void) const
  *   01/07/1995 JLB : Harvester animation support.                                             *
  *   07/08/1995 JLB : Uses general purpose draw routine.                                       *
  *=============================================================================================*/
+// BodyShape[0] is 0 by design (north-facing). Guarded safe draws must never pass shape 0 to
+// DLL_Draw_Intercept or NotifyMainDrawCache — produced harvesters stalled bulk graduation (5z-n7).
+static int Aeloria_GuardedUnitShapeNumber(const UnitClass* unit)
+{
+	if (!unit) {
+		return UnitClass::BodyShape[16];
+	}
+	// Use static body facing only — Shape_Number() can return harvester anim frames (32+)
+	// that stress the client intercept on pool-reused units with corrupt +8.
+	int facing = Dir_To_32(unit->PrimaryFacing);
+	int shapenum = UnitClass::BodyShape[facing];
+	if (shapenum > 0) {
+		return shapenum;
+	}
+	return UnitClass::BodyShape[16];
+}
+
+static void Aeloria_LogProducedUnitFirstDrawIfNeeded(const UnitClass* unit, WindowNumberType window,
+                                                     int guarded, int bad_plus_8)
+{
+	uintptr_t key = reinterpret_cast<uintptr_t>(unit);
+	auto it = g_AeloriaObjectStability.find(key);
+	if (it == g_AeloriaObjectStability.end() || !it->second.producedUnitUnlimboSeeded) {
+		return;
+	}
+	uint8_t bit = (window == WINDOW_VIRTUAL) ? 0x01u : 0x02u;
+	if (it->second.producedUnitFirstDrawMask & bit) {
+		return;
+	}
+	it->second.producedUnitFirstDrawMask |= bit;
+	const char* winName = (window == WINDOW_VIRTUAL) ? "VIRTUAL" : "MAIN";
+	Aeloria_Debug_Log("PRODUCED_UNIT_FIRST_DRAW this=%p owner=%d frame=%u window=%s guarded=%d bad_plus_8=%d type_enum=%d",
+	                  (void*)unit, (int)unit->Owner(), Frame, winName, guarded, bad_plus_8,
+	                  (int)it->second.cachedTypeEnum);
+}
+
 void UnitClass::Draw_It(int x, int y, WindowNumberType window) const
 {
 	assert(Units.ID(this) == ID);
 	assert(IsActive);
+
+	Aeloria_Repair_Early_Class_Pointer(const_cast<UnitClass*>(this));
 
 	/*
 	**	Early-out if the Class pointer is not yet valid (can happen very early
 	**	during scenario load before TypeClasses are fully constructed).
 	*/
 	if (!Is_Drawable(this)) return;
+
+	const UnitTypeClass* unit_type = static_cast<const UnitTypeClass*>(Aeloria_Safe_Techno_Type(this));
+	if (unit_type == nullptr) return;
+
+	int drawW = 48;
+	int drawH = 48;
+	unit_type->Dimensions(drawW, drawH);
+	if (drawW <= 0) drawW = 48;
+	if (drawH <= 0) drawH = 48;
+
+	uintptr_t at_plus_8 = *(uintptr_t*)((const char*)this + 8);
+	const bool bad_plus_8 = !Is_Plausible_Class_Pointer(at_plus_8);
+	const ObjectClass* selfObj = static_cast<const ObjectClass*>(this);
+	const bool repurposedHarvester = Aeloria_IsRepurposedHarvester(selfObj);
+	const bool producedTracked = Aeloria_IsProducedUnitUnlimboSeeded(selfObj);
+	const bool eternalProduced = Aeloria_IsEternalSafeProducedUnit(selfObj);
+	const bool producedHarvester = Aeloria_IsProducedBadPlus8Harvester(selfObj);
+	// producedTracked alone: defense-in-depth if stab flags were lost but Unlimbo seed survived (5z-n8b).
+	const bool producedBadPlus8 = eternalProduced
+	                              || Aeloria_IsProducedBadPlus8Unit(selfObj)
+	                              || producedTracked
+	                              || (bad_plus_8 && producedTracked);
+	const bool needsMainGuard = Aeloria_IsEarlyStartingUnitMainGuarded(selfObj);
+	const int guardedFlag = (needsMainGuard || repurposedHarvester || producedBadPlus8) ? 1 : 0;
+
+	// LAYERS export uses WINDOW_VIRTUAL. Never call Get_Image_Data / Techno_Draw_Object here —
+	// produced war-factory units can pass plausible +8 while Class is still corrupt.
+	if (window == WINDOW_VIRTUAL) {
+		Aeloria_LogProducedUnitFirstDrawIfNeeded(this, window, guardedFlag, bad_plus_8 ? 1 : 0);
+		if (needsMainGuard && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_PLAYER_CREATION)) {
+			Aeloria_Debug_Log("UNIT_VIRTUAL_GUARD this=%p owner=%d frame=%u (safe VIRTUAL draw)",
+			                  (void*)this, (int)Owner(), Frame);
+		}
+		int virtualShape = 0;
+		if (producedTracked) {
+			virtualShape = 0;
+		} else if (repurposedHarvester || producedBadPlus8 || needsMainGuard) {
+			virtualShape = Aeloria_GuardedUnitShapeNumber(this);
+		}
+		DLL_Draw_Intercept(virtualShape, x, y, drawW, drawH, AELORIA_CLIENT_DRAW_FLAGS_CENTER,
+		                   const_cast<UnitClass*>(this), DIR_N, 0x100, nullptr, (char)Owner());
+		return;
+	}
+
+	if ((repurposedHarvester || producedBadPlus8 || needsMainGuard)
+	    && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_PLAYER_CREATION)) {
+		const char* guardTag = (repurposedHarvester || producedHarvester) ? "HARVESTER_MAIN_GUARD"
+		                     : (producedBadPlus8 ? "PRODUCED_UNIT_MAIN_GUARD" : "UNIT_MAIN_GUARD");
+		Aeloria_Debug_Log("%s this=%p owner=%d frame=%u (safe MAIN draw; corrupt +8 guard)",
+		                  guardTag, (void*)this, (int)Owner(), Frame);
+	}
+	if (bad_plus_8 || repurposedHarvester || producedBadPlus8 || needsMainGuard) {
+		Aeloria_LogProducedUnitFirstDrawIfNeeded(this, window, guardedFlag, bad_plus_8 ? 1 : 0);
+		int shapenum = Aeloria_GuardedUnitShapeNumber(this);
+		// WF-produced: cache MAIN before intercept; use shape 0 intercept (matches unlimbo seed — 5z-n8).
+		// Starting-unit MAIN notify still forbidden (5z-n4b).
+		if (drawW > 0 && drawH > 0 && producedTracked) {
+			Aeloria_TryNotifyProducedUnitMainDrawCache(selfObj, shapenum, drawW, drawH, x, y, bad_plus_8);
+		}
+		int interceptShape = producedTracked ? 0 : shapenum;
+		DLL_Draw_Intercept(interceptShape, x, y, drawW, drawH, AELORIA_CLIENT_DRAW_FLAGS_CENTER,
+		                   const_cast<UnitClass*>(this), DIR_N, 0x100, nullptr, (char)Owner());
+		// Phase 5i: skip DriveClass::Draw_It on guarded MAIN — matches infantry (no FootClass on safe path).
+		return;
+	}
+
+	Aeloria_LogProducedUnitFirstDrawIfNeeded(this, window, 0, bad_plus_8 ? 1 : 0);
 
 	if (Aeloria_ShouldLogVerbose(this) && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_GUARD_PASSED)) {
 		Aeloria_Debug_Log("Unit guard passed this=%p Class.Raw=%ld - proceeding to draw", (void*)this, Class.Raw());
@@ -2150,7 +2287,9 @@ void UnitClass::Draw_It(int x, int y, WindowNumberType window) const
 			                  (void*)this, Class.Raw());
 		}
 
-		if (Class->IsRadarEquipped) {
+		bool safeForRadarExtras = Is_Plausible_Class_Pointer(at_plus_8)
+			&& !Aeloria_IsEarlyStartingUnitMainGuarded(static_cast<const ObjectClass*>(this));
+		if (safeForRadarExtras && unit_type->IsRadarEquipped) {
 			/*
 			**	Pragmatic Option A diagnostic (May 2026):
 			**	During the early-load grace frame, log the exact parameters we are about to
@@ -2167,7 +2306,7 @@ void UnitClass::Draw_It(int x, int y, WindowNumberType window) const
 			if (*this == UNIT_MGG) {
 				int x2 = x, y2 = y;
 				shapenum = 32 + (Frame & 7);
-				Class->Turret_Adjust(PrimaryFacing, x2, y2);
+				unit_type->Turret_Adjust(PrimaryFacing, x2, y2);
 				Techno_Draw_Object(shapefile, shapenum, x2, y2, window);
 			} else {
 //#ifdef FIXIT_PHASETRANSPORT	//	checked - ajw 9/28/98
@@ -2195,7 +2334,7 @@ void UnitClass::Draw_It(int x, int y, WindowNumberType window) const
 		**	If there is a turret, then it must be rendered as well. This may include
 		**	firing animation if required.
 		*/
-		if (/*!Class->IsChunkyShape &&*/ Class->IsTurretEquipped) {
+		if (unit_type->IsTurretEquipped) {
 			int xx = x;
 			int yy = y;
 
@@ -2216,7 +2355,7 @@ void UnitClass::Draw_It(int x, int y, WindowNumberType window) const
 				Recoil_Adjust(SecondaryFacing, xx, yy);
 			}
 
-			Class->Turret_Adjust(PrimaryFacing, xx, yy);
+			unit_type->Turret_Adjust(PrimaryFacing, xx, yy);
 
 			/*
 			**	Actually perform the draw. Overlay an optional shimmer effect as necessary.
@@ -2232,7 +2371,7 @@ void UnitClass::Draw_It(int x, int y, WindowNumberType window) const
 		shapefile = MFCD::Retrieve("FLAGFLY.SHP");
 		int flag_x = x + (ICON_PIXEL_W / 2) - 2;
 		int flag_y = y + (3 * ICON_PIXEL_H / 4) - Get_Build_Frame_Height(shapefile);
-		CC_Draw_Shape(this, "FLAGFLY", shapefile, Frame % 14, flag_x, flag_y, window, SHAPE_CENTER|SHAPE_FADING|SHAPE_GHOST, HouseClass::As_Pointer(Flagged)->Remap_Table(false, Class->Remap), Map.UnitShadow, DIR_N, 0x0100, Flagged);
+		CC_Draw_Shape(this, "FLAGFLY", shapefile, Frame % 14, flag_x, flag_y, window, SHAPE_CENTER|SHAPE_FADING|SHAPE_GHOST, HouseClass::As_Pointer(Flagged)->Remap_Table(false, unit_type->Remap), Map.UnitShadow, DIR_N, 0x0100, Flagged);
 	}
 
 	DriveClass::Draw_It(x, y, window);
@@ -2399,7 +2538,8 @@ bool UnitClass::Goto_Tiberium(int rad)
  *=============================================================================================*/
 BuildingClass * UnitClass::FindBestRefinery(bool friendly) const
 {
-	if (!Class->IsToHarvest) {
+	UnitTypeClass const* safe_utype = static_cast<UnitTypeClass const*>(Aeloria_Safe_Techno_Type(this));
+	if (!safe_utype || !safe_utype->IsToHarvest) {
 		return nullptr;
 	}
 
@@ -2987,7 +3127,8 @@ int UnitClass::Mission_Harvest(void)
 	**	A non-harvesting type unit will just sit still if it is given the harvest mission. This
 	**	allows combat units to act "brain dead".
 	*/
-	if (!Class->IsToHarvest) return(TICKS_PER_SECOND*30);
+	UnitTypeClass const* safe_utype = static_cast<UnitTypeClass const*>(Aeloria_Safe_Techno_Type(this));
+	if (!safe_utype || !safe_utype->IsToHarvest) return(TICKS_PER_SECOND*30);
 
 	InitHarvest = false;
 
@@ -3297,7 +3438,8 @@ short const * UnitClass::Overlap_List(bool redraw) const
 	if (redraw && (Is_Selected_By_Player() || IsFiring)) {
 		size += 24;
 	}
-	if (Class->IsGigundo || IsAnimAttached) {
+	UnitTypeClass const* unit_type = Class;
+	if ((unit_type && unit_type->IsGigundo) || IsAnimAttached) {
 		size = ICON_PIXEL_W*2;
 	}
 
@@ -3823,7 +3965,8 @@ ActionType UnitClass::What_Action(CELL cell) const
 	assert(IsActive);
 
 	ActionType action = DriveClass::What_Action(cell);
-	if (action == ACTION_MOVE && Map[cell].Land_Type() == LAND_TIBERIUM && Class->IsToHarvest) {
+	const UnitTypeClass* unit_type = static_cast<const UnitTypeClass*>(Aeloria_Safe_Techno_Type(this));
+	if (unit_type && action == ACTION_MOVE && Map[cell].Land_Type() == LAND_TIBERIUM && unit_type->IsToHarvest) {
 		return(ACTION_HARVEST);
 	}
 #ifdef FIXIT_CSII	//	checked - ajw 9/28/98
@@ -3906,7 +4049,8 @@ int UnitClass::Mission_Guard(void)
 {
 	assert(Units.ID(this) == ID);
 	assert(IsActive);
-	if (/*House->IsBaseBuilding &&*/ !House->IsHuman && Class->IsToHarvest && House->Get_Quantity(STRUCT_REFINERY) > 0 && !House->IsTiberiumShort) {
+	UnitTypeClass const* guard_utype = static_cast<UnitTypeClass const*>(Aeloria_Safe_Techno_Type(this));
+	if (/*House->IsBaseBuilding &&*/ !House->IsHuman && guard_utype && guard_utype->IsToHarvest && House->Get_Quantity(STRUCT_REFINERY) > 0 && !House->IsTiberiumShort) {
 		Assign_Mission(MISSION_HARVEST);
 		return(1);
 //		return(MissionControl[Mission].Normal_Delay() + Random_Pick(0, 2));
@@ -3963,7 +4107,8 @@ int UnitClass::Mission_Enter(void)
 	assert(Units.ID(this) == ID);
 	assert(IsActive);
 
-	if (!Class->IsToHarvest) {
+	UnitTypeClass const* enter_utype = static_cast<UnitTypeClass const*>(Aeloria_Safe_Techno_Type(this));
+	if (!enter_utype || !enter_utype->IsToHarvest) {
 		return FootClass::Mission_Enter();
 	}
 
@@ -4577,7 +4722,11 @@ ObjectTypeClass const & UnitClass::Class_Of(void) const
 	assert(Units.ID(this) == ID);
 	assert(IsActive);
 
-	return(*Class);
+	UnitTypeClass const* unit_type = Class;
+	if (unit_type) {
+		return *unit_type;
+	}
+	return UnitTypeClass::As_Reference(UNIT_JEEP);
 }
 
 

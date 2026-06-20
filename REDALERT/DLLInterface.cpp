@@ -31,6 +31,7 @@
 #include <vector>
 #include <set>
 #include <map>
+#include <algorithm>
 
 #include	"function.h"
 #include "externs.h"
@@ -611,11 +612,24 @@ int g_PlayerExemptionFrames = 0;
 int g_HumanPlayerDrawAttempts = 0;   // times we reached a draw attempt for a human-owned object during the window
 int g_HumanPlayerFallbackUses   = 0;   // times we had to use the safe default size because Get_Build_Frame_* returned <=0
 
+// Guard hit rate counters (Item 7)
+int g_AeloriaPlayerGuardHits = 0;
+int g_AeloriaNonPlayerGuardHits = 0;
+
+// Demotion counter (for Item 3)
+int g_AeloriaPromotedThenDemoted = 0;
+
 DWORD g_FirstRenderTick = 0;   // Set exactly once at the first Map.Render() after ScenarioInit drops to 0
 
 // Per-object per-message log-once tracker (see OBJECT.H for rationale).
 // Cleared on exemption window expiration so a future match would start fresh (rare).
 std::map<uintptr_t, uint32_t> g_AeloriaObjectLogMask;
+
+// Per-object stabilization state (see OBJECT.H for struct definition)
+std::map<uintptr_t, AeloriaObjectStability> g_AeloriaObjectStability;
+
+// Per-object creation frame (for creation + first-draw correlation).
+std::map<uintptr_t, uint32_t> g_AeloriaObjectCreationFrame;
 
 // Master verbose draw diagnostics toggle (see OBJECT.H declaration for full docs).
 // Default false (clean + fast for normal play). The launcher -DebugMode flag sets the
@@ -623,61 +637,167 @@ std::map<uintptr_t, uint32_t> g_AeloriaObjectLogMask;
 // (via the read in CNC_Init below). This is what makes "the debugmode flag flips the loggins switch on".
 bool g_AeloriaEnableVerboseDrawLogs = false;
 
+// infantry-scale Phase 2: healthy barracks infantry skip per-object tracking maps.
+bool g_AeloriaZeroMapProducedInfantry = true;
+// infantry-scale Phase 3b: stateless DLL_Draw_Intercept for untracked techno (all RTTI) on corrupt +8.
+bool g_AeloriaStatelessUntrackedTechno = true;
+
+// infantry-scale Phase 5: per-frame LAYERS sustain for zero-map produced infantry (flicker fix).
+static std::set<uintptr_t> g_AeloriaStatelessInfantryHotList;
+static const size_t AELORIA_STATELESS_HOTLIST_MAX = 128;
+
+// Generate a short unique ID similar to the Python BLAKE2b + UUIDv4 script the user provided.
+// Uses CoCreateGuid for randomness + first 6 bytes formatted as 8-4 hex (48 bits entropy).
+static std::string GenerateAeloriaShortLogId()
+{
+	char envId[64] = {};
+	if (GetEnvironmentVariableA("AELORIA_LOG_SESSION_ID", envId, sizeof(envId)) > 0 && envId[0]) {
+		return std::string(envId);
+	}
+
+    GUID guid;
+    if (CoCreateGuid(&guid) != S_OK)
+    {
+        return "00000000-0000";
+    }
+
+    // Take first 6 bytes of the GUID
+    unsigned char bytes[6];
+    memcpy(bytes, &guid, 6);
+
+    char hex[13];
+    snprintf(hex, sizeof(hex), "%02x%02x%02x%02x%02x%02x",
+             bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]);
+
+    char shortId[14];
+    snprintf(shortId, sizeof(shortId), "%s-%s", std::string(hex, 8).c_str(), std::string(hex + 8, 4).c_str());
+
+    return shortId;
+}
+
+// Milestone / corruption messages that must survive when verbose draw logging is off.
+// Everything else (per-frame placeholder, sustain bulk, client intercept, etc.) is suppressed.
+static bool Aeloria_IsCriticalLogMessage(const char *fmt)
+{
+	if (!fmt || !fmt[0]) return false;
+
+	static const char *critical[] = {
+		"SEVERE",
+		"PLAYER_OBJECT_CREATED",
+		"PLAYER_EXEMPTION_SEVERE",
+		"CREATION_MAP_CLEARED",
+		"FIRST RENDER",
+		"HUMAN PLAYER HOUSE",
+		"EARLY LOAD GRACE",
+		"PLAYER EXEMPTION (Phase",
+		"OFFSETS:",
+		"FIRST_RENDER_SNAPSHOT",
+		"WINDOW_EXPIRED",
+		"WINDOW_EXPIRED_PRUNE",
+		"AELORIA_STABILITY_REPORT",
+		"GUARD_HIT_RATE",
+		"STABILIZATION_SPEED",
+		"FORCED_CATCHUP_HASCREATION",
+		"WORST_OFFENDER",
+		"(All tracked objects",
+		"CNC_INIT",
+		"AELORIA: FAILED to open",
+		"BULK_SLOT_STOMP_GUARD",
+		"BULK_SKIP_INVALID_POS",
+		"PRODUCED_INFANTRY_ZERO_MAP_SEED",
+		"PRODUCED_INFANTRY_UNLIMBO_SEED",
+		"PRODUCED_INFANTRY_GRADUATE_DEFER",
+		"PRODUCED_TECHNO_GRADUATE_DEFER",
+		"PRODUCED_UNIT_UNLIMBO_SEED",
+		"PRODUCED_UNIT_PLAUSIBLE_PLUS8",
+		"UNIT_MAIN_GUARD",
+		"UNIT_VIRTUAL_GUARD",
+		"PRODUCED_UNIT_FIRST_DRAW",
+		"PRODUCED_UNIT_MAIN_CACHE",
+		"PRODUCED_UNIT_MAIN_GUARD",
+		"HARVESTER_MAIN_GUARD",
+		"GET_LAYER_BULK_HASCREATION_INSERT",
+		"INFANTRY_DESTROYED",
+		"INFANTRY_DEATH_DRAW",
+		"PRODUCED_INFANTRY_CORRUPT_TRACK",
+		"CONSTRUCTION_SEED",
+		"GRAND_OPENING",
+		"HARVESTER_",
+		"TRACKING_CLEARED",
+		"STATELESS_INFANTRY_VIRTUAL",
+		"STATELESS_TECHNO_DRAW",
+		"STATELESS_HOTLIST_SUSTAIN",
+		"FOOT_LAYER_SUSTAIN",
+		nullptr
+	};
+
+	for (int i = 0; critical[i] != nullptr; ++i) {
+		if (strncmp(fmt, critical[i], strlen(critical[i])) == 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
 void Aeloria_Debug_Log(const char *fmt, ...)
 {
 	if (!fmt) return;
 
-	// Lazy open on first use (try several likely locations)
+	// When verbose is off, drop the per-frame hot-path spam before touching the log file.
+	if (!g_AeloriaEnableVerboseDrawLogs && !Aeloria_IsCriticalLogMessage(fmt)) {
+		return;
+	}
+
+	// Lazy open on first use — now with unique per-run filename (timestamp + short nanoid)
+	// and real wall-clock timestamps on every line.
 	if (!s_aeloria_log) {
 		char userPath[MAX_PATH];
-		char candidate[MAX_PATH];
+		char logPath[MAX_PATH];
+		std::string shortId = GenerateAeloriaShortLogId();
 
-		// Best option: use the user's actual profile directory (C:\Users\jacks etc.)
+		SYSTEMTIME st;
+		GetLocalTime(&st);
+
+		char dateTime[32];
+		snprintf(dateTime, sizeof(dateTime), "%04d-%02d-%02d-%02d%02d",
+		         st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute);
+
+		// Preferred: User's profile directory
 		if (GetEnvironmentVariableA("USERPROFILE", userPath, sizeof(userPath)) > 0) {
-			_snprintf(candidate, sizeof(candidate), "%s\\Aeloria_Debug.log", userPath);
-			s_aeloria_log = fopen(candidate, "a");
-			if (s_aeloria_log) {
-				fprintf(s_aeloria_log, "\n\n=== Aeloria Debug Log started (USERPROFILE) %s ===\n", __DATE__);
-				fflush(s_aeloria_log);
-			}
+			_snprintf(logPath, sizeof(logPath),
+			          "%s\\Aeloria-Debug-%s-%s.log",
+			          userPath, dateTime, shortId.c_str());
+			s_aeloria_log = fopen(logPath, "a");
 		}
 
-		// Explicitly try the path the user is currently using (C:\Users\jacks)
+		// Fallbacks
 		if (!s_aeloria_log) {
-			s_aeloria_log = fopen("C:\\Users\\jacks\\Aeloria_Debug.log", "a");
-			if (s_aeloria_log) {
-				fprintf(s_aeloria_log, "\n\n=== Aeloria Debug Log started (explicit jacks path) %s ===\n", __DATE__);
-				fflush(s_aeloria_log);
-			}
+			_snprintf(logPath, sizeof(logPath),
+			          "C:\\Users\\jacks\\Aeloria-Debug-%s-%s.log",
+			          dateTime, shortId.c_str());
+			s_aeloria_log = fopen(logPath, "a");
 		}
 
-		// Try a couple of other common writable places
 		if (!s_aeloria_log) {
-			const char* candidates[] = {
-				"C:\\Users\\Public\\Aeloria_Debug.log",
-				"C:\\Aeloria_Debug.log",
-				NULL
-			};
-			for (int i = 0; candidates[i] && !s_aeloria_log; ++i) {
-				s_aeloria_log = fopen(candidates[i], "a");
-				if (s_aeloria_log) {
-					fprintf(s_aeloria_log, "\n\n=== Aeloria Debug Log started %s ===\n", __DATE__);
-					fflush(s_aeloria_log);
-				}
-			}
+			_snprintf(logPath, sizeof(logPath),
+			          "C:\\Aeloria-Debug-%s-%s.log",
+			          dateTime, shortId.c_str());
+			s_aeloria_log = fopen(logPath, "a");
 		}
 
-		// Last resort: current working directory of the process
 		if (!s_aeloria_log) {
-			s_aeloria_log = fopen("Aeloria_Debug.log", "a");
-			if (s_aeloria_log) {
-				fprintf(s_aeloria_log, "\n\n=== Aeloria Debug Log (current working dir) started ===\n");
-				fflush(s_aeloria_log);
-			}
+			_snprintf(logPath, sizeof(logPath),
+			          "Aeloria-Debug-%s-%s.log",
+			          dateTime, shortId.c_str());
+			s_aeloria_log = fopen(logPath, "a");
 		}
 
-		// If we still failed, at least scream into the debugger output
-		if (!s_aeloria_log) {
+		if (s_aeloria_log) {
+			fprintf(s_aeloria_log,
+			        "\n\n=== Aeloria Debug Log started %04d-%02d-%02d %02d:%02d:%02d (ID: %s) ===\n",
+			        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, shortId.c_str());
+			fflush(s_aeloria_log);
+		} else {
 			OutputDebugStringA("AELORIA: FAILED to open any log file for Aeloria_Debug_Log!\n");
 		}
 	}
@@ -691,9 +811,18 @@ void Aeloria_Debug_Log(const char *fmt, ...)
 	va_end(args);
 	buffer[sizeof(buffer) - 1] = '\0';
 
-	// Write with timestamp + ScenarioInit for correlation
-	fprintf(s_aeloria_log, "[%d] %s\n", ScenarioInit, buffer);
-	fflush(s_aeloria_log);   // Critical for crash-time visibility
+	// Real wall-clock timestamp with milliseconds on every line
+	SYSTEMTIME st;
+	GetLocalTime(&st);
+
+	char timePrefix[32];
+	snprintf(timePrefix, sizeof(timePrefix),
+	         "[%04d-%02d-%02d %02d:%02d:%02d.%03d] ",
+	         st.wYear, st.wMonth, st.wDay,
+	         st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+
+	fprintf(s_aeloria_log, "%s%s\n", timePrefix, buffer);
+	fflush(s_aeloria_log);
 
 	// Also forward to existing channels (best effort)
 	GlyphX_Debug_Print(buffer);
@@ -708,17 +837,854 @@ void Aeloria_Debug_Log(const char *fmt, ...)
 **	each distinct tag is allowed exactly once; everything after is silent for that object.
 **	Non-exempt objects use the prior verbose gate (mostly silent after 8s real time).
 */
+TechnoTypeClass const* Aeloria_Safe_Techno_Type(TechnoClass const* techno)
+{
+	if (!techno) return nullptr;
+
+	TechnoTypeClass const* ttype = nullptr;
+	switch (techno->What_Am_I()) {
+	case RTTI_UNIT: {
+		UnitClass const* unit = static_cast<UnitClass const*>(techno);
+		ttype = unit->Class;
+		// CCPtr::Raw() is a heap ID, not a pointer — never apply Is_Plausible_Class_Pointer to it.
+		if (ttype && unit->Class.Is_Valid() && ttype->RTTI == RTTI_UNITTYPE) {
+			return ttype;
+		}
+		auto it = g_AeloriaObjectStability.find(reinterpret_cast<uintptr_t>(techno));
+		if (it != g_AeloriaObjectStability.end()) {
+			if (it->second.cachedTypeEnum >= 0) {
+				return &UnitTypeClass::As_Reference((UnitType)it->second.cachedTypeEnum);
+			}
+			if (_stricmp(it->second.cachedAssetName, "JEEP") == 0) {
+				return &UnitTypeClass::As_Reference(UNIT_JEEP);
+			}
+		}
+		return &UnitTypeClass::As_Reference(UNIT_JEEP);
+	}
+
+	case RTTI_INFANTRY: {
+		InfantryClass const* infantry = static_cast<InfantryClass const*>(techno);
+		ttype = infantry->Class;
+		if (ttype && infantry->Class.Is_Valid() && ttype->RTTI == RTTI_INFANTRYTYPE) {
+			return ttype;
+		}
+		int raw = infantry->Class.Raw();
+		if (raw >= 0) {
+			InfantryTypeClass const* viaRaw = InfantryTypes.Ptr(raw);
+			if (viaRaw && viaRaw->RTTI == RTTI_INFANTRYTYPE) {
+				return viaRaw;
+			}
+		}
+		auto it = g_AeloriaObjectStability.find(reinterpret_cast<uintptr_t>(techno));
+		if (it != g_AeloriaObjectStability.end()) {
+			if (it->second.cachedTypeEnum >= 0) {
+				return &InfantryTypeClass::As_Reference((InfantryType)it->second.cachedTypeEnum);
+			}
+		}
+		return &InfantryTypeClass::As_Reference(INFANTRY_E1);
+	}
+
+	case RTTI_AIRCRAFT: {
+		AircraftClass const* aircraft = static_cast<AircraftClass const*>(techno);
+		ttype = aircraft->Class;
+		if (ttype && aircraft->Class.Is_Valid() && ttype->RTTI == RTTI_AIRCRAFTTYPE) {
+			return ttype;
+		}
+		auto it = g_AeloriaObjectStability.find(reinterpret_cast<uintptr_t>(techno));
+		if (it != g_AeloriaObjectStability.end() && it->second.cachedTypeEnum >= 0) {
+			return &AircraftTypeClass::As_Reference((AircraftType)it->second.cachedTypeEnum);
+		}
+		return &AircraftTypeClass::As_Reference(AIRCRAFT_TRANSPORT);
+	}
+
+	case RTTI_VESSEL:
+		ttype = static_cast<VesselClass const*>(techno)->Class;
+		return ttype;
+
+	case RTTI_BUILDING: {
+		BuildingClass const* building = static_cast<BuildingClass const*>(techno);
+		uintptr_t at8 = *(uintptr_t*)((const char*)building + 8);
+		bool badAt8 = !Is_Plausible_Class_Pointer(at8);
+
+		auto it = g_AeloriaObjectStability.find(reinterpret_cast<uintptr_t>(techno));
+		if (it != g_AeloriaObjectStability.end() && it->second.cachedTypeEnum >= 0) {
+			return &BuildingTypeClass::As_Reference((StructType)it->second.cachedTypeEnum);
+		}
+		int raw = building->Class.Raw();
+		if (raw >= 0) {
+			BuildingTypeClass const* viaRaw = BuildingTypes.Ptr(raw);
+			if (viaRaw && viaRaw->RTTI == RTTI_BUILDINGTYPE) {
+				return viaRaw;
+			}
+		}
+		if (!badAt8 && building->Class.Is_Valid()) {
+			ttype = building->Class;
+			if (ttype && ttype->RTTI == RTTI_BUILDINGTYPE) {
+				return ttype;
+			}
+		}
+		// Never fall back to STRUCT_CONST (3x3) — client renders a factory-sized footprint.
+		// Prefer a neutral 1x1 defense type; raw heap id may still identify the real struct.
+		if (raw >= 0) {
+			StructType st = (StructType)raw;
+			if (st == STRUCT_FLAME_TURRET || st == STRUCT_TURRET || st == STRUCT_PILLBOX
+			    || st == STRUCT_CAMOPILLBOX || st == STRUCT_SAM) {
+				return &BuildingTypeClass::As_Reference(st);
+			}
+		}
+		return &BuildingTypeClass::As_Reference(STRUCT_PILLBOX);
+	}
+
+	default:
+		return nullptr;
+	}
+}
+
+void Aeloria_Repair_Early_Class_Pointer(TechnoClass* techno)
+{
+	if (!techno) return;
+
+	uintptr_t key = reinterpret_cast<uintptr_t>(techno);
+	auto stabIt = g_AeloriaObjectStability.find(key);
+	AeloriaObjectStability* stab = (stabIt != g_AeloriaObjectStability.end()) ? &stabIt->second : nullptr;
+	bool tracked = (g_AeloriaObjectCreationFrame.find(key) != g_AeloriaObjectCreationFrame.end())
+		|| (stab && stab->earlySafeClientRegistered)
+		|| (stab && stab->cachedTypeEnum >= 0)
+		|| (techno->What_Am_I() == RTTI_BUILDING && g_HumanPlayerHouse != HOUSE_NONE
+		    && techno->Owner() == g_HumanPlayerHouse);
+	if (!tracked) {
+		if (Aeloria_TechnoClassRawIsHealthy(techno)) {
+			return;
+		}
+		return;
+	}
+
+	switch (techno->What_Am_I()) {
+	case RTTI_UNIT: {
+		UnitClass* unit = static_cast<UnitClass*>(techno);
+		if (unit->Class.Is_Valid()) {
+			const UnitTypeClass* t = unit->Class;
+			if (t && t->RTTI == RTTI_UNITTYPE) {
+				if (stab) stab->cachedTypeEnum = (int16_t)t->Type;
+				return;
+			}
+		}
+		UnitType fallback = UNIT_JEEP;
+		if (stab) {
+			if (stab->cachedTypeEnum >= 0) {
+				fallback = (UnitType)stab->cachedTypeEnum;
+			} else if (_stricmp(stab->cachedAssetName, "JEEP") == 0) {
+				fallback = UNIT_JEEP;
+			}
+		}
+		unit->Class = UnitTypes.Ptr((int)fallback);
+		if (stab) stab->cachedTypeEnum = (int16_t)fallback;
+		break;
+	}
+
+	case RTTI_INFANTRY: {
+		InfantryClass* infantry = static_cast<InfantryClass*>(techno);
+		if (infantry->Class.Is_Valid()) {
+			const InfantryTypeClass* t = infantry->Class;
+			if (t && t->RTTI == RTTI_INFANTRYTYPE) {
+				if (stab) stab->cachedTypeEnum = (int16_t)t->Type;
+				return;
+			}
+		}
+		InfantryType fallback = INFANTRY_E1;
+		if (stab && stab->cachedTypeEnum >= 0) {
+			fallback = (InfantryType)stab->cachedTypeEnum;
+		}
+		infantry->Class = InfantryTypes.Ptr((int)fallback);
+		if (stab) stab->cachedTypeEnum = (int16_t)fallback;
+		break;
+	}
+
+	case RTTI_AIRCRAFT: {
+		AircraftClass* aircraft = static_cast<AircraftClass*>(techno);
+		if (aircraft->Class.Is_Valid()) {
+			const AircraftTypeClass* t = aircraft->Class;
+			if (t && t->RTTI == RTTI_AIRCRAFTTYPE) {
+				if (stab) stab->cachedTypeEnum = (int16_t)t->Type;
+				return;
+			}
+		}
+		AircraftType fallback = AIRCRAFT_TRANSPORT;
+		if (stab && stab->cachedTypeEnum >= 0) {
+			fallback = (AircraftType)stab->cachedTypeEnum;
+		}
+		aircraft->Class = AircraftTypes.Ptr((int)fallback);
+		if (stab) stab->cachedTypeEnum = (int16_t)fallback;
+		break;
+	}
+
+	case RTTI_BUILDING: {
+		BuildingClass* building = static_cast<BuildingClass*>(techno);
+		uintptr_t at8 = *(uintptr_t*)((const char*)building + 8);
+		bool badAt8 = !Is_Plausible_Class_Pointer(at8);
+
+		// CCPtr heap id is authoritative when +8 is corrupt — never trust Class-> alone.
+		if (building->Class.Raw() >= 0) {
+			BuildingTypeClass const* viaRaw = BuildingTypes.Ptr(building->Class.Raw());
+			if (viaRaw && viaRaw->RTTI == RTTI_BUILDINGTYPE) {
+				if (stab) stab->cachedTypeEnum = (int16_t)viaRaw->Type;
+			}
+		}
+		if (stab && stab->cachedTypeEnum < 0 && !badAt8 && building->Class.Is_Valid()) {
+			const BuildingTypeClass* t = building->Class;
+			if (t && t->RTTI == RTTI_BUILDINGTYPE) {
+				stab->cachedTypeEnum = (int16_t)t->Type;
+			}
+		}
+
+		StructType fallback = STRUCT_TURRET;
+		if (stab && stab->cachedTypeEnum >= 0) {
+			fallback = (StructType)stab->cachedTypeEnum;
+		} else if (building->Class.Raw() >= 0) {
+			BuildingTypeClass const* viaRaw = BuildingTypes.Ptr(building->Class.Raw());
+			if (viaRaw && viaRaw->RTTI == RTTI_BUILDINGTYPE) {
+				fallback = viaRaw->Type;
+			}
+		}
+
+		building->Class = BuildingTypes.Ptr((int)fallback);
+		if (stab) stab->cachedTypeEnum = (int16_t)fallback;
+
+		if (badAt8 && stab && stab->cachedTypeEnum == (int16_t)STRUCT_REFINERY
+		    && Aeloria_ShouldLogOncePerObject(building, AEL_LOG_PLAYER_CREATION)) {
+			Aeloria_Debug_Log("REPAIR_BUILDING_REFINERY this=%p raw=%d type_enum=%d bad_at8=1",
+			                  (void*)building, building->Class.Raw(), (int)stab->cachedTypeEnum);
+			if (g_HumanPlayerHouse != HOUSE_NONE && building->Owner() == g_HumanPlayerHouse) {
+				Aeloria_Seed_Human_Building_Stability(building);
+			}
+		}
+		break;
+	}
+
+	default:
+		break;
+	}
+}
+
+void Aeloria_Seed_Building_Creation(BuildingClass* building)
+{
+	if (!building || !building->IsActive) {
+		return;
+	}
+
+	Aeloria_Repair_Early_Class_Pointer(building);
+
+	uintptr_t key = reinterpret_cast<uintptr_t>(building);
+	const bool humanDeployed = (g_HumanPlayerHouse != HOUSE_NONE && building->Owner() == g_HumanPlayerHouse);
+	// Human sidebar/MCV/factory-placed buildings use BuildingClass::Draw_It safe export + normal
+	// layer walk. Bulk hasCreation insert for them (5z-n3 df5a113b) stomped harvester tail slots and
+	// crashed in legacy blitter remap during refinery deploy (REDALERT.DLL+0xcacda).
+	if (!humanDeployed) {
+		if (g_AeloriaObjectCreationFrame.find(key) == g_AeloriaObjectCreationFrame.end()) {
+			g_AeloriaObjectCreationFrame[key] = Frame;
+		}
+	} else {
+		g_AeloriaObjectCreationFrame.erase(key);
+	}
+
+	auto& stab = g_AeloriaObjectStability[key];
+	if (stab.rtti == 0) {
+		stab.rtti = (uint8_t)RTTI_BUILDING;
+	}
+	if (stab.cachedTypeEnum < 0 && building->Class.Raw() >= 0) {
+		BuildingTypeClass const* viaRaw = BuildingTypes.Ptr(building->Class.Raw());
+		if (viaRaw && viaRaw->RTTI == RTTI_BUILDINGTYPE) {
+			stab.cachedTypeEnum = (int16_t)viaRaw->Type;
+		}
+	}
+	if (stab.cachedTypeEnum < 0 && building->Class.Is_Valid()) {
+		BuildingTypeClass const* t = building->Class;
+		if (t && t->RTTI == RTTI_BUILDINGTYPE) {
+			stab.cachedTypeEnum = (int16_t)t->Type;
+		}
+	}
+	stab.earlySafeClientRegistered = true;
+
+	if (Aeloria_ShouldLogOncePerObject(building, AEL_LOG_PLAYER_CREATION)) {
+		Aeloria_Debug_Log("CONSTRUCTION_SEED this=%p owner=%d type_enum=%d raw=%d frame=%u",
+		                  (void*)building, (int)building->Owner(), (int)stab.cachedTypeEnum, building->Class.Raw(), Frame);
+	}
+}
+
+void Aeloria_Seed_Human_Building_Stability(BuildingClass* building)
+{
+	if (!building || g_HumanPlayerHouse == HOUSE_NONE || building->Owner() != g_HumanPlayerHouse) {
+		return;
+	}
+
+	Aeloria_Seed_Building_Creation(building);
+}
+
+void Aeloria_RelocateHarvesterStability(UnitClass* unit)
+{
+	if (!unit) return;
+
+	uintptr_t key = reinterpret_cast<uintptr_t>(unit);
+	int priorType = -1;
+	uint8_t priorRtti = 0;
+	bool hadPriorStab = false;
+	uint32_t priorCreationFrame = 0;
+	bool hadCreation = false;
+
+	auto oldStab = g_AeloriaObjectStability.find(key);
+	if (oldStab != g_AeloriaObjectStability.end()) {
+		hadPriorStab = true;
+		priorType = oldStab->second.cachedTypeEnum;
+		priorRtti = oldStab->second.rtti;
+	}
+	auto oldCreation = g_AeloriaObjectCreationFrame.find(key);
+	if (oldCreation != g_AeloriaObjectCreationFrame.end()) {
+		hadCreation = true;
+		priorCreationFrame = oldCreation->second;
+	}
+
+	g_AeloriaObjectStability.erase(key);
+	g_AeloriaObjectLogMask.erase(key);
+	g_AeloriaObjectCreationFrame[key] = Frame;
+
+	AeloriaObjectStability stab;
+	stab.cachedTypeEnum = (int16_t)UNIT_HARVESTER;
+	stab.rtti = (uint8_t)RTTI_UNIT;
+	stab.earlySafeClientRegistered = true;
+	stab.clientListInserted = false;
+	stab.sustainRetired = false;
+	stab.sustainNormalHits = 0;
+	stab.stabilityLevel = 0;
+	stab.hasCachedMainDraw = false;
+	stab.hasCachedDraw = false;
+	g_AeloriaObjectStability[key] = stab;
+
+	unit->Class = UnitTypes.Ptr((int)UNIT_HARVESTER);
+	Aeloria_Repair_Early_Class_Pointer(unit);
+
+	Aeloria_Debug_Log("HARVESTER_STABILITY_RELOCATE this=%p prior_type_enum=%d prior_rtti=%u had_prior_stab=%d had_creation=%d prior_creation_frame=%u units_id=%d owner=%d frame=%u",
+	                  (void*)unit, priorType, (unsigned)priorRtti, hadPriorStab ? 1 : 0, hadCreation ? 1 : 0,
+	                  priorCreationFrame, Units.ID(unit), (int)unit->Owner(), Frame);
+
+	if (hadPriorStab && priorType >= 0 && priorType != (int)UNIT_HARVESTER) {
+		Aeloria_Debug_Log("HARVESTER_POOL_REUSE this=%p prior_type_enum=%d prior_creation_frame=%u owner=%d frame=%u",
+		                  (void*)unit, priorType, priorCreationFrame, (int)unit->Owner(), Frame);
+	}
+}
+
+static int Aeloria_PeekTechnoTypeEnum(TechnoClass const* techno)
+{
+	if (!techno) return -1;
+	switch (techno->What_Am_I()) {
+	case RTTI_UNIT: {
+		UnitClass const* unit = static_cast<UnitClass const*>(techno);
+		if (unit->Class.Raw() >= 0) return unit->Class.Raw();
+		break;
+	}
+	case RTTI_INFANTRY: {
+		InfantryClass const* infantry = static_cast<InfantryClass const*>(techno);
+		if (infantry->Class.Raw() >= 0) return infantry->Class.Raw();
+		break;
+	}
+	case RTTI_AIRCRAFT: {
+		AircraftClass const* aircraft = static_cast<AircraftClass const*>(techno);
+		if (aircraft->Class.Raw() >= 0) return aircraft->Class.Raw();
+		break;
+	}
+	case RTTI_VESSEL: {
+		VesselClass const* vessel = static_cast<VesselClass const*>(techno);
+		if (vessel->Class.Raw() >= 0) return vessel->Class.Raw();
+		break;
+	}
+	default:
+		break;
+	}
+	return -1;
+}
+
+bool Aeloria_InfantryClassRawIsHealthy(InfantryClass const* infantry)
+{
+	if (!infantry) return false;
+	int raw = infantry->Class.Raw();
+	if (raw < 0) return false;
+	InfantryTypeClass const* ttype = InfantryTypes.Ptr(raw);
+	if (!ttype) return false;
+	return ttype->What_Am_I() == RTTI_INFANTRYTYPE;
+}
+
+// infantry-scale Phase 5c: zero-map is E1-only. E3 (and other types) can pass Class.Raw health
+// checks while +8 is still corrupt, then AV in vanilla draw paths during layer export.
+bool Aeloria_ShouldZeroMapProducedInfantry(InfantryClass const* infantry)
+{
+	if (!infantry || !g_AeloriaZeroMapProducedInfantry) {
+		return false;
+	}
+	if (!Aeloria_InfantryClassRawIsHealthy(infantry)) {
+		return false;
+	}
+	InfantryTypeClass const* ttype = InfantryTypes.Ptr(infantry->Class.Raw());
+	if (!ttype) {
+		return false;
+	}
+	return ttype->Type == INFANTRY_E1;
+}
+
+bool Aeloria_TechnoClassRawIsHealthy(TechnoClass const* techno)
+{
+	if (!techno) return false;
+
+	switch (techno->What_Am_I()) {
+	case RTTI_INFANTRY:
+		return Aeloria_InfantryClassRawIsHealthy(static_cast<InfantryClass const*>(techno));
+
+	case RTTI_BUILDING: {
+		BuildingClass const* building = static_cast<BuildingClass const*>(techno);
+		int raw = building->Class.Raw();
+		if (raw < 0) return false;
+		BuildingTypeClass const* ttype = BuildingTypes.Ptr(raw);
+		return ttype && ttype->RTTI == RTTI_BUILDINGTYPE;
+	}
+
+	case RTTI_UNIT: {
+		UnitClass const* unit = static_cast<UnitClass const*>(techno);
+		int raw = unit->Class.Raw();
+		if (raw < 0) return false;
+		UnitTypeClass const* ttype = UnitTypes.Ptr(raw);
+		return ttype && ttype->RTTI == RTTI_UNITTYPE;
+	}
+
+	case RTTI_AIRCRAFT: {
+		AircraftClass const* aircraft = static_cast<AircraftClass const*>(techno);
+		int raw = aircraft->Class.Raw();
+		if (raw < 0) return false;
+		AircraftTypeClass const* ttype = AircraftTypes.Ptr(raw);
+		return ttype && ttype->RTTI == RTTI_AIRCRAFTTYPE;
+	}
+
+	case RTTI_VESSEL: {
+		VesselClass const* vessel = static_cast<VesselClass const*>(techno);
+		int raw = vessel->Class.Raw();
+		if (raw < 0) return false;
+		VesselTypeClass const* ttype = VesselTypes.Ptr(raw);
+		return ttype && ttype->RTTI == RTTI_VESSELTYPE;
+	}
+
+	default:
+		return false;
+	}
+}
+
+static bool Aeloria_TechnoTypeDimensions(TechnoTypeClass const* ttype, RTTIType rtti, int& outW, int& outH)
+{
+	if (!ttype) return false;
+
+	outW = 48;
+	outH = 48;
+	switch (rtti) {
+	case RTTI_BUILDING:
+		static_cast<BuildingTypeClass const*>(ttype)->Dimensions(outW, outH);
+		break;
+	case RTTI_INFANTRY:
+		static_cast<InfantryTypeClass const*>(ttype)->Dimensions(outW, outH);
+		break;
+	case RTTI_UNIT:
+		static_cast<UnitTypeClass const*>(ttype)->Dimensions(outW, outH);
+		break;
+	case RTTI_AIRCRAFT:
+		static_cast<AircraftTypeClass const*>(ttype)->Dimensions(outW, outH);
+		break;
+	case RTTI_VESSEL:
+		static_cast<VesselTypeClass const*>(ttype)->Dimensions(outW, outH);
+		break;
+	default:
+		return false;
+	}
+
+	if (outW <= 0) outW = 24;
+	if (outH <= 0) outH = 24;
+	return true;
+}
+
+void Aeloria_OneShotProducedInfantryClientSeed(TechnoClass* techno)
+{
+	if (!techno) return;
+
+	Aeloria_Repair_Early_Class_Pointer(techno);
+	char overrideOwner = (char)techno->Owner();
+	if (overrideOwner == HOUSE_NONE) return;
+
+	int drawW = 24;
+	int drawH = 24;
+	InfantryTypeClass const* itype = static_cast<InfantryTypeClass const*>(Aeloria_Safe_Techno_Type(techno));
+	if (itype) {
+		itype->Dimensions(drawW, drawH);
+	}
+	if (drawW <= 0) drawW = 24;
+	if (drawH <= 0) drawH = 24;
+
+	DLLExportClass::DLL_Draw_Intercept(0, 0, 0, drawW, drawH, 0, techno, DIR_N, 0x100, nullptr, overrideOwner);
+
+	int typeEnum = -1;
+	if (itype) {
+		typeEnum = (int)itype->Type;
+	}
+	uintptr_t key = reinterpret_cast<uintptr_t>(techno);
+	if (g_AeloriaStatelessInfantryHotList.size() >= AELORIA_STATELESS_HOTLIST_MAX) {
+		g_AeloriaStatelessInfantryHotList.erase(g_AeloriaStatelessInfantryHotList.begin());
+	}
+	g_AeloriaStatelessInfantryHotList.insert(key);
+
+	Aeloria_Debug_Log("PRODUCED_INFANTRY_ZERO_MAP_SEED this=%p owner=%d type_enum=%d w=%d h=%d frame=%u",
+	                  (void*)techno, (int)overrideOwner, typeEnum, drawW, drawH, Frame);
+}
+
+// Phase 5k-5: drop all per-object tracking when a pool slot is freed so the next occupant
+// cannot inherit stale stability, creation frame, or log-mask state.
+void Aeloria_ClearObjectTracking(ObjectClass* obj)
+{
+	if (!obj) return;
+
+	uintptr_t key = reinterpret_cast<uintptr_t>(obj);
+	bool hadStab = false;
+	bool hadCreation = false;
+	bool hadLogMask = false;
+	int typeEnum = -1;
+	uint8_t rtti = 0;
+
+	auto stabIt = g_AeloriaObjectStability.find(key);
+	if (stabIt != g_AeloriaObjectStability.end()) {
+		hadStab = true;
+		typeEnum = stabIt->second.cachedTypeEnum;
+		rtti = stabIt->second.rtti;
+	}
+	hadCreation = g_AeloriaObjectCreationFrame.find(key) != g_AeloriaObjectCreationFrame.end();
+	hadLogMask = g_AeloriaObjectLogMask.find(key) != g_AeloriaObjectLogMask.end();
+
+	if (!hadStab && !hadCreation && !hadLogMask) {
+		return;
+	}
+
+	g_AeloriaObjectStability.erase(key);
+	g_AeloriaObjectCreationFrame.erase(key);
+	g_AeloriaObjectLogMask.erase(key);
+	g_AeloriaStatelessInfantryHotList.erase(key);
+
+	Aeloria_Debug_Log("TRACKING_CLEARED this=%p rtti=%u type_enum=%d had_stab=%d had_creation=%d had_log_mask=%d frame=%u",
+	                  (void*)obj, (unsigned)rtti, typeEnum, hadStab ? 1 : 0, hadCreation ? 1 : 0, hadLogMask ? 1 : 0, Frame);
+}
+
+// P2: Barracks/factory/helipad production often reuses a dead object's pool slot.
+// Stale earlySafeClientRegistered + wrong cachedTypeEnum caused skipped re-seed (0DC75CD8 session).
+void Aeloria_ResetProducedTechnoTracking(TechnoClass* techno)
+{
+	if (!techno) return;
+
+	uintptr_t key = reinterpret_cast<uintptr_t>(techno);
+	int priorType = -1;
+	uint8_t priorRtti = 0;
+	bool hadPriorStab = false;
+	uint32_t priorCreationFrame = 0;
+	bool hadCreation = false;
+
+	auto oldStab = g_AeloriaObjectStability.find(key);
+	if (oldStab != g_AeloriaObjectStability.end()) {
+		hadPriorStab = true;
+		priorType = oldStab->second.cachedTypeEnum;
+		priorRtti = oldStab->second.rtti;
+	}
+	auto oldCreation = g_AeloriaObjectCreationFrame.find(key);
+	if (oldCreation != g_AeloriaObjectCreationFrame.end()) {
+		hadCreation = true;
+		priorCreationFrame = oldCreation->second;
+	}
+
+	if (!hadPriorStab && !hadCreation) {
+		return;
+	}
+
+	RTTIType currentRtti = techno->What_Am_I();
+	int currentType = Aeloria_PeekTechnoTypeEnum(techno);
+	bool poolReuse = hadPriorStab
+		&& ((priorRtti != 0 && priorRtti != (uint8_t)currentRtti)
+		    || (priorType >= 0 && currentType >= 0 && priorType != currentType));
+
+	if (!poolReuse) {
+		// Same-type slot recycle (e.g. dead E1 -> new E1): refresh lifetime without full erase.
+		g_AeloriaObjectCreationFrame[key] = Frame;
+		if (hadPriorStab) {
+			auto& stab = g_AeloriaObjectStability[key];
+			stab.clientListInserted = false;
+			stab.sustainRetired = false;
+			stab.sustainNormalHits = 0;
+			stab.hasCachedMainDraw = false;
+			stab.hasCachedDraw = false;
+			stab.cachedShapeNumber = 0;
+			stab.cachedDrawFlags = 0;
+			stab.cachedRotation = 0;
+			stab.cachedScale = 0x100;
+			stab.cachedDrawX = 0;
+			stab.cachedDrawY = 0;
+			stab.cachedWidth = 0;
+			stab.cachedHeight = 0;
+			stab.cachedAssetName[0] = '\0';
+			stab.producedUnitUnlimboSeeded = false;
+			stab.producedUnitBadPlus8 = false;
+			stab.producedUnitFirstDrawMask = 0;
+		}
+		g_AeloriaObjectLogMask.erase(key);
+		return;
+	}
+
+	g_AeloriaObjectStability.erase(key);
+	g_AeloriaObjectLogMask.erase(key);
+	g_AeloriaObjectCreationFrame.erase(key);
+
+	Aeloria_Debug_Log("PRODUCED_POOL_REUSE_RESET this=%p prior_rtti=%u prior_type=%d new_rtti=%d new_type=%d owner=%d prior_creation=%u frame=%u",
+	                  (void*)techno, (unsigned)priorRtti, priorType, (int)currentRtti, currentType,
+	                  (int)techno->Owner(), priorCreationFrame, Frame);
+}
+
+bool Aeloria_IsStatelessUntrackedTechno(const ObjectClass* obj)
+{
+	if (!obj || !g_AeloriaStatelessUntrackedTechno || !obj->Is_Techno()) {
+		return false;
+	}
+
+	uintptr_t key = reinterpret_cast<uintptr_t>(obj);
+	if (g_AeloriaObjectCreationFrame.find(key) != g_AeloriaObjectCreationFrame.end()) {
+		return false;
+	}
+	auto stabIt = g_AeloriaObjectStability.find(key);
+	if (stabIt != g_AeloriaObjectStability.end() && stabIt->second.earlySafeClientRegistered) {
+		return false;
+	}
+
+	return Aeloria_TechnoClassRawIsHealthy(static_cast<TechnoClass const*>(obj));
+}
+
+bool Aeloria_IsZeroMapUntrackedInfantry(const ObjectClass* obj)
+{
+	if (!obj || obj->What_Am_I() != RTTI_INFANTRY || !Aeloria_IsStatelessUntrackedTechno(obj)) {
+		return false;
+	}
+	return Aeloria_ShouldZeroMapProducedInfantry(static_cast<InfantryClass const*>(obj));
+}
+
+bool Aeloria_TryStatelessTechnoDraw(const ObjectClass* object, int shapenum, int x, int y, DirType rotation, long virtualscale,
+                                   const char* shape_file_name, char override_owner)
+{
+	if (!Aeloria_IsStatelessUntrackedTechno(object)) {
+		return false;
+	}
+
+	RTTIType rtti = object->What_Am_I();
+	TechnoClass* techno = const_cast<TechnoClass*>(static_cast<TechnoClass const*>(object));
+	TechnoTypeClass const* ttype = Aeloria_Safe_Techno_Type(techno);
+	if (!ttype) {
+		return false;
+	}
+
+	int drawW = 24;
+	int drawH = 24;
+	if (!Aeloria_TechnoTypeDimensions(ttype, rtti, drawW, drawH)) {
+		return false;
+	}
+
+	char owner = (override_owner != HOUSE_NONE) ? override_owner : (char)object->Owner();
+	DLLExportClass::DLL_Draw_Intercept(shapenum, x, y, drawW, drawH, AELORIA_CLIENT_DRAW_FLAGS_CENTER,
+	                                   object, rotation, virtualscale, shape_file_name, owner);
+	if (Aeloria_ShouldLogOncePerObject(object, AEL_LOG_FIRST_REAL_DRAW)) {
+		Aeloria_Debug_Log("STATELESS_TECHNO_DRAW this=%p RTTI=%d owner=%d w=%d h=%d frame=%u",
+		                  (void*)object, (int)rtti, (int)owner, drawW, drawH, Frame);
+	}
+	return true;
+}
+
+bool Aeloria_TryStatelessInfantryVirtualDraw(const ObjectClass* object, int shapenum, int x, int y, DirType rotation, long virtualscale,
+                                             const char* shape_file_name, char override_owner)
+{
+	return Aeloria_TryStatelessTechnoDraw(object, shapenum, x, y, rotation, virtualscale, shape_file_name, override_owner);
+}
+
+bool Aeloria_TrySafeVirtualDrawIntercept(const ObjectClass* object, int shapenum, int x, int y, DirType rotation, long virtualscale,
+                                         const char* shape_file_name, char override_owner)
+{
+	if (!object || !object->Is_Techno()) {
+		return false;
+	}
+	// Human-deployed buildings must use placeholder on MAIN/tactical (ObjectList is null there).
+	// This intercept only populates the virtual export buffer; letting it "handle" MAIN draws
+	// skips the placeholder and leaves a path open to legacy Techno_Draw_Object blitter AV.
+	if (Aeloria_IsHumanDeployedBuilding(object)) {
+		return false;
+	}
+	if (Aeloria_IsProducedBadPlus8Unit(object)) {
+		int drawW = 48;
+		int drawH = 48;
+		TechnoClass* techno = const_cast<TechnoClass*>(static_cast<TechnoClass const*>(object));
+		Aeloria_Repair_Early_Class_Pointer(techno);
+		TechnoTypeClass const* ttype = Aeloria_Safe_Techno_Type(techno);
+		if (ttype) {
+			Aeloria_TechnoTypeDimensions(ttype, object->What_Am_I(), drawW, drawH);
+		}
+		char owner = (override_owner != HOUSE_NONE) ? override_owner : (char)object->Owner();
+		DLLExportClass::DLL_Draw_Intercept(shapenum, x, y, drawW, drawH, AELORIA_CLIENT_DRAW_FLAGS_CENTER,
+		                                   object, rotation, virtualscale, shape_file_name, owner);
+		return true;
+	}
+
+	uintptr_t key = reinterpret_cast<uintptr_t>(object);
+	auto cfIt = g_AeloriaObjectCreationFrame.find(key);
+	auto stabIt = g_AeloriaObjectStability.find(key);
+	bool tracked = (cfIt != g_AeloriaObjectCreationFrame.end())
+		|| (stabIt != g_AeloriaObjectStability.end() && stabIt->second.earlySafeClientRegistered);
+	if (!tracked) {
+		return false;
+	}
+
+	TechnoClass* techno = const_cast<TechnoClass*>(static_cast<TechnoClass const*>(object));
+	Aeloria_Repair_Early_Class_Pointer(techno);
+	TechnoTypeClass const* ttype = Aeloria_Safe_Techno_Type(techno);
+	if (!ttype) {
+		return false;
+	}
+
+	int drawW = 32;
+	int drawH = 32;
+	if (!Aeloria_TechnoTypeDimensions(ttype, object->What_Am_I(), drawW, drawH)) {
+		return false;
+	}
+
+	char owner = (override_owner != HOUSE_NONE) ? override_owner : (char)object->Owner();
+	DLLExportClass::DLL_Draw_Intercept(shapenum, x, y, drawW, drawH, AELORIA_CLIENT_DRAW_FLAGS_CENTER,
+	                                   object, rotation, virtualscale, shape_file_name, owner);
+	return true;
+}
+
+static void Aeloria_PruneStaleTracking()
+{
+	static unsigned lastPruneFrame = 0;
+	if (Frame < lastPruneFrame + 150) {
+		return;
+	}
+	lastPruneFrame = Frame;
+
+	size_t prunedStab = 0;
+	size_t prunedCreation = 0;
+
+	for (auto it = g_AeloriaObjectStability.begin(); it != g_AeloriaObjectStability.end(); ) {
+		ObjectClass* obj = reinterpret_cast<ObjectClass*>(it->first);
+		bool inactive = (!obj || !obj->IsActive);
+		// Phase 4: prune sustain-retired produced units (virtual-draw graduated) as well as
+		// MAIN-draw graduates — stops O(n) map scans in late-game Get_Layer_State.
+		bool graduated = (!inactive && it->second.sustainRetired
+		                    && (it->second.stabilityLevel >= 2 || it->second.clientListInserted));
+		// WF-produced bad+8 harvesters must keep stab flags for eternal safe draw (5z-n7).
+		if (!inactive && it->second.producedUnitUnlimboSeeded && it->second.producedUnitBadPlus8) {
+			graduated = false;
+		}
+		if (inactive || graduated) {
+			g_AeloriaObjectCreationFrame.erase(it->first);
+			g_AeloriaObjectLogMask.erase(it->first);
+			it = g_AeloriaObjectStability.erase(it);
+			prunedStab++;
+		} else {
+			++it;
+		}
+	}
+
+	for (auto it = g_AeloriaObjectCreationFrame.begin(); it != g_AeloriaObjectCreationFrame.end(); ) {
+		ObjectClass* obj = reinterpret_cast<ObjectClass*>(it->first);
+		if (!obj || !obj->IsActive) {
+			g_AeloriaObjectLogMask.erase(it->first);
+			it = g_AeloriaObjectCreationFrame.erase(it);
+			prunedCreation++;
+		} else {
+			++it;
+		}
+	}
+
+	size_t prunedHot = 0;
+	for (auto it = g_AeloriaStatelessInfantryHotList.begin(); it != g_AeloriaStatelessInfantryHotList.end(); ) {
+		ObjectClass* obj = reinterpret_cast<ObjectClass*>(*it);
+		if (!obj || !obj->IsActive || obj->IsInLimbo) {
+			it = g_AeloriaStatelessInfantryHotList.erase(it);
+			prunedHot++;
+		} else {
+			++it;
+		}
+	}
+
+	if (prunedStab > 0 || prunedCreation > 0 || prunedHot > 0) {
+		Aeloria_Debug_Log("TRACKING_PRUNE pruned_stab=%zu pruned_creation=%zu pruned_hot=%zu remain_stab=%zu remain_creation=%zu remain_hot=%zu frame=%u",
+		                  prunedStab, prunedCreation, prunedHot, g_AeloriaObjectStability.size(),
+		                  g_AeloriaObjectCreationFrame.size(), g_AeloriaStatelessInfantryHotList.size(), Frame);
+	}
+}
+
+// After the opening exemption window closes, prune only graduated/inactive tracking entries.
+// Mid-game construction (P3), human-deployed buildings, and produced units must survive —
+// a blanket clear at frame 600 was dropping has_creation on in-progress war factories and crashing.
+static bool Aeloria_ShouldRetainTrackingAfterWindowExpire(uintptr_t key)
+{
+	ObjectClass* obj = reinterpret_cast<ObjectClass*>(key);
+	if (!obj || !obj->IsActive) {
+		return false;
+	}
+
+	if (Aeloria_IsHumanDeployedBuilding(obj)) {
+		return true;
+	}
+	if (Aeloria_IsRepurposedHarvester(obj)) {
+		return true;
+	}
+	if (Aeloria_IsProducedBadPlus8Harvester(obj) || Aeloria_IsEternalSafeProducedUnit(obj)) {
+		return true;
+	}
+
+	auto stabIt = g_AeloriaObjectStability.find(key);
+	if (stabIt != g_AeloriaObjectStability.end()) {
+		if (stabIt->second.earlySafeClientRegistered && !Aeloria_HasValidMainDrawCache(obj)) {
+			return true;
+		}
+	}
+
+	auto cfIt = g_AeloriaObjectCreationFrame.find(key);
+	if (cfIt != g_AeloriaObjectCreationFrame.end() && cfIt->second > 10) {
+		return true;
+	}
+
+	if (obj->What_Am_I() == RTTI_BUILDING) {
+		BuildingClass* building = static_cast<BuildingClass*>(obj);
+		if (building->Mission == MISSION_CONSTRUCTION || building->BState == BSTATE_CONSTRUCTION) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
 bool Aeloria_ShouldLogOncePerObject(const void* obj, int tag)
 {
 	if (obj == nullptr || tag <= 0 || tag >= AEL_LOG_MAX) return false;
 
 	const ObjectClass* o = reinterpret_cast<const ObjectClass*>(obj);
+
+	// Phase C: If the object has already graduated to stable (level 2), it is no longer
+	// under heavy exemption for logging purposes. Fall back to the normal (mostly silent)
+	// verbose gate. This is the main additional spam reduction for objects that stabilized
+	// mid-window.
+	uintptr_t key = reinterpret_cast<uintptr_t>(obj);
+	auto stabIt = g_AeloriaObjectStability.find(key);
+	if (stabIt != g_AeloriaObjectStability.end() && stabIt->second.stabilityLevel >= 2) {
+		return Aeloria_ShouldLogVerbose(o);
+	}
+
 	if (!Is_Player_Exempt(o)) {
 		return Aeloria_ShouldLogVerbose(o);
 	}
 
-	// Player object under exemption: dedup per (this, tag)
-	uintptr_t key = reinterpret_cast<uintptr_t>(obj);
+	// Player object under (still-active) exemption: dedup per (this, tag)
 	auto it = g_AeloriaObjectLogMask.find(key);
 	uint32_t mask = (it != g_AeloriaObjectLogMask.end()) ? it->second : 0u;
 	uint32_t bit = (1u << tag);
@@ -798,6 +1764,36 @@ extern "C" __declspec(dllexport) void __cdecl CNC_Init(const char *command_line,
 		OutputDebugStringA(stateMsg);
 	}
 
+	{
+		char val[16] = {0};
+		if (GetEnvironmentVariableA("AELORIA_ZERO_MAP_PRODUCED_INFANTRY", val, sizeof(val)) > 0) {
+			if (val[0] == '0' || _stricmp(val, "false") == 0 || _stricmp(val, "no") == 0 || _stricmp(val, "off") == 0) {
+				g_AeloriaZeroMapProducedInfantry = false;
+			} else {
+				g_AeloriaZeroMapProducedInfantry = true;
+			}
+		}
+		char zmMsg[96];
+		_snprintf(zmMsg, sizeof(zmMsg), "AELORIA: g_AeloriaZeroMapProducedInfantry = %s\n",
+		          g_AeloriaZeroMapProducedInfantry ? "TRUE" : "FALSE");
+		OutputDebugStringA(zmMsg);
+	}
+
+	{
+		char val[16] = {0};
+		if (GetEnvironmentVariableA("AELORIA_STATELESS_UNTRACKED_TECHNO", val, sizeof(val)) > 0) {
+			if (val[0] == '0' || _stricmp(val, "false") == 0 || _stricmp(val, "no") == 0 || _stricmp(val, "off") == 0) {
+				g_AeloriaStatelessUntrackedTechno = false;
+			} else {
+				g_AeloriaStatelessUntrackedTechno = true;
+			}
+		}
+		char stMsg[96];
+		_snprintf(stMsg, sizeof(stMsg), "AELORIA: g_AeloriaStatelessUntrackedTechno = %s\n",
+		          g_AeloriaStatelessUntrackedTechno ? "TRUE" : "FALSE");
+		OutputDebugStringA(stMsg);
+	}
+
 	DLLExportClass::Set_Content_Directory(NULL);
 
 	DLL_Startup(command_line);
@@ -805,6 +1801,13 @@ extern "C" __declspec(dllexport) void __cdecl CNC_Init(const char *command_line,
 	DLLExportClass::Set_Event_Callback(event_callback);
 
 	DLLExportClass::Init();
+
+	// Eager file log so menu-phase / pre-skirmish exits still leave a correlation artifact.
+	Aeloria_Debug_Log("CNC_INIT command_line=%s verbose_draw=%d zero_map_inf=%d frame=%u",
+	                  command_line ? command_line : "(null)",
+	                  g_AeloriaEnableVerboseDrawLogs ? 1 : 0,
+	                  g_AeloriaZeroMapProducedInfantry ? 1 : 0,
+	                  Frame);
 }
 
 
@@ -1427,6 +2430,11 @@ extern "C" __declspec(dllexport) bool __cdecl CNC_Start_Instance_Variation(int s
 		return false;
 	}
 
+	// Ensure creation timestamps start fresh for this scenario (pairs with not clearing
+	// g_AeloriaObjectCreationFrame in the late first-render arming block).
+	g_AeloriaObjectCreationFrame.clear();
+	Aeloria_Debug_Log("CREATION_MAP_CLEARED early (CNC_Start_Instance_Variation entry)");
+
 	ScenarioPlayerType scen_player = SCEN_PLAYER_NONE;
 
 	if (stricmp(faction, "SPAIN") == 0) {
@@ -1591,7 +2599,14 @@ extern "C" __declspec(dllexport) bool __cdecl CNC_Start_Instance_Variation(int s
 	g_PlayerExemptionFrames   = PLAYER_EXEMPTION_FRAME_COUNT;
 	g_HumanPlayerDrawAttempts = 0;
 	g_HumanPlayerFallbackUses = 0;
-	g_AeloriaObjectLogMask.clear();   // fresh per skirmish for the once-per-object logging
+	g_AeloriaObjectLogMask.clear();
+	g_AeloriaObjectStability.clear();
+	// NOTE: Do NOT clear g_AeloriaObjectCreationFrame here (see matching comment in
+	// CNC_Start_Custom_Instance). Creation records (for age diagnostics) are kept;
+	// stability/logmask/counters are the per-game state being reset before first render.
+	g_AeloriaPlayerGuardHits = 0;
+	g_AeloriaNonPlayerGuardHits = 0;
+	g_AeloriaPromotedThenDemoted = 0;
 
 	Map.Render();
 
@@ -1697,6 +2712,12 @@ extern "C" __declspec(dllexport) bool __cdecl CNC_Start_Custom_Instance(const ch
 {
 
 	DLLExportClass::Set_Content_Directory(content_directory);
+
+	// Ensure creation timestamps start fresh for this scenario (objects will be recorded
+	// during subsequent Unlimbo calls during map load). This pairs with the decision
+	// NOT to clear g_AeloriaObjectCreationFrame in the late "first render" arming block.
+	g_AeloriaObjectCreationFrame.clear();
+	Aeloria_Debug_Log("CREATION_MAP_CLEARED early (CNC_Start_Custom_Instance entry)");
 
 	char	fullname[_MAX_FNAME + _MAX_EXT];
 
@@ -1830,7 +2851,74 @@ extern "C" __declspec(dllexport) bool __cdecl CNC_Start_Custom_Instance(const ch
 	Map.Flag_To_Redraw(true);
 
 	Set_Palette(GamePalette.Get_Data());
+
+	// === Aeloria Stability Arming (Custom Instance Path) ===
+	// This block was missing, causing invisible units on 4p+ custom maps.
+	// Mirrors the arming done in CNC_Start_Instance_Variation before the first guarded render.
+	Aeloria_Debug_Log("FIRST RENDER AFTER LOAD (CNC_Start_Custom_Instance)");
+	g_FirstRenderTick = GetTickCount();
+
+	g_EarlyLoadGraceActive = true;
+	Aeloria_Debug_Log("EARLY LOAD GRACE: enabled for first Map.Render() (Custom path)");
+
+	if (PlayerPtr) {
+		Aeloria_Debug_Log("HUMAN PLAYER HOUSE: %d (PlayerPtr=%p, ActLike=%d)",
+		                  (int)PlayerPtr->Class->House, (void*)PlayerPtr, (int)PlayerPtr->ActLike);
+		g_HumanPlayerHouse = PlayerPtr->Class->House;
+		Aeloria_Debug_Log("HUMAN PLAYER HOUSE CAPTURED FOR EXEMPTION: %d", (int)g_HumanPlayerHouse);
+	} else {
+		Aeloria_Debug_Log("HUMAN PLAYER HOUSE: PlayerPtr is NULL at first render (Custom path)");
+		g_HumanPlayerHouse = HOUSE_NONE;
+	}
+
+	g_PlayerExemptionFrames   = PLAYER_EXEMPTION_FRAME_COUNT;
+	g_HumanPlayerDrawAttempts = 0;
+	g_HumanPlayerFallbackUses = 0;
+	g_AeloriaObjectLogMask.clear();
+	g_AeloriaObjectStability.clear();
+	// NOTE: Do NOT clear g_AeloriaObjectCreationFrame here. Creations are recorded during
+	// scenario init (Techno::Unlimbo, relaxed for early window + Frame<100) *before* this
+	// arming point on the custom map path. Clearing it destroyed creation-to-first-draw
+	// age correlation (Item 1 of the 7-point plan) and caused age=-1 for all opening units.
+	// Stability state + logmask + counters are reset here (fresh per-game); creation times
+	// are preserved so first-draw PRE_PLACEHOLDER etc. can report real ages.
+	g_AeloriaPlayerGuardHits = 0;
+	g_AeloriaNonPlayerGuardHits = 0;
+	g_AeloriaPromotedThenDemoted = 0;
+
+	// D: Snapshot of known objects at first render on custom map (now shows real creation count)
+	{
+		size_t tracked = g_AeloriaObjectStability.size();
+		size_t withCreation = g_AeloriaObjectCreationFrame.size();
+		Aeloria_Debug_Log("FIRST_RENDER_SNAPSHOT custom_map stability_tracked=%zu with_creation=%zu", tracked, withCreation);
+	}
+
 	Map.Render();
+
+	g_EarlyLoadGraceActive = false;
+	Aeloria_Debug_Log("EARLY LOAD GRACE: disabled after first Map.Render() (Custom path)");
+	Aeloria_Debug_Log("PLAYER EXEMPTION (Phase B): 18000-frame window active for human house %d (Custom path)", (int)g_HumanPlayerHouse);
+
+	// Targeted catchup force for hasCreation objects (the starting infantry/vehicles recorded at Unlimbo).
+	// This runs AFTER the first Map.Render() + human house capture on the custom 4p path, so:
+	// - g_HumanPlayerHouse is known (isHumanEarly will be correct for the player's starting units).
+	// - The client should be providing a real ObjectList buffer.
+	// - The draw intercept will see hasCreation + list non-null (or protected if still null) and execute the
+	//   full population path (no early return), stamping safe E1/JEEP + Sort + selectable + pos into the real
+	//   client list slots and advancing CurrentDrawCount so the units are visible/selectable/orderable at skirmish start.
+	// This closes the "insertion gap" that caused "map but no units" even when SAFE_CLIENT_REG_EARLY + POST_FILL_STOMP fired.
+	for (auto& pair : g_AeloriaObjectCreationFrame) {
+		ObjectClass* obj = reinterpret_cast<ObjectClass*>(pair.first);
+		if (obj) {
+			char overrideOwner = (char)obj->Owner();
+			if (overrideOwner != HOUSE_NONE) {
+				int px = 0, py = 0;
+				Map.Coord_To_Pixel(obj->Render_Coord(), px, py);
+				DLLExportClass::DLL_Draw_Intercept(0, px, py, 32, 32, AELORIA_CLIENT_DRAW_FLAGS_CENTER, obj, DIR_N, 0x100, nullptr, overrideOwner);
+				Aeloria_Debug_Log("FORCED_CATCHUP_HASCREATION_AFTER_FIRST_RENDER this=%p owner=%d frame=%u pos=(%d,%d)", (void*)obj, (int)overrideOwner, Frame, px, py);
+			}
+		}
+	}
 
 	Set_Palette(GamePalette.Get_Data());
 
@@ -2105,29 +3193,167 @@ extern "C" __declspec(dllexport) bool __cdecl CNC_Advance_Instance(uint64 player
 	*/
 	Frame++;
 
+	Aeloria_PruneStaleTracking();
+
 	/*
-	**	Player House exemption timeout driver.
-	**	While the long countdown > 0 we keep g_EarlyLoadGraceActive true for the human player,
-	**	allowing their early-created units to draw (via the safe fallback path) even when
-	**	their shape data is still corrupted. This is the main lever that lets the player
-	**	see and use their starting forces for the opening minute(s) of the game.
-	**	Non-player objects remain under the normal strict guards.
+	**	Player House exemption timeout driver (Phase B, 18000 frames).
+	**	The long window for human-owned objects is driven by g_PlayerExemptionFrames +
+	**	Is_Player_Exempt(). The short g_EarlyLoadGraceActive flag (one first-render only)
+	**	is managed separately in the CNC_Start_*_Instance arming blocks and is no longer
+	**	touched from this driver (previous reuse caused permanent SKIP_DURING_GRACE for
+	**	the entire opening on custom maps, starving the Remastered client of real draws).
 	*/
 	if (g_PlayerExemptionFrames > 0) {
 		g_PlayerExemptionFrames--;
-		g_EarlyLoadGraceActive = true;
+		// NOTE: Do NOT touch g_EarlyLoadGraceActive here. That flag is strictly for the
+		// single first Map.Render() call (set true immediately before it, set false
+		// immediately after, in the CNC_Start_*_Instance arming blocks). Reusing it for
+		// the long 18000-frame player exemption window caused the one-frame safety guard
+		// in DrawSafePlaceholder to permanently suppress the real DLL_Draw_Intercept path
+		// for any object that still had bad shape data (w/h=0) during the entire opening.
+		// The long exemption continues to work via Is_Player_Exempt() + the placeholder
+		// paths that check stabilityLevel < 2 and owner == human house.
 
 		if (g_PlayerExemptionFrames == 0) {
 			int attempts = g_HumanPlayerDrawAttempts;
 			int fallbacks = g_HumanPlayerFallbackUses;
 			double pct = (attempts > 0) ? (100.0 * fallbacks / attempts) : 0.0;
-			Aeloria_Debug_Log("PLAYER EXEMPTION WINDOW EXPIRED for human house %d after %d frames (Phase B stats: %d draw attempts, %d used fallback size, %.1f%% fallback rate)",
+			Aeloria_Debug_Log("WINDOW_EXPIRED house=%d frames=%d attempts=%d fallbacks=%d fallback_pct=%.1f",
 			                  (int)g_HumanPlayerHouse, PLAYER_EXEMPTION_FRAME_COUNT, attempts, fallbacks, pct);
-			g_AeloriaObjectLogMask.clear();   // reset once-per-object tracking for any future window (or next skirmish)
+
+			// === Phase C: Worst-offender reporting using per-object stability data ===
+			// This is the key output for diagnosing which specific units/buildings were the slowest
+			// to stabilize or had the most bad-shape fallbacks during the opening window.
+			size_t totalTracked = g_AeloriaObjectStability.size();
+			if (totalTracked > 0) {
+				// Manual top-N collection (avoids std::sort + ADL swap issues with legacy headers like jshell.h)
+				struct AeloriaOffender {
+					uintptr_t ptr;
+					uint16_t fallbacks;
+					uint16_t reals;
+					uint8_t level;
+				};
+
+				std::vector<AeloriaOffender> top;
+				top.reserve(8);
+
+				int graduated = 0;
+				int withFallbacks = 0;
+
+				int speedBuckets[4] = {0}; // 0:<50, 1:50-200, 2:201-1000, 3:>1000 or never
+
+				for (const auto& kv : g_AeloriaObjectStability) {
+					const auto& s = kv.second;
+					uintptr_t p = kv.first;
+					uint16_t fb = s.fallbackUses;
+					uint16_t re = s.successfulRealDraws;
+					uint8_t  lv = s.stabilityLevel;
+
+					if (lv >= 2) graduated++;
+					if (fb > 0) withFallbacks++;
+
+					// Speed bucket using successfulRealDraws as proxy
+					if (re < 50) speedBuckets[0]++;
+					else if (re < 200) speedBuckets[1]++;
+					else if (re < 1000) speedBuckets[2]++;
+					else speedBuckets[3]++;
+
+					// Keep only top 8 by fallbackUses (then reals asc)
+					if (top.size() < 8) {
+						top.push_back({p, fb, re, lv});
+					} else {
+						// Find the worst (lowest priority) in current top
+						size_t worstIdx = 0;
+						for (size_t i = 1; i < top.size(); ++i) {
+							const auto& a = top[i];
+							const auto& b = top[worstIdx];
+							bool aWorse = (a.fallbacks < b.fallbacks) ||
+							              (a.fallbacks == b.fallbacks && a.reals > b.reals);
+							if (aWorse) worstIdx = i;
+						}
+						const auto& worst = top[worstIdx];
+						bool thisBetter = (fb > worst.fallbacks) ||
+						                  (fb == worst.fallbacks && re < worst.reals);
+						if (thisBetter) {
+							top[worstIdx] = {p, fb, re, lv};
+						}
+					}
+				}
+
+				// Re-sort the small top list for nice output (manual, no std::sort on the type)
+				for (size_t i = 0; i + 1 < top.size(); ++i) {
+					for (size_t j = i + 1; j < top.size(); ++j) {
+						auto& a = top[i];
+						auto& b = top[j];
+						bool shouldSwap = (b.fallbacks > a.fallbacks) ||
+						                  (b.fallbacks == a.fallbacks && b.reals < a.reals);
+						if (shouldSwap) std::swap(a, b);
+					}
+				}
+
+				Aeloria_Debug_Log("AELORIA_STABILITY_REPORT tracked=%zu graduated=%d with_fallbacks=%d top_by_fallbacks:",
+				                  totalTracked, graduated, withFallbacks);
+
+				// Item 7: Guard hit rate summary
+				Aeloria_Debug_Log("GUARD_HIT_RATE player=%d non_player=%d", g_AeloriaPlayerGuardHits, g_AeloriaNonPlayerGuardHits);
+
+				// Item 3: Speed buckets + demotions
+				Aeloria_Debug_Log("STABILIZATION_SPEED_BUCKETS <50=%d 50-200=%d 201-1000=%d >1000=%d promoted_then_demoted=%d",
+				                  speedBuckets[0], speedBuckets[1], speedBuckets[2], speedBuckets[3], g_AeloriaPromotedThenDemoted);
+
+				int shown = 0;
+				for (const auto& o : top) {
+					if (shown >= 8) break;
+					if (o.fallbacks == 0 && o.level >= 2) continue;
+
+					Aeloria_Debug_Log("  WORST_OFFENDER this=0x%p fallbacks=%u reals=%u level=%u",
+					                  (void*)o.ptr, o.fallbacks, o.reals, o.level);
+					shown++;
+				}
+				if (shown == 0) {
+					Aeloria_Debug_Log("  (All tracked objects either had zero fallbacks or graduated cleanly to level 2)");
+				}
+			}
+
+			size_t prunedStab = 0;
+			size_t prunedCreation = 0;
+			size_t prunedLogMask = 0;
+
+			for (auto it = g_AeloriaObjectStability.begin(); it != g_AeloriaObjectStability.end(); ) {
+				if (Aeloria_ShouldRetainTrackingAfterWindowExpire(it->first)) {
+					++it;
+				} else {
+					g_AeloriaObjectLogMask.erase(it->first);
+					it = g_AeloriaObjectStability.erase(it);
+					prunedStab++;
+				}
+			}
+
+			for (auto it = g_AeloriaObjectCreationFrame.begin(); it != g_AeloriaObjectCreationFrame.end(); ) {
+				if (Aeloria_ShouldRetainTrackingAfterWindowExpire(it->first)) {
+					++it;
+				} else {
+					it = g_AeloriaObjectCreationFrame.erase(it);
+					prunedCreation++;
+				}
+			}
+
+			for (auto it = g_AeloriaObjectLogMask.begin(); it != g_AeloriaObjectLogMask.end(); ) {
+				if (Aeloria_ShouldRetainTrackingAfterWindowExpire(it->first)) {
+					++it;
+				} else {
+					it = g_AeloriaObjectLogMask.erase(it);
+					prunedLogMask++;
+				}
+			}
+
+			Aeloria_Debug_Log("WINDOW_EXPIRED_PRUNE retained_stab=%zu retained_creation=%zu pruned_stab=%zu pruned_creation=%zu pruned_logmask=%zu",
+			                  g_AeloriaObjectStability.size(), g_AeloriaObjectCreationFrame.size(),
+			                  prunedStab, prunedCreation, prunedLogMask);
 		}
-	} else {
-		g_EarlyLoadGraceActive = false;
 	}
+	// (No else clause forcing g_EarlyLoadGraceActive=false here — the short first-render
+	// grace is managed exclusively inside the CNC_Start_* arming blocks around Map.Render().)
 
 	/*
 	** Very rarely, the human players will get a message from the computer.
@@ -3599,14 +4825,98 @@ void DLL_Draw_Line_Intercept(int x, int y, int x1, int y1, unsigned char color, 
 	DLLExportClass::DLL_Draw_Line_Intercept(x, y, x1, y1, color, frame);
 }
 
+static void Aeloria_CacheDrawParams(const ObjectClass* object, int shape_number, int x, int y, int width, int height,
+                                    int flags, DirType rotation, long scale, const char* shape_file_name);
+static void Aeloria_PopulateEarlyBulkSlot(CNCObjectStruct& slot, const ObjectClass* obj, int exportLayer);
+static void Aeloria_CopyEarlyDefaultAssetName(char* dest, int destLen, RTTIType rtti, const AeloriaObjectStability* stab);
+static const ObjectTypeClass& Aeloria_Safe_Object_Type_Of(const ObjectClass* object, bool hasCreation);
+static BuildingTypeClass const* Aeloria_Safe_Building_Type(BuildingClass const* building, bool hasCreation);
+static UnitType Aeloria_Intercept_Unit_Type_Enum(UnitClass const* unit);
+
 
 void DLLExportClass::DLL_Draw_Intercept(int shape_number, int x, int y, int width, int height, int flags, const ObjectClass *object, DirType rotation, long scale, const char *shape_file_name, char override_owner)
 {
+	// Phase 2 diagnostic (approved plan): loud entry into the actual client object population code.
+	// This is the moment the Remastered side decides whether to accept the draw for rendering + selection.
+	// We especially care what What_Am_I() returns for early creation objects.
+
+	uintptr_t key = 0;
+	bool hasCreation = false;
+	if (object) {
+		key = reinterpret_cast<uintptr_t>(object);
+		hasCreation = g_AeloriaObjectCreationFrame.find(key) != g_AeloriaObjectCreationFrame.end();
+		if (hasCreation && object->Is_Techno()) {
+			Aeloria_Repair_Early_Class_Pointer(const_cast<TechnoClass*>(static_cast<TechnoClass const*>(object)));
+		}
+		if (object->What_Am_I() == RTTI_BUILDING) {
+			uintptr_t at8 = *(uintptr_t*)((const char*)object + 8);
+			if (!Is_Plausible_Class_Pointer(at8)) {
+				Aeloria_Repair_Early_Class_Pointer(const_cast<BuildingClass*>(static_cast<BuildingClass const*>(object)));
+			}
+		}
+	}
+
+	// Hoisted for visibility checkpoint code (HUMAN_EARLY handling in REAL_FIRST and UNKNOWN paths).
+	// Declared at function scope so it is visible after the REAL_FIRST if-block.
+	bool isHumanEarly = (object && g_HumanPlayerHouse != HOUSE_NONE && object->Owner() == g_HumanPlayerHouse);
+
+	// Consolidation (2026-06-13): client registration is owned by Get_Layer_State bulk/sustain.
+	// Draw intercept stays on the vanilla population path except the Unlimbo list-null seed below.
+	bool skipHeavyEarlyPath = !hasCreation;
+	if (hasCreation && object) {
+		auto gradIt = g_AeloriaObjectStability.find(key);
+		if (gradIt != g_AeloriaObjectStability.end() && gradIt->second.clientListInserted) {
+			skipHeavyEarlyPath = true;
+		}
+		if (Frame >= 300) {
+			skipHeavyEarlyPath = true;
+		}
+	}
+
+	if (object && Is_Player_Exempt(object) && g_PlayerExemptionFrames > 0 && g_AeloriaEnableVerboseDrawLogs) {
+		int stab = 0;
+		auto sIt = g_AeloriaObjectStability.find(key);
+		if (sIt != g_AeloriaObjectStability.end()) stab = sIt->second.stabilityLevel;
+		RTTIType rtti = object->What_Am_I();
+		Aeloria_Debug_Log("CLIENT_DRAW_INTERCEPT this=%p RTTI=%d owner=%d has_creation=%d stab=%d frame=%u shape=%d w=%d h=%d",
+		                  (void*)object, rtti, (int)object->Owner(), hasCreation ? 1 : 0, stab, Frame, shape_number, width, height);
+	}
+
+	// Unlimbo-only seed when the client ObjectList does not exist yet (scenario-start units).
+	if (ObjectList == nullptr && hasCreation && !skipHeavyEarlyPath) {
+		CNCObjectStruct localObj{};
+		memset(&localObj, 0, sizeof(localObj));
+		Convert_Type(object, localObj);
+		if (localObj.Type == UNKNOWN) {
+			RTTIType rtti = object->What_Am_I();
+			if (rtti == RTTI_INFANTRY) { localObj.Type = INFANTRY; localObj.ID = Infantry.ID((InfantryClass*)object); }
+			else if (rtti == RTTI_UNIT) { localObj.Type = UNIT; localObj.ID = Units.ID((UnitClass*)object); }
+		}
+		localObj.Owner = (char)object->Owner();
+		localObj.Width = 32;
+		localObj.Height = 32;
+		localObj.IsSelectable = true;
+		auto& stab = g_AeloriaObjectStability[key];
+		Aeloria_CopyEarlyDefaultAssetName(localObj.AssetName, CNC_OBJECT_ASSET_NAME_LENGTH, object->What_Am_I(), &stab);
+		stab.earlySafeClientRegistered = true;
+		if (stab.stabilityLevel < 1) stab.stabilityLevel = 1;
+		return;
+	}
+
+	if (ObjectList == nullptr) {
+		return;
+	}
+
 	CNCObjectStruct& new_object = ObjectList->Objects[TotalObjectCount + CurrentDrawCount];
 	memset(&new_object, 0, sizeof(new_object));
 	Convert_Type(object, new_object);
 	if (new_object.Type == UNKNOWN) {
-		return;
+		if (!hasCreation) {
+			if (isHumanEarly) {
+				return;
+			}
+			return;
+		}
 	}
 
 	CNCObjectStruct* base_object = NULL;
@@ -3629,13 +4939,16 @@ void DLLExportClass::DLL_Draw_Intercept(int shape_number, int x, int y, int widt
 		new_object.SortOrder = ObjectList->Objects[TotalObjectCount].SortOrder + CurrentDrawCount;
 	}	
 
-	strncpy(new_object.TypeName, object->Class_Of().IniName, CNC_OBJECT_ASSET_NAME_LENGTH);
+	{
+		const ObjectTypeClass& oclass = Aeloria_Safe_Object_Type_Of(object, hasCreation);
+		strncpy(new_object.TypeName, oclass.IniName, CNC_OBJECT_ASSET_NAME_LENGTH);
 
-	if (shape_file_name != NULL) {
-		strncpy(new_object.AssetName, shape_file_name, CNC_OBJECT_ASSET_NAME_LENGTH);
-	}
-	else {
-		strncpy(new_object.AssetName, object->Class_Of().Graphic_Name(), CNC_OBJECT_ASSET_NAME_LENGTH);
+		if (shape_file_name != NULL) {
+			strncpy(new_object.AssetName, shape_file_name, CNC_OBJECT_ASSET_NAME_LENGTH);
+		}
+		else {
+			strncpy(new_object.AssetName, oclass.Graphic_Name(), CNC_OBJECT_ASSET_NAME_LENGTH);
+		}
 	}
 
 	new_object.Owner = (base_object != NULL) ? ((override_owner != HOUSE_NONE) ? override_owner : base_object->Owner) : (char)object->Owner();
@@ -3659,13 +4972,15 @@ void DLLExportClass::DLL_Draw_Intercept(int shape_number, int x, int y, int widt
 			if (building->BState == BSTATE_CONSTRUCTION) {
 				strncat(new_object.AssetName, "MAKE", CNC_OBJECT_ASSET_NAME_LENGTH);
 			}
-			const BuildingTypeClass *building_type = building->Class;
-			short const *occupy_list = building_type->Occupy_List();
-			if (occupy_list) {
-				while (*occupy_list != REFRESH_EOL && new_object.OccupyListLength < MAX_OCCUPY_CELLS) {
-					new_object.OccupyList[new_object.OccupyListLength] = *occupy_list;
-					new_object.OccupyListLength++;
-					occupy_list++;
+			BuildingTypeClass const* building_type = Aeloria_Safe_Building_Type(building, hasCreation);
+			if (building_type) {
+				short const *occupy_list = building_type->Occupy_List();
+				if (occupy_list) {
+					while (*occupy_list != REFRESH_EOL && new_object.OccupyListLength < MAX_OCCUPY_CELLS) {
+						new_object.OccupyList[new_object.OccupyListLength] = *occupy_list;
+						new_object.OccupyListLength++;
+						occupy_list++;
+					}
 				}
 			}
 		}
@@ -3673,7 +4988,8 @@ void DLLExportClass::DLL_Draw_Intercept(int shape_number, int x, int y, int widt
 		COORDINATE coord = object->Render_Coord();
 		CELL cell = Coord_Cell(coord);
 		int dimx, dimy;
-		object->Class_Of().Dimensions(dimx, dimy);
+		const ObjectTypeClass& rootOclass = Aeloria_Safe_Object_Type_Of(object, hasCreation);
+		rootOclass.Dimensions(dimx, dimy);
 
 		new_object.PositionX = x;
 		new_object.PositionY = y;
@@ -3691,9 +5007,9 @@ void DLLExportClass::DLL_Draw_Intercept(int shape_number, int x, int y, int widt
 		new_object.VisibleFlags = CNCObjectStruct::VISIBLE_FLAGS_ALL;
 		new_object.SpiedByFlags = 0U;
 
-		new_object.IsSelectable = object->Class_Of().IsSelectable;
+		new_object.IsSelectable = rootOclass.IsSelectable;
 		new_object.IsSelectedMask = object->IsSelectedMask;
-		new_object.MaxStrength = object->Class_Of().MaxStrength;
+		new_object.MaxStrength = rootOclass.MaxStrength;
 		new_object.Strength = object->Strength;
 		new_object.CellX = (CurrentDrawCount > 0) ? root_object.CellX : Cell_X(cell);
 		new_object.CellY = (CurrentDrawCount > 0) ? root_object.CellY : Cell_Y(cell);
@@ -3750,16 +5066,18 @@ void DLLExportClass::DLL_Draw_Intercept(int shape_number, int x, int y, int widt
 		bool is_building = what_is_object == RTTI_BUILDING;
 		if (is_building) {
 			const BuildingClass* building = static_cast<const BuildingClass*>(object);
+			BuildingTypeClass const* building_type = Aeloria_Safe_Building_Type(building, hasCreation);
 			new_object.IsRepairing = building->IsRepairing;
-			new_object.IsFactory = building->Class->Is_Factory();
+			new_object.IsFactory = building_type ? building_type->Is_Factory() : false;
 			new_object.IsPrimaryFactory = building->IsLeader;
-			new_object.IsFake = building->Class->IsFake;
+			new_object.IsFake = building_type ? building_type->IsFake : false;
 		}
 
 		if (object->Is_Techno()) {
 			const TechnoClass* techno_object = static_cast<const TechnoClass*>(object);
-			const TechnoTypeClass *ttype = techno_object->Techno_Type_Class();
+			const TechnoTypeClass *ttype = Aeloria_Safe_Techno_Type(techno_object);
 
+			if (ttype) {
 			new_object.MaxSpeed = (unsigned char)ttype->MaxSpeed;
 			new_object.IsALoaner = techno_object->IsALoaner;
 			new_object.IsNominal = ttype->IsNominal;
@@ -3786,6 +5104,7 @@ void DLLExportClass::DLL_Draw_Intercept(int shape_number, int x, int y, int widt
 				}
 			}
 			Logic_Switch_Player_Context(old_player_ptr);
+			}
 		}
 
 		new_object.ControlGroup = (unsigned char)(-1);
@@ -3801,16 +5120,18 @@ void DLLExportClass::DLL_Draw_Intercept(int shape_number, int x, int y, int widt
 		bool is_infantry = what_is_object == RTTI_INFANTRY;
 		if (is_infantry) {
 			const InfantryClass* infantry = static_cast<const InfantryClass*>(object);
-			new_object.IsDog = infantry->Class->IsDog;
-			new_object.CanPlaceBombs = infantry->Class->IsBomber;
+			InfantryTypeClass const* itype = static_cast<InfantryTypeClass const*>(Aeloria_Safe_Techno_Type(infantry));
+			if (itype) {
+				new_object.IsDog = itype->IsDog;
+				new_object.CanPlaceBombs = itype->IsBomber;
+			}
 		}
 
 		new_object.CanHarvest = false;
 		bool is_unit = what_is_object == RTTI_UNIT;
 		if (is_unit) {
 			const UnitClass* unit = static_cast<const UnitClass*>(object);
-			if (unit->Class->Type == UNIT_HARVESTER)
-			{
+			if (Aeloria_Intercept_Unit_Type_Enum(unit) == UNIT_HARVESTER) {
 				new_object.CanHarvest = true;
 			}
 
@@ -3821,8 +5142,14 @@ void DLLExportClass::DLL_Draw_Intercept(int shape_number, int x, int y, int widt
 		bool is_aircraft = what_is_object == RTTI_AIRCRAFT;
 		if (is_aircraft) {
 			const AircraftClass* aircraft = static_cast<const AircraftClass*>(object);;
-			new_object.IsFixedWingedAircraft = aircraft->Class->IsFixedWing;
+			AircraftTypeClass const* atype = static_cast<AircraftTypeClass const*>(Aeloria_Safe_Techno_Type(aircraft));
+			if (atype) {
+				new_object.IsFixedWingedAircraft = atype->IsFixedWing;
+			}
 		}
+
+		// (Phase 2 safe client reg logic centralized before CurrentDrawCount++ for coverage of all emit paths,
+		//  including when base_object != NULL for a draw entry.)
 
 		switch (what_is_object)
 		{
@@ -3842,7 +5169,8 @@ void DLLExportClass::DLL_Draw_Intercept(int shape_number, int x, int y, int widt
 			new_object.Cloak = techno_object->Cloak;
 			new_object.SpiedByFlags = techno_object->Spied_By();
 
-			if (techno_object->Techno_Type_Class()->IsInvisible) {
+			const TechnoTypeClass* visType = Aeloria_Safe_Techno_Type(techno_object);
+			if (visType != nullptr && visType->IsInvisible) {
 				// Hide for enemy players
 				HouseClass* owner = HouseClass::As_Pointer(object->Owner());
 				if (owner != nullptr) {
@@ -3946,6 +5274,11 @@ void DLLExportClass::DLL_Draw_Intercept(int shape_number, int x, int y, int widt
 		memset(new_object.ActionWithSelected, DAT_NONE, sizeof(new_object.ActionWithSelected));
 	}
 
+	// Cache only real shape draws (not placeholder proxy shape_number=0).
+	if (object && width > 0 && height > 0 && shape_number > 0) {
+		Aeloria_CacheDrawParams(object, shape_number, x, y, width, height, flags, rotation, scale, shape_file_name);
+	}
+
 	CurrentDrawCount++;
 }
 
@@ -3985,6 +5318,566 @@ void DLLExportClass::DLL_Draw_Line_Intercept(int x, int y, int x1, int y1, unsig
 	}
 }
 
+
+static void Aeloria_CacheDrawParams(const ObjectClass* object, int shape_number, int x, int y, int width, int height,
+                                    int flags, DirType rotation, long scale, const char* shape_file_name)
+{
+	if (!object || width <= 0 || height <= 0 || shape_number <= 0) return;
+	uintptr_t key = reinterpret_cast<uintptr_t>(object);
+	auto stabIt = g_AeloriaObjectStability.find(key);
+	if (stabIt == g_AeloriaObjectStability.end()) {
+		// Zero-map / stateless techno must not auto-insert stab entries from draw cache alone.
+		if (Aeloria_IsStatelessUntrackedTechno(object)) return;
+		return;
+	}
+	auto& stab = stabIt->second;
+	stab.hasCachedDraw = true;
+	stab.cachedShapeNumber = shape_number;
+	stab.cachedDrawFlags = flags;
+	stab.cachedRotation = (unsigned char)rotation;
+	stab.cachedScale = scale;
+	stab.cachedDrawX = x;
+	stab.cachedDrawY = y;
+	stab.cachedWidth = width;
+	stab.cachedHeight = height;
+	if (shape_file_name && shape_file_name[0]) {
+		strncpy(stab.cachedAssetName, shape_file_name, sizeof(stab.cachedAssetName));
+	}
+	stab.successfulRealDraws++;
+	stab.lastGoodFrame = Frame;
+	// Virtual intercept cache must not graduate infantry off the MAIN-window guard:
+	// E3+ can cache good virtual shapes while +8 stays plausible-but-corrupt on MAIN
+	// (1127 session: barracks rocket troopers AV after ~3 layer exports).
+}
+
+void Aeloria_GraduateTrackedObject(const ObjectClass* obj)
+{
+	if (!obj) return;
+	uintptr_t key = reinterpret_cast<uintptr_t>(obj);
+	auto it = g_AeloriaObjectStability.find(key);
+	if (it == g_AeloriaObjectStability.end()) return;
+	AeloriaObjectStability& stab = it->second;
+
+	uint32_t creationFrame = UINT32_MAX;
+	auto cfIt = g_AeloriaObjectCreationFrame.find(key);
+	if (cfIt != g_AeloriaObjectCreationFrame.end()) {
+		creationFrame = cfIt->second;
+	}
+	g_AeloriaObjectCreationFrame.erase(key);
+
+	stab.sustainRetired = true;
+	stab.stabilityLevel = 2;
+
+	// Phase 4/5e/5g: drop mid-game produced techno from tracking maps once MAIN draw is safe.
+	// Retain stability until hasCachedMainDraw — virtual-only cache is not enough (1145 session).
+	bool scenarioStart = (creationFrame <= 10);
+	if (!scenarioStart && !Aeloria_IsHumanDeployedBuilding(obj) && !Aeloria_IsRepurposedHarvester(obj)
+	    && !Aeloria_IsProducedBadPlus8Unit(obj) && !Aeloria_IsEternalSafeProducedUnit(obj)) {
+		RTTIType rtti = obj->What_Am_I();
+		if ((rtti == RTTI_INFANTRY || rtti == RTTI_UNIT || rtti == RTTI_AIRCRAFT)
+		    && !Aeloria_HasValidMainDrawCache(obj)) {
+			g_AeloriaObjectLogMask.erase(key);
+			Aeloria_Debug_Log("PRODUCED_TECHNO_GRADUATE_DEFER this=%p owner=%d rtti=%d type_enum=%d frame=%u (retain stab until MAIN cache)",
+			                  (void*)obj, (int)obj->Owner(), (int)rtti, (int)stab.cachedTypeEnum, Frame);
+			return;
+		}
+		g_AeloriaObjectStability.erase(key);
+		g_AeloriaObjectLogMask.erase(key);
+	}
+}
+
+bool Aeloria_TryNotifyProducedUnitMainDrawCache(const ObjectClass* obj, int shape_number, int width, int height,
+                                              int draw_x, int draw_y, bool runtime_bad_plus_8)
+{
+	if (!obj || width <= 0 || height <= 0) {
+		return false;
+	}
+	uintptr_t key = reinterpret_cast<uintptr_t>(obj);
+	auto it = g_AeloriaObjectStability.find(key);
+	if (it == g_AeloriaObjectStability.end() || !it->second.producedUnitUnlimboSeeded) {
+		return false;
+	}
+	if (runtime_bad_plus_8) {
+		it->second.producedUnitBadPlus8 = true;
+	}
+	int cacheShape = (shape_number > 0) ? shape_number : 16;
+	Aeloria_NotifyMainDrawCache(obj, cacheShape, width, height, draw_x, draw_y);
+	Aeloria_Debug_Log("PRODUCED_UNIT_MAIN_CACHE this=%p owner=%d shape=%d pos=(%d,%d) frame=%u",
+	                  (void*)obj, (int)obj->Owner(), cacheShape, draw_x, draw_y, Frame);
+	return true;
+}
+
+void Aeloria_NotifyMainDrawCache(const ObjectClass* obj, int shape_number, int width, int height, int draw_x, int draw_y)
+{
+	if (!obj || shape_number <= 0 || width <= 0 || height <= 0) return;
+	uintptr_t key = reinterpret_cast<uintptr_t>(obj);
+	auto& stab = g_AeloriaObjectStability[key];
+	stab.hasCachedMainDraw = true;
+	// Do not set hasCachedDraw here — that flag means a full virtual intercept cache
+	// (position + DrawFlags + shape). Setting it without cachedDrawX/Y/Flags caused bulk
+	// sustain to overwrite pixel positions with (0,0) and DrawFlags=0 (top-left anchor).
+	stab.cachedShapeNumber = shape_number;
+	stab.cachedWidth = width;
+	stab.cachedHeight = height;
+	// MAIN Draw_It pixel coords — foot units in MARK_UP leave the map layer so
+	// Render_Coord→pixel can be negative; bulk sustain must use the last good MAIN draw.
+	if (draw_x >= 0 && draw_y >= 0) {
+		stab.cachedDrawX = draw_x;
+		stab.cachedDrawY = draw_y;
+	}
+	stab.lastGoodFrame = Frame;
+	Aeloria_GraduateTrackedObject(obj);
+}
+
+static void Aeloria_CopyEarlyDefaultAssetName(char* dest, int destLen, RTTIType rtti, const AeloriaObjectStability* stab)
+{
+	if (stab && stab->cachedTypeEnum >= 0) {
+		if (rtti == RTTI_UNIT) {
+			const UnitTypeClass& ref = UnitTypeClass::As_Reference((UnitType)stab->cachedTypeEnum);
+			strncpy(dest, ref.Graphic_Name(), destLen);
+			return;
+		}
+		if (rtti == RTTI_INFANTRY) {
+			const InfantryTypeClass& ref = InfantryTypeClass::As_Reference((InfantryType)stab->cachedTypeEnum);
+			strncpy(dest, ref.Graphic_Name(), destLen);
+			return;
+		}
+		if (rtti == RTTI_BUILDING) {
+			const BuildingTypeClass& ref = BuildingTypeClass::As_Reference((StructType)stab->cachedTypeEnum);
+			strncpy(dest, ref.Graphic_Name(), destLen);
+			return;
+		}
+	}
+	if (rtti == RTTI_INFANTRY) strncpy(dest, "E1", destLen);
+	else if (rtti == RTTI_UNIT) strncpy(dest, "JEEP", destLen);
+	else if (rtti == RTTI_BUILDING) strncpy(dest, "FTUR", destLen);
+	else strncpy(dest, "ICON", destLen);
+}
+
+static const ObjectTypeClass& Aeloria_Safe_Object_Type_Of(const ObjectClass* object, bool hasCreation)
+{
+	if (object && object->Is_Techno()) {
+		uintptr_t at8 = *(uintptr_t*)((const char*)object + 8);
+		bool badAt8 = !Is_Plausible_Class_Pointer(at8);
+		RTTIType rtti = object->What_Am_I();
+		if (hasCreation || (badAt8 && rtti == RTTI_BUILDING)) {
+			TechnoClass* tc = const_cast<TechnoClass*>(static_cast<TechnoClass const*>(object));
+			Aeloria_Repair_Early_Class_Pointer(tc);
+			TechnoTypeClass const* safe = Aeloria_Safe_Techno_Type(tc);
+			if (safe) {
+				return *static_cast<const ObjectTypeClass*>(safe);
+			}
+			if (rtti == RTTI_BUILDING) {
+				return BuildingTypeClass::As_Reference(STRUCT_TURRET);
+			}
+		}
+	}
+	return object->Class_Of();
+}
+
+static UnitType Aeloria_Intercept_Unit_Type_Enum(UnitClass const* unit)
+{
+	if (!unit) {
+		return UNIT_NONE;
+	}
+	TechnoTypeClass const* ttype = Aeloria_Safe_Techno_Type(unit);
+	UnitTypeClass const* utype = ttype ? static_cast<UnitTypeClass const*>(ttype) : nullptr;
+	return utype ? utype->Type : UNIT_NONE;
+}
+
+static BuildingTypeClass const* Aeloria_Safe_Building_Type(BuildingClass const* building, bool hasCreation)
+{
+	if (!building) {
+		return nullptr;
+	}
+	if (hasCreation) {
+		Aeloria_Repair_Early_Class_Pointer(const_cast<BuildingClass*>(building));
+	}
+	TechnoTypeClass const* ttype = Aeloria_Safe_Techno_Type(building);
+	if (ttype && ttype->RTTI == RTTI_BUILDINGTYPE) {
+		return static_cast<BuildingTypeClass const*>(ttype);
+	}
+	return &BuildingTypeClass::As_Reference(STRUCT_TURRET);
+}
+
+static bool Aeloria_IsValidBulkPixelPos(int px, int py)
+{
+	return px >= 0 && py >= 0 && px < 8192 && py < 8192;
+}
+
+// Moving foot units leave Map.Layer during MARK_UP; live Coord_To_Pixel can fail while MAIN draw coords are good.
+static bool Aeloria_ResolveBulkPixelPos(const ObjectClass* obj, const AeloriaObjectStability* stab, int& px, int& py)
+{
+	px = 0;
+	py = 0;
+	if (!obj || !obj->IsActive) {
+		return false;
+	}
+
+	int livePx = 0;
+	int livePy = 0;
+	bool liveOk = false;
+	if (obj->IsActive) {
+		COORDINATE renderCoord = obj->Render_Coord();
+		liveOk = Map.Coord_To_Pixel(renderCoord, livePx, livePy) && Aeloria_IsValidBulkPixelPos(livePx, livePy);
+		if (!liveOk) {
+			COORDINATE centerCoord = obj->Center_Coord();
+			liveOk = Map.Coord_To_Pixel(centerCoord, livePx, livePy) && Aeloria_IsValidBulkPixelPos(livePx, livePy);
+		}
+	}
+	if (liveOk) {
+		px = livePx;
+		py = livePy;
+		return true;
+	}
+
+	if (stab && stab->hasCachedMainDraw && Aeloria_IsValidBulkPixelPos(stab->cachedDrawX, stab->cachedDrawY)) {
+		px = stab->cachedDrawX;
+		py = stab->cachedDrawY;
+		return true;
+	}
+
+	if (stab && stab->hasCachedDraw && stab->cachedDrawFlags != 0
+	    && Aeloria_IsValidBulkPixelPos(stab->cachedDrawX, stab->cachedDrawY)) {
+		px = stab->cachedDrawX;
+		py = stab->cachedDrawY;
+		return true;
+	}
+
+	return false;
+}
+
+static int Aeloria_FindObjectExportIndex(CNCObjectListStruct* list, const void* objPtr)
+{
+	if (!list || !objPtr) {
+		return -1;
+	}
+	for (int i = 0; i < 512; ++i) {
+		if (list->Objects[i].CNCInternalObjectPointer == objPtr) {
+			return i;
+		}
+	}
+	return -1;
+}
+
+// Contiguous bulk tail only — client Count must match dense [0..Count-1]. Skipping stale holes (5z-n2 bug)
+// wrote idx=89 while finalCount=85 and crashed in VCRUNTIME140 (heap corruption).
+static bool Aeloria_PrepareContiguousBulkSlot(CNCObjectListStruct* list, int proposedIdx, const void* objPtr)
+{
+	if (!list || proposedIdx < 0 || proposedIdx >= 512 || !objPtr) {
+		return false;
+	}
+	void* occupant = list->Objects[proposedIdx].CNCInternalObjectPointer;
+	if (occupant != nullptr && occupant != objPtr) {
+		Aeloria_Debug_Log("BULK_SLOT_STOMP_GUARD idx=%d stale=%p new=%p frame=%u (clearing stale tail slot before contiguous append)",
+		                  proposedIdx, occupant, objPtr, Frame);
+		memset(&list->Objects[proposedIdx], 0, sizeof(CNCObjectStruct));
+	}
+	return true;
+}
+
+// Shared safe LAYERS slot fill for first bulk insert + per-frame sustain re-insert (early custom 4p starting forces).
+// Uses cached virtual-draw params when available (no Class_Of — sustain must not reintroduce +8 AV).
+static void Aeloria_PopulateEarlyBulkSlot(CNCObjectStruct& slot, const ObjectClass* obj, int exportLayer)
+{
+	memset(&slot, 0, sizeof(slot));
+
+	uintptr_t objKey = reinterpret_cast<uintptr_t>(obj);
+	auto stabIt = g_AeloriaObjectStability.find(objKey);
+	const AeloriaObjectStability* stab = (stabIt != g_AeloriaObjectStability.end()) ? &stabIt->second : nullptr;
+
+	RTTIType rtti = obj->What_Am_I();
+	if (rtti == RTTI_INFANTRY) { slot.Type = INFANTRY; slot.ID = Infantry.ID((InfantryClass*)obj); }
+	else if (rtti == RTTI_UNIT) { slot.Type = UNIT; slot.ID = Units.ID((UnitClass*)obj); }
+	else if (rtti == RTTI_BUILDING) { slot.Type = BUILDING; slot.ID = Buildings.ID((BuildingClass*)obj); }
+
+	slot.Owner = (char)obj->Owner();
+	const bool hasCachedDims = stab && (stab->hasCachedDraw || stab->hasCachedMainDraw);
+	slot.Width = (hasCachedDims && stab->cachedWidth > 0) ? stab->cachedWidth : 32;
+	slot.Height = (hasCachedDims && stab->cachedHeight > 0) ? stab->cachedHeight : 32;
+	slot.IsSelectable = true;
+	slot.DimensionX = 16; slot.DimensionY = 16;
+
+	COORDINATE renderCoord = obj->Render_Coord();
+	COORDINATE centerCoord = obj->Center_Coord();
+	CELL cell = Coord_Cell(renderCoord);
+	slot.CellX = (unsigned short)Cell_X(cell);
+	slot.CellY = (unsigned short)Cell_Y(cell);
+	slot.CenterCoordX = (unsigned short)Coord_X(centerCoord);
+	slot.CenterCoordY = (unsigned short)Coord_Y(centerCoord);
+	slot.Altitude = obj->Height;
+
+	int px = 0;
+	int py = 0;
+	Aeloria_ResolveBulkPixelPos(obj, stab, px, py);
+	slot.PositionX = px;
+	slot.PositionY = py;
+
+	short realStr = 0;
+	if (rtti == RTTI_INFANTRY || rtti == RTTI_UNIT || rtti == RTTI_BUILDING) {
+		realStr = (short)((TechnoClass*)const_cast<ObjectClass*>(obj))->Strength;
+	}
+	slot.MaxStrength = (slot.Type == INFANTRY ? 50 : (slot.Type == UNIT ? 100 : 400));
+	slot.Strength = (realStr > 0 ? realStr : slot.MaxStrength);
+	if (slot.Strength > slot.MaxStrength) slot.Strength = slot.MaxStrength;
+	if (slot.Strength <= 0) slot.Strength = slot.MaxStrength;
+
+	const char* tn = (slot.Type == INFANTRY ? "E1" : (slot.Type == UNIT ? "UNIT" : "OBJ"));
+	strncpy(slot.TypeName, tn, CNC_OBJECT_ASSET_NAME_LENGTH);
+	Aeloria_CopyEarlyDefaultAssetName(slot.AssetName, CNC_OBJECT_ASSET_NAME_LENGTH, rtti, stab);
+
+	if (rtti == RTTI_UNIT || rtti == RTTI_INFANTRY || rtti == RTTI_BUILDING) {
+		TechnoClass* tc = const_cast<TechnoClass*>(static_cast<TechnoClass const*>(obj));
+		Aeloria_Repair_Early_Class_Pointer(tc);
+		TechnoTypeClass const* ttype = Aeloria_Safe_Techno_Type(tc);
+		if (ttype) {
+			ObjectTypeClass const& otype = static_cast<ObjectTypeClass const&>(*ttype);
+			const char* gname = otype.Graphic_Name();
+			const char* iname = otype.Name();
+			if (gname && gname[0]) {
+				strncpy(slot.AssetName, gname, CNC_OBJECT_ASSET_NAME_LENGTH);
+			}
+			if (iname && iname[0]) {
+				strncpy(slot.TypeName, iname, CNC_OBJECT_ASSET_NAME_LENGTH);
+			}
+			int dx = 0, dy = 0;
+			otype.Dimensions(dx, dy);
+			if (dx > 0) slot.DimensionX = (unsigned char)dx;
+			if (dy > 0) slot.DimensionY = (unsigned char)dy;
+			slot.MaxStrength = ttype->MaxStrength;
+			if (slot.Strength > slot.MaxStrength) slot.Strength = slot.MaxStrength;
+			slot.IsSelectable = ttype->IsSelectable;
+			if (rtti == RTTI_BUILDING) {
+				BuildingTypeClass const* btype = static_cast<BuildingTypeClass const*>(ttype);
+				short const* occupy = btype->Occupy_List();
+				if (occupy) {
+					while (*occupy != REFRESH_EOL && slot.OccupyListLength < MAX_OCCUPY_CELLS) {
+						slot.OccupyList[slot.OccupyListLength++] = *occupy++;
+					}
+				}
+			}
+		}
+	}
+
+	// Only trust the virtual intercept cache when DrawFlags were captured too (Aeloria_CacheDrawParams).
+	// hasCachedMainDraw alone records shape dims for graduation, not anchor semantics.
+	// Position is resolved above via Aeloria_ResolveBulkPixelPos (live coord, then MAIN, then virtual).
+	if (stab && stab->hasCachedDraw && stab->cachedDrawFlags != 0) {
+		slot.ShapeIndex = (unsigned short)stab->cachedShapeNumber;
+		slot.DrawFlags = stab->cachedDrawFlags;
+		slot.Rotation = stab->cachedRotation;
+		slot.Scale = stab->cachedScale;
+		if (stab->cachedAssetName[0]) {
+			strncpy(slot.AssetName, stab->cachedAssetName, CNC_OBJECT_ASSET_NAME_LENGTH);
+		}
+	} else {
+		slot.DrawFlags = AELORIA_CLIENT_DRAW_FLAGS_CENTER;
+		if (hasCachedDims && stab->cachedShapeNumber > 0) {
+			slot.ShapeIndex = (unsigned short)stab->cachedShapeNumber;
+		} else {
+			slot.ShapeIndex = 0;
+		}
+		slot.Rotation = (unsigned char)DIR_N;
+		slot.Scale = 0x100;
+	}
+
+	slot.SortOrder = (exportLayer << 29) + (obj->Sort_Y() >> 3);
+	slot.CNCInternalObjectPointer = (void*)obj;
+	slot.VisibleFlags = CNCObjectStruct::VISIBLE_FLAGS_ALL;
+	slot.IsTheaterSpecific = false;
+	slot.FlashingFlags = 0;
+	slot.Cloak = UNCLOAKED;
+	slot.SpiedByFlags = 0U;
+	slot.IsSelectedMask = 0U;
+	slot.RecentlyCreated = true;
+	slot.NumLines = 0;
+	slot.NumPips = 0;
+	slot.MaxPips = 0;
+	slot.OccupyListLength = 0;
+	slot.SubObject = 0;
+	slot.BaseObjectID = 0;
+	slot.BaseObjectType = UNKNOWN;
+	slot.SimLeptonX = 0;
+	slot.SimLeptonY = 0;
+	slot.MaxSpeed = 0;
+	slot.IsALoaner = false;
+	slot.IsFactory = false;
+	slot.IsPrimaryFactory = false;
+	slot.IsNominal = true;
+	slot.IsDog = false;
+	slot.IsIronCurtain = false;
+	slot.IsAntiGround = true;
+	slot.IsAntiAircraft = false;
+	slot.IsSubSurface = false;
+	slot.IsFake = false;
+	slot.CanRepair = false;
+	slot.CanDemolish = false;
+	slot.CanDemolishUnit = false;
+	slot.CanHarvest = false;
+	slot.CanPlaceBombs = false;
+	slot.IsFixedWingedAircraft = false;
+	slot.IsInFormation = false;
+	slot.ProductionAssetName[0] = '\0';
+	slot.OverrideDisplayName = "\0";
+
+	HouseClass* owner_house = nullptr;
+	for (int i = 0; i < Houses.Count(); ++i) {
+		HouseClass* hptr = Houses.Ptr(i);
+		if ((hptr != nullptr) && (hptr->Class->House == (HousesType)slot.Owner)) {
+			owner_house = hptr;
+			break;
+		}
+	}
+	slot.RemapColor = (owner_house != nullptr) ? owner_house->RemapColor : -1;
+
+	memset(slot.CanMove, 0, sizeof(slot.CanMove));
+	memset(slot.CanFire, 0, sizeof(slot.CanFire));
+	memset(slot.ActionWithSelected, DAT_NONE, sizeof(slot.ActionWithSelected));
+	if (slot.Owner >= 0 && slot.Owner < MAX_HOUSES) {
+		slot.CanMove[slot.Owner] = true;
+		slot.CanFire[slot.Owner] = true;
+		slot.ActionWithSelected[slot.Owner] = DAT_MOVE;
+	}
+}
+
+static bool Aeloria_ObjectAlreadyInExportList(CNCObjectListStruct* list, int count, const void* objPtr)
+{
+	if (!list || !objPtr) {
+		return false;
+	}
+	if (Aeloria_FindObjectExportIndex(list, objPtr) >= 0) {
+		return true;
+	}
+	for (int i = 0; i < count; ++i) {
+		if (list->Objects[i].CNCInternalObjectPointer == objPtr) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// Foot units are removed from Map.Layer during MARK_UP while moving; sustain re-inserts them.
+static bool Aeloria_IsFootLayerSustainCandidate(const ObjectClass* obj)
+{
+	if (!obj || !obj->IsActive || obj->IsInLimbo || !obj->Is_Techno()) {
+		return false;
+	}
+	RTTIType rtti = obj->What_Am_I();
+	if (rtti != RTTI_INFANTRY && rtti != RTTI_UNIT) {
+		return false;
+	}
+	uintptr_t key = reinterpret_cast<uintptr_t>(obj);
+	// Produced war-factory units: defer foot sustain until tactical MAIN draw caches coords (5z-n5).
+	auto sIt = g_AeloriaObjectStability.find(key);
+	if (sIt != g_AeloriaObjectStability.end()
+	    && sIt->second.producedUnitUnlimboSeeded
+	    && !Aeloria_HasValidMainDrawCache(obj)) {
+		return false;
+	}
+	if (g_AeloriaStatelessInfantryHotList.find(key) != g_AeloriaStatelessInfantryHotList.end()) {
+		return true;
+	}
+	return g_AeloriaObjectCreationFrame.find(key) != g_AeloriaObjectCreationFrame.end();
+}
+
+static void Aeloria_SustainMissingFootLayerObjects(CNCObjectListStruct* list, int& totalCount, int exportLayer)
+{
+	if (!GameActive || !list) {
+		return;
+	}
+
+	int footAdded = 0;
+	const int baseTotal = totalCount;
+
+	auto tryInsert = [&](const ObjectClass* obj) {
+		if (!Aeloria_IsFootLayerSustainCandidate(obj)) {
+			return;
+		}
+		if (Aeloria_ObjectAlreadyInExportList(list, baseTotal + footAdded, obj)) {
+			return;
+		}
+		int idx = baseTotal + footAdded;
+		if (idx >= 512) {
+			return;
+		}
+		Aeloria_PopulateEarlyBulkSlot(list->Objects[idx], obj, exportLayer);
+		footAdded++;
+	};
+
+	for (uintptr_t k : g_AeloriaStatelessInfantryHotList) {
+		tryInsert(reinterpret_cast<const ObjectClass*>(k));
+	}
+	for (auto& cp : g_AeloriaObjectCreationFrame) {
+		tryInsert(reinterpret_cast<const ObjectClass*>(cp.first));
+	}
+
+	if (footAdded > 0) {
+		totalCount += footAdded;
+		Aeloria_Debug_Log("FOOT_LAYER_SUSTAIN N=%d finalCount=%d frame=%u",
+		                  footAdded, totalCount, Frame);
+	}
+}
+
+static bool Aeloria_ObjectNeedsBulkOrSustain(const ObjectClass* obj, AeloriaObjectStability& stab)
+{
+	if (!obj || !obj->IsActive || obj->IsInLimbo) return false;
+	uintptr_t key = reinterpret_cast<uintptr_t>(obj);
+	bool tracked = g_AeloriaObjectCreationFrame.find(key) != g_AeloriaObjectCreationFrame.end();
+	if (tracked && !stab.clientListInserted) return true;
+	if (!stab.earlySafeClientRegistered) return false;
+	if (!stab.clientListInserted) return true;
+	if (stab.sustainRetired) return false;
+	if (Aeloria_HasValidMainDrawCache(obj)) {
+		Aeloria_GraduateTrackedObject(obj);
+		return false;
+	}
+	return true;
+}
+
+static bool Aeloria_AnyBulkWorkPending()
+{
+	if (!g_AeloriaObjectCreationFrame.empty()) {
+		for (auto& cp : g_AeloriaObjectCreationFrame) {
+			const ObjectClass* obj = reinterpret_cast<const ObjectClass*>(cp.first);
+			auto sIt = g_AeloriaObjectStability.find(cp.first);
+			if (sIt == g_AeloriaObjectStability.end()) {
+				return true;
+			}
+			if (!sIt->second.clientListInserted && obj && obj->IsActive && !obj->IsInLimbo) {
+				return true;
+			}
+		}
+	}
+
+	for (auto& kv : g_AeloriaObjectStability) {
+		if (kv.second.sustainRetired) {
+			continue;
+		}
+		const ObjectClass* obj = reinterpret_cast<const ObjectClass*>(kv.first);
+		if (Aeloria_ObjectNeedsBulkOrSustain(obj, kv.second)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// Layer export normally requires IsDown; foot techno briefly clears it during MARK_UP/MARK_DOWN
+// while moving. Force export for Aeloria-tracked and zero-map objects so the client keeps them.
+// Must not run during main menu / attract (GameActive false) — caused menu AV in Gate 3c.
+static bool Aeloria_ForceLayerExport(const ObjectClass* object)
+{
+	if (!GameActive || !object || !object->IsActive || object->IsInLimbo) {
+		return false;
+	}
+	if (Aeloria_IsTrackedStartingUnit(object)) {
+		return true;
+	}
+	if (Aeloria_IsStatelessUntrackedTechno(object)) {
+		return true;
+	}
+	uintptr_t key = reinterpret_cast<uintptr_t>(object);
+	return g_AeloriaObjectCreationFrame.find(key) != g_AeloriaObjectCreationFrame.end();
+}
 
 /**************************************************************************************************
 * DLLExportClass::Get_Layer_State -- Get game objects from the layers
@@ -4059,12 +5952,22 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 					}
 				}
 
-				if (Debug_Map || Debug_Unshroud || (object->IsDown && !object->IsInLimbo)) {
+				bool drawInLayerExport = (Debug_Map || Debug_Unshroud || (object->IsDown && !object->IsInLimbo));
+				if (!drawInLayerExport && GameActive && Aeloria_ForceLayerExport(object)) {
+					drawInLayerExport = true;
+				}
+
+				if (drawInLayerExport) {
 					int	x, y;
 					Map.Coord_To_Pixel(object->Render_Coord(), x, y);
 
+					if (GameActive && object->Is_Techno() && (Aeloria_IsTrackedStartingUnit(object) || Aeloria_IsStatelessUntrackedTechno(object)
+					                              || g_AeloriaObjectCreationFrame.find(reinterpret_cast<uintptr_t>(object)) != g_AeloriaObjectCreationFrame.end())) {
+						Aeloria_Repair_Early_Class_Pointer(static_cast<TechnoClass*>(object));
+					}
+
 					/*
-					** Call to Draw_It can result in multiple callbacks to the draw intercept
+					** Call to Draw_It can result in multiple callbacks to the draw intercept.
 					*/
 					CurrentDrawCount = 0;
 					object->Draw_It(x, y, WINDOW_VIRTUAL);
@@ -4135,7 +6038,183 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 		}
 	}
 
-	ObjectList->Count = TotalObjectCount;
+	// === Complementary bulk registration for hasCreation objects (team-synthesized P0 from north star gap analysis) ===
+	// Runs *after* the normal layer walk but *before* the client consumes the buffer (ObjectList->Count).
+	// When the client finally provides a real ObjectList (in Get_Game_State for GAME_STATE_LAYERS, after CNC_Start_Custom_Instance returns),
+	// we walk the g_AeloriaObjectCreationFrame (seeded at Unlimbo for early custom 4p starting forces) and force-enrich + insert
+	// any that have earlySafeClientRegistered but !clientListInserted. This is the "first-class" post-list-ready hook that
+	// bypasses draw-intercept timing/early-return/IsDown guard problems and the transient per-frame nature of the export list.
+	// Uses the *same* enriched population as the (now position/strength-enriched) direct flush so flushed units have real
+	// Center/Cell/Pos/Strength/Remap/IsSelectable etc. for client rendering + selection (yellow boxes) + orders at t=0.
+	// Complements (does not replace) the per-draw flush and the catchup forces in CNC_Start_Custom_Instance.
+	// Only in early window or when tracked creations exist (low overhead). Skips if already present by CNCInternalObjectPointer.
+	//
+	// Step 4 (crash/short-run guard): Use *local* bulkAdded counter. Do NOT increment or read CurrentDrawCount here.
+	// This avoids sharing the per-layer CurrentDrawCount static with the normal layer walk batch (potential stomping/offset
+	// bug in proposedIdx = Total + Current when Current holds last-layer value after normal Total updates).
+	// We now cleanly append graduated units right after the final normal Total (at the "end" of this export's normal data).
+	// Strengthened proposedIdx < 512, IsActive/!IsInLimbo already present. Added "first export with graduated" log + export_count visibility.
+	if (ObjectList != nullptr && Aeloria_AnyBulkWorkPending()) {
+		int bulkAdded = 0;  // Step 4: separate counter, no sharing with CurrentDrawCount or normal batch
+		const int normalTotal = TotalObjectCount;
+
+		for (auto& cp : g_AeloriaObjectCreationFrame) {
+			uintptr_t k = cp.first;
+			auto sIt = g_AeloriaObjectStability.find(k);
+			if (sIt == g_AeloriaObjectStability.end()) continue;
+			auto& stab = sIt->second;
+			if (stab.clientListInserted) continue;
+
+			const ObjectClass* obj = reinterpret_cast<const ObjectClass*>(k);
+			if (!obj || !obj->IsActive || obj->IsInLimbo) continue;
+			if (Aeloria_IsHumanDeployedBuilding(obj)) continue;
+			// Produced war-factory units: defer bulk until tactical MAIN draw caches coords (5z-n4).
+			if (stab.producedUnitUnlimboSeeded && !Aeloria_HasValidMainDrawCache(obj)) continue;
+
+			int listCountSoFar = normalTotal + bulkAdded;
+			if (Aeloria_ObjectAlreadyInExportList(ObjectList, listCountSoFar, obj)) continue;
+
+			int existingIdx = Aeloria_FindObjectExportIndex(ObjectList, obj);
+			int proposedIdx = (existingIdx >= 0) ? existingIdx : (normalTotal + bulkAdded);
+			if (proposedIdx < 0 || proposedIdx >= 512) continue;
+			if (existingIdx < 0 && !Aeloria_PrepareContiguousBulkSlot(ObjectList, proposedIdx, obj)) continue;
+
+			CNCObjectStruct& slot = ObjectList->Objects[proposedIdx];
+			Aeloria_PopulateEarlyBulkSlot(slot, obj, ExportLayer);
+			if (!Aeloria_IsValidBulkPixelPos(slot.PositionX, slot.PositionY)) {
+				Aeloria_Debug_Log("BULK_SKIP_INVALID_POS this=%p owner=%d idx=%d pos=(%d,%d) frame=%u (defer bulk until MAIN/virtual draw coords available)",
+				                  (void*)obj, (int)obj->Owner(), proposedIdx, (int)slot.PositionX, (int)slot.PositionY, Frame);
+				continue;
+			}
+
+			RTTIType rtti = obj->What_Am_I();
+			if (existingIdx < 0) {
+				bulkAdded++;
+			}
+			stab.earlySafeClientRegistered = true;
+			stab.clientListInserted = true;
+			if (stab.stabilityLevel < 1) stab.stabilityLevel = 1;
+
+			Aeloria_Debug_Log("GET_LAYER_BULK_HASCREATION_INSERT this=%p owner=%d rtti=%d idx=%d pos=(%d,%d) str=%d/%d (complementary bulk registration when client list is live - closes timing gap for north star)",
+			                  (void*)obj, (int)obj->Owner(), (int)rtti, proposedIdx, (int)slot.PositionX, (int)slot.PositionY, (int)slot.Strength, (int)slot.MaxStrength);
+		}
+
+		// Sustain pass (approved plan 2026-06-13): re-feed graduated early units every export until normal layer walk includes them.
+		// Fixes finalCount=18 -> 0 after frame 0 (graduation one-shot + IsDown/guard prune on normal layer walk).
+		// Do NOT gate on successfulRealDraws — early safe registration sets that to 1 optimistically before any real draw.
+		int sustainAdded = 0;
+		int sustainSkippedNormal = 0;
+		int sustainSkippedInactive = 0;
+		const bool sustainCapReached = (_export_count >= AELORIA_SUSTAIN_MAX_LAYER_EXPORTS);
+		for (auto& kv : g_AeloriaObjectStability) {
+			uintptr_t k = kv.first;
+			auto& stab = kv.second;
+			if (!stab.earlySafeClientRegistered || !stab.clientListInserted || stab.sustainRetired) continue;
+
+			const ObjectClass* obj = reinterpret_cast<const ObjectClass*>(k);
+			if (!obj || !obj->IsActive || obj->IsInLimbo) { sustainSkippedInactive++; continue; }
+			// Produced war-factory units: defer sustain until MAIN draw caches coords (5z-n5).
+			if (stab.producedUnitUnlimboSeeded && !Aeloria_HasValidMainDrawCache(obj)) continue;
+
+			if (sustainCapReached || Aeloria_HasValidMainDrawCache(obj)) {
+				if (Aeloria_HasValidMainDrawCache(obj)) {
+					Aeloria_GraduateTrackedObject(obj);
+				} else {
+					stab.sustainRetired = true;
+					g_AeloriaObjectCreationFrame.erase(k);
+				}
+				continue;
+			}
+
+			// Normal layer walk got this object into the export this frame — hand off, no sustain duplicate.
+			if (normalTotal > 0 && Aeloria_ObjectAlreadyInExportList(ObjectList, normalTotal, obj)) {
+				if (stab.sustainNormalHits < 255) stab.sustainNormalHits++;
+				if (stab.sustainNormalHits >= 3) {
+					stab.sustainRetired = true;
+				}
+				sustainSkippedNormal++;
+				continue;
+			}
+			stab.sustainNormalHits = 0;
+
+			int listCountSoFar = normalTotal + bulkAdded + sustainAdded;
+			if (Aeloria_ObjectAlreadyInExportList(ObjectList, listCountSoFar, obj)) continue;
+
+			int existingIdx = Aeloria_FindObjectExportIndex(ObjectList, obj);
+			int proposedIdx = (existingIdx >= 0) ? existingIdx : (normalTotal + bulkAdded + sustainAdded);
+			if (proposedIdx < 0 || proposedIdx >= 512) continue;
+			if (existingIdx < 0 && !Aeloria_PrepareContiguousBulkSlot(ObjectList, proposedIdx, obj)) continue;
+
+			CNCObjectStruct& slot = ObjectList->Objects[proposedIdx];
+			Aeloria_PopulateEarlyBulkSlot(slot, obj, ExportLayer);
+			if (!Aeloria_IsValidBulkPixelPos(slot.PositionX, slot.PositionY)) {
+				Aeloria_Debug_Log("BULK_SKIP_INVALID_POS this=%p owner=%d idx=%d pos=(%d,%d) frame=%u (defer sustain until MAIN/virtual draw coords available)",
+				                  (void*)obj, (int)obj->Owner(), proposedIdx, (int)slot.PositionX, (int)slot.PositionY, Frame);
+				continue;
+			}
+			if (existingIdx < 0) {
+				sustainAdded++;
+			}
+
+			Aeloria_Debug_Log("SUSTAIN_BULK_REINSERT this=%p owner=%d idx=%d pos=(%d,%d) str=%d/%d frame=%d (re-feed graduated early unit until normal Draw_It succeeds)",
+			                  (void*)obj, (int)obj->Owner(), proposedIdx, (int)slot.PositionX, (int)slot.PositionY,
+			                  (int)slot.Strength, (int)slot.MaxStrength, Frame);
+		}
+		if (sustainAdded > 0) {
+			Aeloria_Debug_Log("SUSTAIN_BULK_COUNT N=%d normal=%d first_bulk=%d proposed_end=%d human=%d frame=%d",
+			                  sustainAdded, normalTotal, bulkAdded, normalTotal + bulkAdded + sustainAdded,
+			                  (int)g_HumanPlayerHouse, Frame);
+		} else if (bulkAdded == 0 && normalTotal == 0) {
+			Aeloria_Debug_Log("SUSTAIN_BULK_NONE normal=0 first_bulk=0 skipped_normal=%d skipped_inactive=%d human=%d frame=%d (eligible graduated objs not re-fed this export)",
+			                  sustainSkippedNormal, sustainSkippedInactive, (int)g_HumanPlayerHouse, Frame);
+		}
+
+		// Step 4 from approved plan (crash/short-run guard): log bulk completion with counts before the Count update.
+		int bulkContrib = bulkAdded + sustainAdded;
+		if (bulkContrib > 0 || sustainAdded > 0) {
+			Aeloria_Debug_Log("BULK_COMPLETED_FOR_GRADUATED N=%d proposed_end_idx=%d human=%d (step4 guard; if crash follows, look here for idx/Count issues)",
+			                  bulkContrib, normalTotal + bulkContrib, (int)g_HumanPlayerHouse);
+			Aeloria_Debug_Log("FIRST_EXPORT_WITH_GRADUATED_UNITS _export_count=%d bulk_grads_added=%d finalCount=%d human_at_bulk=%d (step4: first time client sees our graduated early starting forces in this Get_Layer_State)",
+			                  _export_count, bulkContrib, normalTotal + bulkContrib, (int)g_HumanPlayerHouse);
+		}
+
+		TotalObjectCount += bulkAdded + sustainAdded;
+	}
+
+	// Phase 5b: foot units leave Map.Layer during MARK_UP; re-insert when the layer walk missed them.
+	Aeloria_SustainMissingFootLayerObjects(ObjectList, TotalObjectCount, ExportLayer);
+
+	// Vanilla always assigns Count after the layer walk (see TIBERIANDAWN Get_Layer_State). Keeping it
+	// inside the bulk-only path left stale/garbage Count when sustain retired (export 3: finalCount=16384 crash).
+	if (ObjectList != nullptr) {
+		ObjectList->Count = TotalObjectCount;
+	}
+
+	// Phase 4: only log layer-export counts when they change or on a slow cadence — late-game
+	// spam here was 255MB logs and measurable tick hit with hundreds of units on map.
+	static int s_lastBulkPostLogCount = -1;
+	static unsigned s_lastBulkPostLogFrame = 0;
+	if (ObjectList != nullptr
+	    && (TotalObjectCount != s_lastBulkPostLogCount
+	        || Frame >= s_lastBulkPostLogFrame + 600)) {
+		Aeloria_Debug_Log("BULK_POST_COUNT total=%d cur_from_bulk=%d finalCount=%d human_house_at_this_export=%d remain_stab=%zu remain_creation=%zu frame=%u",
+		                  TotalObjectCount, 0, (int)ObjectList->Count, (int)g_HumanPlayerHouse,
+		                  g_AeloriaObjectStability.size(), g_AeloriaObjectCreationFrame.size(), Frame);
+		s_lastBulkPostLogCount = TotalObjectCount;
+		s_lastBulkPostLogFrame = Frame;
+	}
+
+	// === DEBUG STEPPING HOOK (addresses user's direct request: run in VS debug mode / step CLI debugger at failure point) ===
+	// RE-ENABLED per approved plan step 1 (for targeted debug run to inspect the graduated slots in the FIRST_EXPORT / post-BULK_POST client LAYERS buffer - the exact point where clean runs still crash on skirmish launch with only partial units bulked).
+	// After BULK_COMPLETED + our Count update (the exact spot the guard warned "if crash follows, look here").
+	// How to use: Launch (via ps1 or .bat), quickly attach in VS (Debug > Attach to Process, select the C&C Remastered process) *before or as the skirmish loads*.
+	// Or register VS as JIT so the __debugbreak triggers the "debug or close" dialog and lands you here with full callstack + locals (ObjectList, the graduated slots 0..Count-1 with the enriched data, etc.).
+	// CLI (cdb): after launch find PID, cdb -p PID, .sympath+ path\to\Data, .reload, bp `RedAlert!DLLExportClass::Get_Layer_State`, g ; then inspect dv, the buffer, step.
+	// When at the break: examine the CNCObjectStructs we just wrote for the graduated early units (now with full flush-like fields + Remap), the Count, human house, etc. Step forward to see what the client does with the first export containing them. Report the slot data, any bad values, callstack.
+	// DISABLED after step 4 debug (2026-06-13): buffer inspection done; AV on F5 was null OverrideDisplayName + Strength>MaxStrength + bad Class_Of AssetName. Clean play test next.
+#if defined(_MSC_VER) && defined(AELORIA_DEBUG_BREAK_AT_BULK_POST)
+	__debugbreak();
+#endif
 
 	if (ObjectList->Count) {
 		_export_count++;
@@ -4158,6 +6237,23 @@ void DLLExportClass::Convert_Type(const ObjectClass *object, CNCObjectStruct &ob
 	}
 
 	RTTIType type = object->What_Am_I();
+
+	// Precision Strike #1: Surgical logging for early creation player objects.
+	// This is the exact moment the client decides whether this object will ever be visible/selectable.
+	// Precision diagnostic (A): Log raw RTTI for has_creation objects during the critical window,
+	// even if Is_Player_Exempt has already dropped. This is the exact moment Convert_Type decides
+	// whether the client will ever see this object as a valid unit.
+	if (g_AeloriaEnableVerboseDrawLogs) {
+		uintptr_t key = reinterpret_cast<uintptr_t>(object);
+		if (g_AeloriaObjectCreationFrame.find(key) != g_AeloriaObjectCreationFrame.end() &&
+		    (g_PlayerExemptionFrames > 0 || Frame < 300)) {
+			int stab = 0;
+			auto sIt = g_AeloriaObjectStability.find(key);
+			if (sIt != g_AeloriaObjectStability.end()) stab = sIt->second.stabilityLevel;
+			Aeloria_Debug_Log("CONVERT_TYPE this=%p RTTI=%d (raw) owner=%d has_creation=1 stab=%d frame=%u",
+			                  (void*)object, (int)type, (int)object->Owner(), stab, Frame);
+		}
+	}
 
 	switch (type) {
 	default:
@@ -5964,6 +8060,8 @@ bool DLLExportClass::Start_Placement(uint64 player_id, int buildable_type, int b
 	BuildingClass *building = Get_Pending_Placement_Object(player_id, buildable_type, buildable_id);
 
 	if (building) {
+		Aeloria_Repair_Early_Class_Pointer(building);
+		Aeloria_Seed_Human_Building_Stability(building);
 
 		TechnoTypeClass const * tech = Fetch_Techno_Type((RTTIType)buildable_type, buildable_id);
 
@@ -6042,6 +8140,14 @@ bool DLLExportClass::Place(uint64 player_id, int buildable_type, int buildable_i
 	BuildingClass *building = Get_Pending_Placement_Object(player_id, buildable_type, buildable_id);
 
 	if (building) {
+		Aeloria_Seed_Human_Building_Stability(building);
+		{
+			uintptr_t key = reinterpret_cast<uintptr_t>(building);
+			auto it = g_AeloriaObjectStability.find(key);
+			int type_enum = (it != g_AeloriaObjectStability.end()) ? (int)it->second.cachedTypeEnum : -1;
+			Aeloria_Debug_Log("PLACE_CLICK this=%p raw=%d type_enum=%d frame=%u",
+			                  (void*)building, building->Class.Raw(), type_enum, Frame);
+		}
 
 		TechnoTypeClass const * tech = Fetch_Techno_Type((RTTIType)buildable_type, buildable_id);
 
@@ -6626,11 +8732,15 @@ bool DLLExportClass::Get_Player_Info_State(uint64 player_id, unsigned char *buff
 	for (int i = 0; i < Buildings.Count(); ++i) {
 		BuildingClass* building = Buildings.Ptr(i);
 		if ((building != nullptr) && building->IsActive && (building->Spied_By() & (1U << PlayerPtr->Class->House))) {
-			if ((*building == STRUCT_POWER) || (*building == STRUCT_ADVANCED_POWER)) {
-				player_info->SpiedPowerFlags |= 1U << building->House->Class->House;
-			}
-			else if ((*building == STRUCT_REFINERY) || (*building == STRUCT_STORAGE)) {
-				player_info->SpiedMoneyFlags |= 1U << building->House->Class->House;
+			Aeloria_Repair_Early_Class_Pointer(building);
+			BuildingTypeClass const* btype = static_cast<BuildingTypeClass const*>(Aeloria_Safe_Techno_Type(building));
+			if (btype) {
+				if (btype->Type == STRUCT_POWER || btype->Type == STRUCT_ADVANCED_POWER) {
+					player_info->SpiedPowerFlags |= 1U << building->House->Class->House;
+				}
+				else if (btype->Type == STRUCT_REFINERY || btype->Type == STRUCT_STORAGE) {
+					player_info->SpiedMoneyFlags |= 1U << building->House->Class->House;
+				}
 			}
 		}
 	}
@@ -6667,7 +8777,9 @@ bool DLLExportClass::Get_Player_Info_State(uint64 player_id, unsigned char *buff
 			ObjectClass* object = CurrentObject[i];
 			if (object->Is_Techno()) {
 				TechnoClass* techno = (TechnoClass*)object;
-				if (techno->Techno_Type_Class()->PrimaryWeapon != NULL || techno->Techno_Type_Class()->SecondaryWeapon != NULL) {
+				Aeloria_Repair_Early_Class_Pointer(techno);
+				TechnoTypeClass const* ttype = Aeloria_Safe_Techno_Type(techno);
+				if (ttype && (ttype->PrimaryWeapon != NULL || ttype->SecondaryWeapon != NULL)) {
 					action_object = object;
 					break;
 				}
@@ -6676,11 +8788,22 @@ bool DLLExportClass::Get_Player_Info_State(uint64 player_id, unsigned char *buff
 		if (action_object == nullptr) {
 			action_object = CurrentObject[0];
 		}
+		if (action_object && action_object->Is_Techno()) {
+			Aeloria_Repair_Early_Class_Pointer((TechnoClass*)action_object);
+		}
 
 		int index = 0;
 		for (int y = top; y <= bottom; ++y) {
 			for (int x = left; x <= right; ++x, ++index) {
-				Convert_Action_Type(action_object->What_Action(XY_Cell(x, y)), (CurrentObject.Count() == 1) ? action_object : NULL, As_Target(XY_Cell(x, y)), player_info->ActionWithSelected[index]);
+				ActionType cell_action = ACTION_NONE;
+				if (action_object != nullptr) {
+					CELL map_cell = XY_Cell(x, y);
+					if (action_object->Is_Techno()) {
+						Aeloria_Repair_Early_Class_Pointer((TechnoClass*)action_object);
+					}
+					cell_action = action_object->What_Action(map_cell);
+				}
+				Convert_Action_Type(cell_action, (CurrentObject.Count() == 1) ? action_object : NULL, As_Target(XY_Cell(x, y)), player_info->ActionWithSelected[index]);
 			}
 		}
 

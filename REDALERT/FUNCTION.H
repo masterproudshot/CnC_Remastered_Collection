@@ -1109,6 +1109,24 @@ void GlyphX_Debug_Print(const char *debug_text);
 ** Also forwards to GlyphX + OutputDebugStringA.
 */
 void Aeloria_Debug_Log(const char *fmt, ...);
+void Aeloria_ClearObjectTracking(ObjectClass* obj);
+void Aeloria_RelocateHarvesterStability(UnitClass* unit);
+void Aeloria_ResetProducedTechnoTracking(TechnoClass* techno);
+bool Aeloria_InfantryClassRawIsHealthy(InfantryClass const* infantry);
+bool Aeloria_ShouldZeroMapProducedInfantry(InfantryClass const* infantry);
+bool Aeloria_TechnoClassRawIsHealthy(TechnoClass const* techno);
+bool Aeloria_IsStatelessUntrackedTechno(const ObjectClass* obj);
+bool Aeloria_IsZeroMapUntrackedInfantry(const ObjectClass* obj);
+void Aeloria_OneShotProducedInfantryClientSeed(TechnoClass* techno);
+bool Aeloria_TryStatelessTechnoDraw(const ObjectClass* object, int shapenum, int x, int y, DirType rotation, long virtualscale,
+                                    const char* shape_file_name, char override_owner);
+bool Aeloria_TryStatelessInfantryVirtualDraw(const ObjectClass* object, int shapenum, int x, int y, DirType rotation, long virtualscale,
+                                             const char* shape_file_name, char override_owner);
+bool Aeloria_TrySafeVirtualDrawIntercept(const ObjectClass* object, int shapenum, int x, int y, DirType rotation, long virtualscale,
+                                         const char* shape_file_name, char override_owner);
+void Aeloria_Seed_Building_Creation(BuildingClass* building);
+bool Aeloria_TryNotifyProducedUnitMainDrawCache(const ObjectClass* obj, int shape_number, int width, int height,
+                                                int draw_x, int draw_y, bool runtime_bad_plus_8);
 
 void Disable_Uncompressed_Shapes (void);
 void Enable_Uncompressed_Shapes (void);

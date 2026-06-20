@@ -773,7 +773,11 @@ void TerrainClass::Read_INI(CCINIClass & ini)
 
 		if (terrain != TERRAIN_NONE) {
 			tptr = new TerrainClass(terrain, cell);
-			Aeloria_Debug_Log("CREATED: Terrain type=%d Class.Raw=%ld", (int)terrain, (long)tptr->Class.Raw());
+			// C: Aggressively throttle Terrain spam during entire early load (including pre-grace on custom maps)
+			bool suppressTerrainSpam = g_EarlyLoadGraceActive || (g_PlayerExemptionFrames > 0) || (Frame < 200);
+			if (!suppressTerrainSpam) {
+				Aeloria_Debug_Log("CREATED: Terrain type=%d Class.Raw=%ld", (int)terrain, (long)tptr->Class.Raw());
+			}
 		}
 	}
 }

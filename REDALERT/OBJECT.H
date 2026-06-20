@@ -324,6 +324,11 @@ extern int g_PlayerExemptionFrames;
 extern int g_HumanPlayerDrawAttempts;
 extern int g_HumanPlayerFallbackUses;
 
+// New counters for richer diagnostics (Items 3 & 7)
+extern int g_AeloriaPlayerGuardHits;
+extern int g_AeloriaNonPlayerGuardHits;
+extern int g_AeloriaPromotedThenDemoted;
+
 extern DWORD g_FirstRenderTick;   // Set at the very first Map.Render() after ScenarioInit
 
 // Project Aeloria: per-object, per-message-type "log once" tracker for verbose draw diagnostics
@@ -334,6 +339,48 @@ extern DWORD g_FirstRenderTick;   // Set at the very first Map.Render() after Sc
 // after minutes of play while preserving every counter increment and SEVERE/rate-limited events.
 extern std::map<uintptr_t, uint32_t> g_AeloriaObjectLogMask;
 
+// Per-object stabilization tracking (first priority hardening).
+// Tracks individual objects' success at drawing with real shape data.
+// Goal: Allow most objects to "graduate" out of the heavy global exemption path
+// instead of forcing every player object through the full 18000-frame timer.
+struct AeloriaObjectStability {
+    uint16_t successfulRealDraws = 0;   // number of draws with real (w>0 && h>0) shape data
+    uint16_t fallbackUses = 0;          // number of times we had to use safe placeholder (bad shape during exemption)
+    uint8_t  stabilityLevel = 0;        // 0=unstable, 1=stabilizing, 2=stable (graduated)
+    uint32_t lastGoodFrame = 0;
+    uint8_t  rtti = 0;                  // cached What_Am_I() for richer summaries (Item 3)
+    bool     earlySafeClientRegistered = false; // Phase 2 (decoupled safe registration): true once this object has been given a usable CNCObjectStruct via the client path using only reliable instance data (What_Am_I/Owner/RTTI fallbacks + coords). Explicit state lets us graduate out of exemption and stop relying on pointer heuristics for the player's view/selection.
+    bool     clientListInserted = false;        // Set true when this hasCreation starting unit has been directly written into a real client ObjectList slot (bypasses timing issues with draw intercept early returns).
+    bool     sustainRetired = false;            // True once normal layer export reliably includes this unit (or it has a valid MAIN draw cache); stops per-export sustain bulk work.
+    uint8_t  sustainNormalHits = 0;             // Consecutive exports where the normal layer walk already contained this object.
+    // Last good virtual-draw params from DLL_Draw_Intercept — sustain bulk re-insert reads these so
+    // the client gets real ShapeIndex/AssetName/dims instead of generic E1+shape 0 (invisible sprites).
+    bool     hasCachedDraw = false;       // virtual/client intercept params (sustain bulk display)
+    bool     hasCachedMainDraw = false;   // confirmed legacy MAIN tactical blitter draw (graduation gate)
+    int      cachedShapeNumber = 0;
+    int      cachedDrawFlags = 0;
+    unsigned char cachedRotation = 0;
+    long     cachedScale = 0x100;
+    int      cachedDrawX = 0;
+    int      cachedDrawY = 0;
+    int      cachedWidth = 0;
+    int      cachedHeight = 0;
+    char     cachedAssetName[16] = {};
+    // Type enum captured at Unlimbo when Class resolves (UnitType / InfantryType value).
+    int16_t  cachedTypeEnum = -1;
+    // Phase 5i: war-factory produced unit — first Draw_It diagnostics (bit0=VIRTUAL, bit1=MAIN).
+    bool     producedUnitUnlimboSeeded = false;
+    bool     producedUnitBadPlus8 = false;
+    uint8_t  producedUnitFirstDrawMask = 0;
+};
+extern std::map<uintptr_t, AeloriaObjectStability> g_AeloriaObjectStability;
+
+// Per-object creation frame tracking (Item 1 in Logging QoL plan).
+// Records the Frame at which a player-relevant object was Unlimbo'd.
+// Used to answer "was this unit bad from birth or did it go bad later?"
+// Cleared together with g_AeloriaObjectStability.
+extern std::map<uintptr_t, uint32_t> g_AeloriaObjectCreationFrame;
+
 // Global master kill-switch for the remaining verbose per-draw diagnostics ("got Object",
 // "guard passed", "about to call ...", GRACE FRAME, PLAYER EXEMPTION bypass, etc.).
 // When false, Aeloria_ShouldLogVerbose returns false immediately and all direct
@@ -343,6 +390,10 @@ extern std::map<uintptr_t, uint32_t> g_AeloriaObjectLogMask;
 // stats line fully intact.
 // Default true so diagnosis builds stay chatty; set to false for clean play.
 extern bool g_AeloriaEnableVerboseDrawLogs;
+// infantry-scale Phase 2: skip stability/creation maps for healthy barracks-produced infantry.
+extern bool g_AeloriaZeroMapProducedInfantry;
+// infantry-scale Phase 3b: stateless client intercept for untracked techno with healthy Class.Raw().
+extern bool g_AeloriaStatelessUntrackedTechno;
 
 // Distinct message tags for the once-per-object suppression (bit positions).
 // Only the high-volume per-frame draw diagnostics get unique tags here.
@@ -361,6 +412,10 @@ enum AeloriaLogTag {
 	AEL_LOG_GRACE_RADAR_DISH = 11,
 	AEL_LOG_TERRAIN_ABOUT_TO_CC = 12,
 	AEL_LOG_PLAYER_PHASE_B_SEVERE = 13,
+	AEL_LOG_PLAYER_CREATION = 14,     // Item 1
+	AEL_LOG_FIRST_REAL_DRAW = 15,     // Item 1
+	AEL_LOG_FIRST_FALLBACK  = 16,     // Item 1
+	AEL_LOG_INFANTRY_DEATH  = 17,     // Phase 5j: once per death-anim MAIN draw
 	// Room for more
 	AEL_LOG_MAX = 31
 };
@@ -375,7 +430,8 @@ inline bool ShouldLogHeavyNonPlayerDiagnostics()
     if (g_FirstRenderTick == 0) return true;
     return (GetTickCount() - g_FirstRenderTick) < 8000;   // 8 real seconds
 }
-const int PLAYER_EXEMPTION_FRAME_COUNT = 18000;  // ~5 minutes of logic frames for human player objects (B-phase: long enough for full opening + early base building at normal visual speed)
+const int PLAYER_EXEMPTION_FRAME_COUNT = 600;   // ~40s logic frames for opening; per-object graduation clears most units earlier
+const int AELORIA_SUSTAIN_MAX_LAYER_EXPORTS = 12; // Cap sustain re-feeds after skirmish-start window
 
 inline bool Is_Plausible_Class_Pointer(uintptr_t ptr)
 {
@@ -388,11 +444,16 @@ inline bool Is_Plausible_Class_Pointer(uintptr_t ptr)
 
 	if (ptr == 0) return false;
 
-	// Reject the exact garbage patterns observed in every crash session:
-	//   0x00210000 family (low values)
-	//   0x8073xxxx / 0x80xxxxxx / 0x81xxxxxx (high-byte sentinels)
+	// Reject tiny garbage values (Class.Raw=1 etc.) that are non-null but not real pointers.
+	if (ptr < 0x10000) return false;
+
+	// Win32 user-mode addresses live below 0x80000000. Kernel/sentinel garbage at +8
+	// (0x80xxxxxx MCV @ frame 73, 0x88xxxxxx, 0xb010b000 / 0xb810b800 V2 @ frame 135) must not pass.
+	if (ptr >= 0x80000000u) return false;
+
+	// Reject low sentinel garbage (0x00210000 family, tiny non-null values in +8 peek).
 	unsigned char high = (unsigned char)((ptr >> 24) & 0xFF);
-	if (high == 0x00 || high == 0x80 || high == 0x81) return false;
+	if (high == 0x00) return false;
 
 	// Basic alignment sanity (TypeClass* should be at least 4-byte aligned on Win32)
 	if ((ptr & 0x3) != 0) return false;
@@ -407,13 +468,171 @@ inline bool Is_Plausible_Class_Pointer(uintptr_t ptr)
 **	Used in CONQUER.CPP skip paths for loud bypass logging + relaxed checks.
 **	No log inside helper (would be too noisy); caller logs on actual exemption events.
 */
+// True only when a MAIN-window draw cached non-zero width AND height (not bulk defaults).
+inline bool Aeloria_HasValidMainDrawCache(const ObjectClass* obj)
+{
+	if (obj == nullptr) return false;
+	uintptr_t key = reinterpret_cast<uintptr_t>(obj);
+	auto it = g_AeloriaObjectStability.find(key);
+	if (it == g_AeloriaObjectStability.end()) return false;
+	const AeloriaObjectStability& s = it->second;
+	// Virtual-window intercept can cache shape>0 while +8 is still corrupt on MAIN (1836 session).
+	// Only a confirmed MAIN tactical blitter draw clears the starting-unit MAIN guard.
+	return s.hasCachedMainDraw && s.cachedWidth > 0 && s.cachedHeight > 0 && s.cachedShapeNumber > 0;
+}
+
+// SHAPE_CENTER (0x0020) | SHAPE_WIN_REL (0x0010) — matches Techno_Draw_Object / CC_Draw_Shape.
+// The Remaster client treats PositionX/Y as sprite top-left unless SHAPE_CENTER is in DrawFlags,
+// but Coord_To_Pixel and Draw_It always supply center pixel coordinates.
+#define AELORIA_CLIENT_DRAW_FLAGS_CENTER 0x0030
+
+void Aeloria_NotifyMainDrawCache(const ObjectClass* obj, int shape_number, int width, int height, int draw_x, int draw_y);
+bool Aeloria_TryNotifyProducedUnitMainDrawCache(const ObjectClass* obj, int shape_number, int width, int height,
+                                                int draw_x, int draw_y, bool runtime_bad_plus_8);
+void Aeloria_GraduateTrackedObject(const ObjectClass* obj);
+
+inline bool Aeloria_IsTrackedStartingUnit(const ObjectClass* obj)
+{
+	if (obj == nullptr) return false;
+	uintptr_t key = reinterpret_cast<uintptr_t>(obj);
+	return g_AeloriaObjectCreationFrame.find(key) != g_AeloriaObjectCreationFrame.end();
+}
+
+// Refinery-spawned harvester reusing a starting-unit pool slot (e.g. former MCV).
+inline bool Aeloria_IsRepurposedHarvester(const ObjectClass* obj)
+{
+	if (obj == nullptr || obj->What_Am_I() != RTTI_UNIT) return false;
+	uintptr_t key = reinterpret_cast<uintptr_t>(obj);
+	auto it = g_AeloriaObjectStability.find(key);
+	if (it == g_AeloriaObjectStability.end()
+	    || it->second.cachedTypeEnum != (int16_t)UNIT_HARVESTER
+	    || !it->second.earlySafeClientRegistered) {
+		return false;
+	}
+	// Relocate clears hasCachedMainDraw, but stale MAIN cache from the prior pool
+	// occupant (e.g. MCV) can survive if tracking was not reset on death — always
+	// guard repurposed harvesters regardless of Aeloria_HasValidMainDrawCache.
+	return true;
+}
+
+inline bool Aeloria_IsProducedUnitUnlimboSeeded(const ObjectClass* obj)
+{
+	if (obj == nullptr) return false;
+	uintptr_t key = reinterpret_cast<uintptr_t>(obj);
+	auto it = g_AeloriaObjectStability.find(key);
+	return it != g_AeloriaObjectStability.end() && it->second.producedUnitUnlimboSeeded;
+}
+
+// War-factory produced units with corrupt +8 at Unlimbo — never use legacy blitter for the match.
+inline bool Aeloria_IsProducedBadPlus8Unit(const ObjectClass* obj)
+{
+	if (obj == nullptr || obj->What_Am_I() != RTTI_UNIT) return false;
+	uintptr_t key = reinterpret_cast<uintptr_t>(obj);
+	auto it = g_AeloriaObjectStability.find(key);
+	return it != g_AeloriaObjectStability.end()
+	    && it->second.producedUnitUnlimboSeeded
+	    && it->second.producedUnitBadPlus8;
+}
+
+// WF-produced harvesters with bad +8: eternal safe draw like refinery-spawned pool-reuse harvesters.
+inline bool Aeloria_IsProducedBadPlus8Harvester(const ObjectClass* obj)
+{
+	if (!Aeloria_IsProducedBadPlus8Unit(obj)) return false;
+	uintptr_t key = reinterpret_cast<uintptr_t>(obj);
+	auto it = g_AeloriaObjectStability.find(key);
+	return it != g_AeloriaObjectStability.end()
+	    && it->second.cachedTypeEnum == (int16_t)UNIT_HARVESTER;
+}
+
+// All WF-produced vehicles: pool-reuse slots always need eternal safe draw (5z-n8).
+inline bool Aeloria_IsEternalSafeProducedUnit(const ObjectClass* obj)
+{
+	if (obj == nullptr || obj->What_Am_I() != RTTI_UNIT) return false;
+	if (Aeloria_IsRepurposedHarvester(obj)) return true;
+	uintptr_t key = reinterpret_cast<uintptr_t>(obj);
+	auto it = g_AeloriaObjectStability.find(key);
+	return it != g_AeloriaObjectStability.end()
+	    && it->second.producedUnitUnlimboSeeded
+	    && it->second.producedUnitBadPlus8;
+}
+
+// Human MCV/sidebar-placed buildings: type cached at Unlimbo, corrupt +8 persists for the whole match.
+inline bool Aeloria_IsHumanDeployedBuilding(const ObjectClass* obj)
+{
+	if (obj == nullptr || g_HumanPlayerHouse == HOUSE_NONE) return false;
+	if (obj->Owner() != g_HumanPlayerHouse || obj->What_Am_I() != RTTI_BUILDING) return false;
+	uintptr_t key = reinterpret_cast<uintptr_t>(obj);
+	auto it = g_AeloriaObjectStability.find(key);
+	return it != g_AeloriaObjectStability.end() && it->second.cachedTypeEnum >= 0;
+}
+
+// Starting units seeded at Unlimbo must not hit the legacy MAIN blitter until a confirmed-safe
+// MAIN-window draw (shape>0) has been cached. Virtual cache alone is not enough.
+// Also covers earlySafeClientRegistered units that were prematurely graduated off the creation
+// map when +8 briefly looked plausible (0x684f6800-style decay) — the 1826 move-order crash.
+inline bool Aeloria_IsEarlyStartingUnitMainGuarded(const ObjectClass* obj)
+{
+	if (obj == nullptr) return false;
+	if (Aeloria_HasValidMainDrawCache(obj)) return false;
+	// Eternal-safe produced / repurposed units use the WF safe-client path, not starting-unit placeholder guard.
+	if (Aeloria_IsRepurposedHarvester(obj) || Aeloria_IsEternalSafeProducedUnit(obj)) return false;
+	if (Aeloria_IsHumanDeployedBuilding(obj)) return true;
+	uintptr_t key = reinterpret_cast<uintptr_t>(obj);
+	if (g_AeloriaObjectCreationFrame.find(key) != g_AeloriaObjectCreationFrame.end()) return true;
+	auto it = g_AeloriaObjectStability.find(key);
+	return it != g_AeloriaObjectStability.end() && it->second.earlySafeClientRegistered;
+}
+
+// MAIN/tactical blitter must not run for starting-unit or produced-unit guards.
+inline bool Aeloria_NeedsSafeMainDrawGuard(const ObjectClass* obj)
+{
+	return Aeloria_IsEarlyStartingUnitMainGuarded(obj) || Aeloria_IsProducedBadPlus8Unit(obj);
+}
+
 inline bool Is_Player_Exempt(const ObjectClass* obj)
 {
 	if (obj == nullptr || g_HumanPlayerHouse == HOUSE_NONE)
 		return false;
+
+	// Per-object stabilization check (new hardening)
+	uintptr_t key = reinterpret_cast<uintptr_t>(obj);
+	auto it = g_AeloriaObjectStability.find(key);
+	if (it != g_AeloriaObjectStability.end() && it->second.stabilityLevel >= 2) {
+		// Bulk-registered starting units can be promoted to level 2 before any real shape
+		// draw succeeds; keep exemption until we have cached draw params from a real draw.
+		if (!Aeloria_HasValidMainDrawCache(obj)) {
+			if (Aeloria_IsHumanDeployedBuilding(obj) || g_PlayerExemptionFrames > 0 || Frame < 600) {
+				return true;
+			}
+		} else {
+			return false; // Object has stabilized with real draw data
+		}
+	}
+	// Phase 2: graduate only after safe client registration AND a real cached draw.
+	if (it != g_AeloriaObjectStability.end() && it->second.earlySafeClientRegistered
+	    && Aeloria_HasValidMainDrawCache(obj)) {
+		return false;
+	}
+
+	// Step 2/3: all bulk-registered starting units (human + AI) stay exempt until real MAIN draw cache exists.
+	if (it != g_AeloriaObjectStability.end() && it->second.earlySafeClientRegistered
+	    && !Aeloria_HasValidMainDrawCache(obj)) {
+		if (g_PlayerExemptionFrames > 0 || Frame < 600) {
+			return true;
+		}
+	}
+
+	if (Aeloria_IsHumanDeployedBuilding(obj) && !Aeloria_HasValidMainDrawCache(obj)) {
+		return true;
+	}
+
 	if (g_PlayerExemptionFrames <= 0 && !g_EarlyLoadGraceActive)
 		return false;
+
 	HousesType owner = obj->Owner();
+	// Human house gets the full long exemption + safe placeholder treatment.
+	// (Allied house extension temporarily removed to keep compile clean; can be added
+	// with proper includes later if ally visibility remains an issue.)
 	return (owner == g_HumanPlayerHouse);
 }
 
@@ -442,6 +661,14 @@ inline bool Aeloria_ShouldLogVerbose(const ObjectClass* obj)
 // player exemption window is active. Subsequent identical messages for the same `this` are suppressed.
 // Non-player objects fall back to the normal verbose/heavy gate logic (already rate-limited by real time).
 bool Aeloria_ShouldLogOncePerObject(const void* obj, int tag);
+
+// Safe TechnoTypeClass lookup for early custom-map units whose CCPtr Class can be null
+// while the object is still active/selectable (avoids AV in per-frame AI / move logic).
+class TechnoTypeClass;
+TechnoTypeClass const* Aeloria_Safe_Techno_Type(TechnoClass const* techno);
+void Aeloria_Repair_Early_Class_Pointer(TechnoClass* techno);
+void Aeloria_Seed_Building_Creation(BuildingClass* building);
+void Aeloria_Seed_Human_Building_Stability(BuildingClass* building);
 
 /*
 **	Project Aeloria (Draw Guard helper):

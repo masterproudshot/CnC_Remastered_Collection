@@ -3431,6 +3431,24 @@ extern void DLL_Draw_Pip_Intercept(const ObjectClass* object, int pip);
 void CC_Draw_Shape(void const * shapefile, int shapenum, int x, int y, WindowNumberType window, ShapeFlags_Type flags, void const * fadingdata, void const * ghostdata, DirType rotation);
 extern void DLL_Draw_Line_Intercept(int x, int y, int x1, int y1, unsigned char color, int frame);
 
+// Forward declarations for Phase B/C safe placeholder helpers (defined later in this file).
+// Required because calls now exist in multiple locations (virtual blocks, hard-reject, Phase B).
+static void DrawSafePlaceholder(const ObjectClass* object,
+                                int x, int y,
+                                int flags,
+                                DirType rotation,
+                                long virtualscale,
+                                const char* shape_file_name,
+                                char override_owner);
+
+static void DrawSafePlayerPlaceholder(const ObjectClass* object,
+                                      int x, int y,
+                                      int flags,
+                                      DirType rotation,
+                                      long virtualscale,
+                                      const char* shape_file_name = nullptr,
+                                      char override_owner = HOUSE_NONE);
+
 void CC_Draw_Shape(const ObjectClass *object, void const * shapefile, int shapenum, int x, int y, WindowNumberType window, ShapeFlags_Type flags, void const * fadingdata, void const * ghostdata, DirType rotation, long virtualscale, int width, int height)
 {
 	if (object) {
@@ -3439,12 +3457,46 @@ void CC_Draw_Shape(const ObjectClass *object, void const * shapefile, int shapen
 		bool logGot = Aeloria_ShouldLogVerbose(object) && Aeloria_ShouldLogOncePerObject(object, AEL_LOG_CC_DRAW_GOT_OBJECT);
 		// During the long player exemption, suppress this very noisy per-draw log for player objects
 		// (the "bypassing" + SEVERE once-per-object logs + final stats are sufficient for visibility).
-		if (logGot && Is_Player_Exempt(object) && g_PlayerExemptionFrames > 0) {
+		// Phase C: the central ShouldLogOncePerObject now also suppresses for objects that have
+		// already graduated to stabilityLevel 2.
+		// Phase 1 diagnostic (approved plan): relax suppression during -D so we see what the client
+		// is actually calling for the early creation objects. This is temporary for the proving run.
+		if (logGot && Is_Player_Exempt(object) && g_PlayerExemptionFrames > 0 && !g_AeloriaEnableVerboseDrawLogs) {
 			logGot = false;
 		}
 		if (logGot) {
 			Aeloria_Debug_Log("CC_Draw_Shape got Object this=%p RTTI=%d at+8=0x%08lx",
 			                  (void*)object, object->What_Am_I(), (unsigned long)at_plus_8);
+		}
+
+		// === PHASE 1 PROVING LOG (approved plan) ===
+		// Loud, direct log for *every* exempt draw during the long window.
+		// This will finally show us:
+		// - Whether the starting units (the has_creation=1 objects from FIRST_RENDER_SNAPSHOT) are
+		//   even reaching the main client paths after grace.
+		// - What w/h they arrive with (the reason the prior creation-record force never fired).
+		// - The exact moment the client stops "seeing" them.
+		if (object && Is_Player_Exempt(object) && g_PlayerExemptionFrames > 0 && g_AeloriaEnableVerboseDrawLogs) {
+			uintptr_t key = reinterpret_cast<uintptr_t>(object);
+			bool hasCreation = g_AeloriaObjectCreationFrame.find(key) != g_AeloriaObjectCreationFrame.end();
+			int stabLevel = 0;
+			auto sIt = g_AeloriaObjectStability.find(key);
+			if (sIt != g_AeloriaObjectStability.end()) stabLevel = sIt->second.stabilityLevel;
+			Aeloria_Debug_Log("VIRTUAL_DRAW_ATTEMPT this=%p RTTI=%d owner=%d w=%d h=%d has_creation=%d stab=%d frame=%u (overload=main)",
+			                  (void*)object, object->What_Am_I(), (int)object->Owner(), width, height, hasCreation ? 1 : 0, stabLevel, Frame);
+
+			// Cheap one-time snapshot ~5s in (frame ~300 at 60fps) of how many early creation objects
+			// are *still* considered exempt. This directly answers "are the starting units still in the
+			// exemption set when the client should be drawing them?"
+			static bool phase1SnapshotDone = false;
+			if (!phase1SnapshotDone && Frame > 300 && g_AeloriaEnableVerboseDrawLogs) {
+				int stillExemptCreation = 0;
+				for (auto& pair : g_AeloriaObjectCreationFrame) {
+					if (Is_Player_Exempt(reinterpret_cast<ObjectClass*>(pair.first))) stillExemptCreation++;
+				}
+				Aeloria_Debug_Log("PHASE1_SNAPSHOT still_exempt_creation_objects=%d at_frame=%u", stillExemptCreation, Frame);
+				phase1SnapshotDone = true;
+			}
 		}
 
 		/*
@@ -3509,10 +3561,45 @@ void CC_Draw_Shape(const ObjectClass *object, void const * shapefile, int shapen
 		**	See Is_Plausible_Class_Pointer in OBJECT.H and plan.md Expert Panel section.
 		**	Now also exempts player House objects (via timeout) so they reach the blitter.
 		*/
-		if (!Is_Plausible_Class_Pointer(at_plus_8) && !Is_Player_Exempt(object)) {
-			Aeloria_Debug_Log("REJECTED at CC_Draw_Shape (last-line defense) this=%p RTTI=%d at+8=0x%08lx",
-			                  (void*)object, object->What_Am_I(), (unsigned long)at_plus_8);
-			return;   // Do not draw — prevents the 0xC0000005 that used to occur here
+		if (!Is_Plausible_Class_Pointer(at_plus_8)) {
+			if (Aeloria_TryStatelessTechnoDraw(object, shapenum, x, y, rotation, virtualscale, NULL, HOUSE_NONE)) {
+				return;
+			}
+			if (object && window != WINDOW_VIRTUAL && Aeloria_IsHumanDeployedBuilding(object)) {
+				DrawSafePlayerPlaceholder(object, x, y, (int)flags, rotation, virtualscale);
+				return;
+			}
+			if (Aeloria_TrySafeVirtualDrawIntercept(object, shapenum, x, y, rotation, virtualscale, NULL, HOUSE_NONE)) {
+				return;
+			}
+			if (object && (Is_Player_Exempt(object) || Aeloria_NeedsSafeMainDrawGuard(object)
+			               || Aeloria_IsHumanDeployedBuilding(object)
+			               || (g_HumanPlayerHouse != HOUSE_NONE && object->Owner() == g_HumanPlayerHouse))) {
+				DrawSafePlayerPlaceholder(object, x, y, (int)flags, rotation, virtualscale);
+				return;
+			}
+			if (object && object->Owner() == g_HumanPlayerHouse) {
+				g_AeloriaPlayerGuardHits++;
+			} else {
+				g_AeloriaNonPlayerGuardHits++;
+			}
+			uintptr_t key = reinterpret_cast<uintptr_t>(object);
+			auto stabIt = g_AeloriaObjectStability.find(key);
+			auto createIt = g_AeloriaObjectCreationFrame.find(key);
+			int age = (createIt != g_AeloriaObjectCreationFrame.end()) ? (int)(Frame - createIt->second) : -1;
+			int fb = (stabIt != g_AeloriaObjectStability.end()) ? stabIt->second.fallbackUses : -1;
+			if (Aeloria_ShouldLogOncePerObject(object, AEL_LOG_GRACE_SKIP)) {
+				Aeloria_Debug_Log("HARD_REJECT this=%p RTTI=%d at8=0x%08lx reason=plausible_ptr age=%d fallbacks=%d",
+				                  (void*)object, object->What_Am_I(), (unsigned long)at_plus_8, age, fb);
+			}
+			return;
+		}
+
+		// Earliest possible guard for custom-map starting units on MAIN/tactical window.
+		// Prevents legacy blitter AV when +8 is still corrupt (incl. after virtual shape cache).
+		if (window != WINDOW_VIRTUAL && Aeloria_NeedsSafeMainDrawGuard(object)) {
+			DrawSafePlayerPlaceholder(object, x, y, (int)flags, rotation, virtualscale);
+			return;
 		}
 	}
 
@@ -3520,18 +3607,40 @@ void CC_Draw_Shape(const ObjectClass *object, void const * shapefile, int shapen
 		if (width == 0) width = Get_Build_Frame_Width(shapefile);
 		if (height == 0) height = Get_Build_Frame_Height(shapefile);
 
-		// For human-player objects that have bad shape data during the long exemption window,
-		// still give the Remastered client a draw event every frame using safe dummy dimensions.
-		// This is what actually restores perceived speed for the player in the modern client.
-		if (Is_Player_Exempt(object) && (width <= 0 || height <= 0)) {
+		// Placeholder only when virtual dims are still bad. Creation-record objects with valid
+		// w/h must use the normal DLL_Draw_Intercept path so real shape params cache and the
+		// sim does not spend ~18000 frames on double-intercept placeholders per unit.
+		if (Is_Player_Exempt(object) && g_PlayerExemptionFrames > 0 && (width <= 0 || height <= 0)) {
+			uintptr_t key = reinterpret_cast<uintptr_t>(object);
+			bool hasCreation = g_AeloriaObjectCreationFrame.find(key) != g_AeloriaObjectCreationFrame.end();
+			if (g_AeloriaEnableVerboseDrawLogs) {
+				Aeloria_Debug_Log("VIRTUAL_FORCE_TAKEN this=%p RTTI=%d has_creation=%d (reason: bad virtual w/h) frame=%u",
+				                  (void*)object, object ? object->What_Am_I() : -1, hasCreation ? 1 : 0, Frame);
+			}
 			HousesType owner = object ? object->Owner() : HOUSE_NONE;
 			g_HumanPlayerFallbackUses++;
+			// Also track per-object for worst-offender reporting in Phase C
+			{
+				uintptr_t key = reinterpret_cast<uintptr_t>(object);
+				auto stabIt = g_AeloriaObjectStability.find(key);
+				if (stabIt != g_AeloriaObjectStability.end()) {
+					stabIt->second.fallbackUses++;
+				}
+			}
 			if (Aeloria_ShouldLogOncePerObject(object, AEL_LOG_PLAYER_PHASE_B_SEVERE)) {
-				Aeloria_Debug_Log("PLAYER EXEMPTION (Phase C, virtual): using safe 32x32 for human house %d (was w=%d h=%d) via DLL_Draw_Intercept",
+				Aeloria_Debug_Log("PLAYER EXEMPTION (Phase C, virtual): using safe placeholder via helper for human house %d (was w=%d h=%d)",
 				                  (int)owner, width, height);
 			}
-			width  = 32;
-			height = 32;
+
+			if (g_AeloriaEnableVerboseDrawLogs) {
+				auto cIt = g_AeloriaObjectCreationFrame.find(reinterpret_cast<uintptr_t>(object));
+				int age = (cIt != g_AeloriaObjectCreationFrame.end()) ? (int)(Frame - cIt->second) : -1;
+				Aeloria_Debug_Log("PRE_PLACEHOLDER (virtual) this=%p RTTI=%d owner=%d w=%d h=%d age=%d",
+				                  (void*)object, object->What_Am_I(), (int)object->Owner(), width, height, age);
+			}
+
+			DrawSafePlayerPlaceholder(object, x, y, (int)flags, rotation, virtualscale);
+			return;
 		}
 
 		DLL_Draw_Intercept(shapenum, x, y, width, height, (int)flags, object, rotation, virtualscale, NULL, HOUSE_NONE);
@@ -3546,25 +3655,116 @@ void CC_Draw_Shape(const ObjectClass *object, void const * shapefile, int shapen
 	**	caused by the vast majority of their draws being suppressed even inside the window.
 	**	Non-player objects and non-exempt objects continue to be strictly protected.
 	*/
-	if (Is_Player_Exempt(object)) {
+	const bool needsStartingUnitDrawGuard = object && Aeloria_NeedsSafeMainDrawGuard(object);
+	if (Is_Player_Exempt(object) || needsStartingUnitDrawGuard) {
 		g_HumanPlayerDrawAttempts++;
-		if (width <= 0 || height <= 0) {
-			HousesType owner = object ? object->Owner() : HOUSE_NONE;
-			g_HumanPlayerFallbackUses++;
 
-			// Per-object once + global counter for stats. Each distinct player object emits the detailed SEVERE line at most once during the window.
-			if (Aeloria_ShouldLogOncePerObject(object, AEL_LOG_PLAYER_PHASE_B_SEVERE)) {
-				Aeloria_Debug_Log("PLAYER EXEMPTION (Phase B): SEVERE shape corruption for human house %d (w=%d h=%d) — drawing safe rect placeholder instead of blitter",
-				                  (int)owner, width, height);
+		if (Aeloria_IsStatelessUntrackedTechno(object)) {
+			if (width <= 0 || height <= 0 || shapenum <= 0) {
+				DrawSafePlayerPlaceholder(object, x, y, (int)flags, rotation, virtualscale);
+				return;
+			}
+		} else {
+		uintptr_t key = reinterpret_cast<uintptr_t>(object);
+		auto& stab = g_AeloriaObjectStability[key];
+
+		// Cache RTTI for richer summaries (Item 3)
+		if (stab.rtti == 0 && object) {
+			stab.rtti = (uint8_t)object->What_Am_I();
+		}
+
+		// Track real vs fallback draws for stabilization (non-zero shape only — placeholder shape=0 must not count)
+		if (width > 0 && height > 0 && shapenum > 0) {
+			stab.successfulRealDraws++;
+			stab.lastGoodFrame = Frame;
+
+			// Logging QoL Item 1: First real draw age (creation-to-first-good-draw)
+			auto cIt = g_AeloriaObjectCreationFrame.find(reinterpret_cast<uintptr_t>(object));
+			if (stab.successfulRealDraws == 1 && cIt != g_AeloriaObjectCreationFrame.end()) {
+				int age = Frame - cIt->second;
+				if (g_AeloriaEnableVerboseDrawLogs && Aeloria_ShouldLogOncePerObject(object, AEL_LOG_FIRST_REAL_DRAW)) {
+					Aeloria_Debug_Log("FIRST_REAL_DRAW this=%p RTTI=%d owner=%d age=%d",
+					                  (void*)object, object->What_Am_I(), (int)object->Owner(), age);
+				}
 			}
 
-			// Safe cheap placeholder draw for the human player only.
-			// This gives the object a draw call every frame (restores perceived 5%→normal speed)
-			// without ever feeding structurally bad shape data to the dangerous blitter.
-			// The unit will appear as a small colored box on bad frames — good enough for animation timing and visibility.
-			LogicPage->Fill_Rect(x, y, x + 32, y + 32, 14);   // bright yellow — very visible
-			return;
+			if (stab.stabilityLevel < 2 && stab.successfulRealDraws >= 10 && Aeloria_HasValidMainDrawCache(object)) {
+				stab.stabilityLevel = 2;
+				// Phase C spam reduction: drop this object from the once-per log mask now that
+				// it has graduated. Future draw diagnostics for it will use the lighter gate.
+				g_AeloriaObjectLogMask.erase(reinterpret_cast<uintptr_t>(object));
+				if (g_AeloriaEnableVerboseDrawLogs) {
+					auto cIt = g_AeloriaObjectCreationFrame.find(reinterpret_cast<uintptr_t>(object));
+					int age = (cIt != g_AeloriaObjectCreationFrame.end()) ? (int)(Frame - cIt->second) : -1;
+					Aeloria_Debug_Log("OBJECT STABILIZED this=%p RTTI=%d owner=%d draws=%u age=%d level=2",
+					                  (void*)object, object->What_Am_I(), (int)object->Owner(), stab.successfulRealDraws, age);
+				}
+			}
+		} else {
+			if (stab.stabilityLevel >= 2) {
+				stab.stabilityLevel = 1; // Demote
+				g_AeloriaPromotedThenDemoted++;
+			}
+			g_HumanPlayerFallbackUses++;
+			stab.fallbackUses++;
+
+			// Logging QoL Item 1: First fallback with creation age
+			auto cIt = g_AeloriaObjectCreationFrame.find(reinterpret_cast<uintptr_t>(object));
+			if (stab.fallbackUses == 1 && cIt != g_AeloriaObjectCreationFrame.end()) {
+				int age = Frame - cIt->second;
+				if (g_AeloriaEnableVerboseDrawLogs && Aeloria_ShouldLogOncePerObject(object, AEL_LOG_FIRST_FALLBACK)) {
+					Aeloria_Debug_Log("FIRST_FALLBACK this=%p RTTI=%d owner=%d age=%d born_bad_or_became_bad=1",
+					                  (void*)object, object->What_Am_I(), (int)object->Owner(), age);
+				}
+			}
+
+			HousesType owner = object ? object->Owner() : HOUSE_NONE;
+
+			if (Aeloria_ShouldLogOncePerObject(object, AEL_LOG_PLAYER_PHASE_B_SEVERE)) {
+				Aeloria_Debug_Log("PLAYER_EXEMPTION_SEVERE house=%d w=%d h=%d action=placeholder this=%p RTTI=%d",
+				                  (int)owner, width, height, (void*)object, object->What_Am_I());
+			}
+
+			// For non-stabilized player objects with bad shape data, draw a reliable
+			// visible placeholder through the client's rendering path.
+			if (stab.stabilityLevel < 2 || Aeloria_IsHumanDeployedBuilding(object)) {
+				// Extra diagnostic breadcrumb right before the placeholder call on bad shape.
+				auto cIt = g_AeloriaObjectCreationFrame.find(reinterpret_cast<uintptr_t>(object));
+				int age = (cIt != g_AeloriaObjectCreationFrame.end()) ? (int)(Frame - cIt->second) : -1;
+				Aeloria_Debug_Log("PRE_PLACEHOLDER this=%p RTTI=%d owner=%d w=%d h=%d age=%d",
+				                  (void*)object, object->What_Am_I(), (int)object->Owner(), width, height, age);
+
+				DrawSafePlayerPlaceholder(object, x, y, (int)flags, rotation, virtualscale);
+				return;
+			}
 		}
+		}
+	}
+
+	// Last-mile guard for all paths (including post-graduation starting units at frame 20+):
+	// never call the legacy blitter with null shape or zero dimensions.
+	if (shapefile == nullptr || shapenum < 0) {
+		if (object && (Is_Player_Exempt(object) || Aeloria_NeedsSafeMainDrawGuard(object))) {
+			DrawSafePlayerPlaceholder(object, x, y, (int)flags, rotation, virtualscale);
+		}
+		return;
+	}
+	if (width <= 0) width = Get_Build_Frame_Width(shapefile);
+	if (height <= 0) height = Get_Build_Frame_Height(shapefile);
+	if (width <= 0 || height <= 0) {
+		if (object && (Is_Player_Exempt(object) || Aeloria_NeedsSafeMainDrawGuard(object))) {
+			DrawSafePlayerPlaceholder(object, x, y, (int)flags, rotation, virtualscale);
+		}
+		return;
+	}
+	// Starting units: never hit legacy MAIN blitter while Unlimbo creation tracking is active.
+	if (window != WINDOW_VIRTUAL && object && Aeloria_NeedsSafeMainDrawGuard(object)) {
+		DrawSafePlayerPlaceholder(object, x, y, (int)flags, rotation, virtualscale);
+		return;
+	}
+
+	if (window != WINDOW_VIRTUAL && object && shapenum > 0 && width > 0 && height > 0) {
+		Aeloria_NotifyMainDrawCache(object, shapenum, width, height, x, y);
 	}
 
 	CC_Draw_Shape(shapefile, shapenum, x, y, window, flags, fadingdata, ghostdata, rotation);
@@ -3575,12 +3775,27 @@ void CC_Draw_Shape(const ObjectClass *object, const char *shape_file_name, void 
 	if (object) {
 		uintptr_t at_plus_8 = *(uintptr_t*)((const char*)object + 8);
 		bool logGot = Aeloria_ShouldLogVerbose(object) && Aeloria_ShouldLogOncePerObject(object, AEL_LOG_CC_DRAW_GOT_OBJECT);
-		if (logGot && Is_Player_Exempt(object) && g_PlayerExemptionFrames > 0) {
+		// Phase 1 diagnostic (approved plan): relax suppression during -D so we see what the client
+		// is actually calling for the early creation objects. This is temporary for the proving run.
+		if (logGot && Is_Player_Exempt(object) && g_PlayerExemptionFrames > 0 && !g_AeloriaEnableVerboseDrawLogs) {
 			logGot = false;
 		}
+		// Phase C: central stability check in ShouldLogOncePerObject further reduces chatter for graduated objects.
 		if (logGot) {
 			Aeloria_Debug_Log("CC_Draw_Shape got Object this=%p RTTI=%d at+8=0x%08lx (name overload)",
 			                  (void*)object, object->What_Am_I(), (unsigned long)at_plus_8);
+		}
+
+		// === PHASE 1 PROVING LOG (approved plan) ===
+		// Same loud diagnostic for the name overload (used by Techno_Draw_Object_Virtual etc.).
+		if (object && Is_Player_Exempt(object) && g_PlayerExemptionFrames > 0 && g_AeloriaEnableVerboseDrawLogs) {
+			uintptr_t key = reinterpret_cast<uintptr_t>(object);
+			bool hasCreation = g_AeloriaObjectCreationFrame.find(key) != g_AeloriaObjectCreationFrame.end();
+			int stabLevel = 0;
+			auto sIt = g_AeloriaObjectStability.find(key);
+			if (sIt != g_AeloriaObjectStability.end()) stabLevel = sIt->second.stabilityLevel;
+			Aeloria_Debug_Log("VIRTUAL_DRAW_ATTEMPT this=%p RTTI=%d owner=%d w=%d h=%d has_creation=%d stab=%d frame=%u (overload=name)",
+			                  (void*)object, object->What_Am_I(), (int)object->Owner(), 0, 0, hasCreation ? 1 : 0, stabLevel, Frame);
 		}
 
 		/*
@@ -3639,10 +3854,45 @@ void CC_Draw_Shape(const ObjectClass *object, const char *shape_file_name, void 
 		**	See Is_Plausible_Class_Pointer in OBJECT.H and plan.md Expert Panel section.
 		**	Player exemption also applied here.
 		*/
-		if (!Is_Plausible_Class_Pointer(at_plus_8) && !Is_Player_Exempt(object)) {
-			Aeloria_Debug_Log("REJECTED at CC_Draw_Shape (last-line defense) this=%p RTTI=%d at+8=0x%08lx",
-			                  (void*)object, object->What_Am_I(), (unsigned long)at_plus_8);
+		if (!Is_Plausible_Class_Pointer(at_plus_8)) {
+			if (Aeloria_TryStatelessTechnoDraw(object, shapenum, x, y, rotation, virtualscale, shape_file_name, override_owner)) {
+				return;
+			}
+			if (object && window != WINDOW_VIRTUAL && Aeloria_IsHumanDeployedBuilding(object)) {
+				DrawSafePlayerPlaceholder(object, x, y, (int)flags, rotation, virtualscale, shape_file_name, override_owner);
+				return;
+			}
+			if (Aeloria_TrySafeVirtualDrawIntercept(object, shapenum, x, y, rotation, virtualscale, shape_file_name, override_owner)) {
+				return;
+			}
+			if (object && (Is_Player_Exempt(object) || Aeloria_NeedsSafeMainDrawGuard(object)
+			               || Aeloria_IsHumanDeployedBuilding(object)
+			               || (g_HumanPlayerHouse != HOUSE_NONE && object->Owner() == g_HumanPlayerHouse))) {
+				DrawSafePlayerPlaceholder(object, x, y, (int)flags, rotation, virtualscale, shape_file_name, override_owner);
+				return;
+			}
+
+			uintptr_t key = reinterpret_cast<uintptr_t>(object);
+			if (object && object->Owner() == g_HumanPlayerHouse) {
+				g_AeloriaPlayerGuardHits++;
+			} else {
+				g_AeloriaNonPlayerGuardHits++;
+			}
+			// E: Post-mortem context on hard rejection
+			auto stabIt = g_AeloriaObjectStability.find(key);
+			auto createIt = g_AeloriaObjectCreationFrame.find(key);
+			int age = (createIt != g_AeloriaObjectCreationFrame.end()) ? (int)(Frame - createIt->second) : -1;
+			int fb = (stabIt != g_AeloriaObjectStability.end()) ? stabIt->second.fallbackUses : -1;
+			if (Aeloria_ShouldLogOncePerObject(object, AEL_LOG_GRACE_SKIP)) {
+				Aeloria_Debug_Log("HARD_REJECT this=%p RTTI=%d at8=0x%08lx reason=plausible_ptr age=%d fallbacks=%d",
+				                  (void*)object, object->What_Am_I(), (unsigned long)at_plus_8, age, fb);
+			}
 			return;   // Do not draw — prevents the 0xC0000005 that used to occur here
+		}
+
+		if (window != WINDOW_VIRTUAL && Aeloria_NeedsSafeMainDrawGuard(object)) {
+			DrawSafePlayerPlaceholder(object, x, y, (int)flags, rotation, virtualscale, shape_file_name, override_owner);
+			return;
 		}
 	}
 
@@ -3650,18 +3900,38 @@ void CC_Draw_Shape(const ObjectClass *object, const char *shape_file_name, void 
 		int width = Get_Build_Frame_Width(shapefile);
 		int height = Get_Build_Frame_Height(shapefile);
 
-		// Same safe placeholder treatment for the name overload (used by Techno_Draw_Object_Virtual).
-		// Ensures player-owned buildings (and other objects) still get a draw event in the Remastered client
-		// even when their shape data is bad during the long exemption window.
-		if (Is_Player_Exempt(object) && (width <= 0 || height <= 0)) {
+		// Name overload: same perf rule — placeholder only for bad virtual dims.
+		if (Is_Player_Exempt(object) && g_PlayerExemptionFrames > 0 && (width <= 0 || height <= 0)) {
+			uintptr_t key = reinterpret_cast<uintptr_t>(object);
+			bool hasCreation = g_AeloriaObjectCreationFrame.find(key) != g_AeloriaObjectCreationFrame.end();
+			if (g_AeloriaEnableVerboseDrawLogs) {
+				Aeloria_Debug_Log("VIRTUAL_FORCE_TAKEN this=%p RTTI=%d has_creation=%d (reason: bad virtual w/h, name) frame=%u",
+				                  (void*)object, object ? object->What_Am_I() : -1, hasCreation ? 1 : 0, Frame);
+			}
 			HousesType owner = object ? object->Owner() : HOUSE_NONE;
 			g_HumanPlayerFallbackUses++;
+			// Also track per-object for worst-offender reporting in Phase C
+			{
+				uintptr_t key = reinterpret_cast<uintptr_t>(object);
+				auto stabIt = g_AeloriaObjectStability.find(key);
+				if (stabIt != g_AeloriaObjectStability.end()) {
+					stabIt->second.fallbackUses++;
+				}
+			}
 			if (Aeloria_ShouldLogOncePerObject(object, AEL_LOG_PLAYER_PHASE_B_SEVERE)) {
-				Aeloria_Debug_Log("PLAYER EXEMPTION (Phase C, virtual name): using safe 32x32 for human house %d (was w=%d h=%d)",
+				Aeloria_Debug_Log("PLAYER EXEMPTION (Phase C, virtual name): using safe placeholder via helper for human house %d (was w=%d h=%d)",
 				                  (int)owner, width, height);
 			}
-			width  = 32;
-			height = 32;
+
+			if (g_AeloriaEnableVerboseDrawLogs) {
+				auto cIt = g_AeloriaObjectCreationFrame.find(reinterpret_cast<uintptr_t>(object));
+				int age = (cIt != g_AeloriaObjectCreationFrame.end()) ? (int)(Frame - cIt->second) : -1;
+				Aeloria_Debug_Log("PRE_PLACEHOLDER (virtual name) this=%p RTTI=%d owner=%d w=%d h=%d age=%d",
+				                  (void*)object, object->What_Am_I(), (int)object->Owner(), width, height, age);
+			}
+
+			DrawSafePlayerPlaceholder(object, x, y, (int)flags, rotation, virtualscale, shape_file_name, override_owner);
+			return;
 		}
 
 		DLL_Draw_Intercept(shapenum, x, y, width, height, (int)flags, object, rotation, virtualscale, shape_file_name, override_owner);
@@ -3674,28 +3944,200 @@ void CC_Draw_Shape(const ObjectClass *object, const char *shape_file_name, void 
 	**	for the human house, use safe default size instead of hard-skipping. This is what
 	**	restores normal animation/build speed for the player's units.
 	*/
-	if (Is_Player_Exempt(object)) {
+	const bool needsStartingUnitDrawGuardName = object && Aeloria_NeedsSafeMainDrawGuard(object);
+	if (Is_Player_Exempt(object) || needsStartingUnitDrawGuardName) {
 		g_HumanPlayerDrawAttempts++;
 		int w = Get_Build_Frame_Width(shapefile);
 		int h = Get_Build_Frame_Height(shapefile);
-		if (w <= 0 || h <= 0) {
-			HousesType owner = object ? object->Owner() : HOUSE_NONE;
-			g_HumanPlayerFallbackUses++;
 
-			if (Aeloria_ShouldLogOncePerObject(object, AEL_LOG_PLAYER_PHASE_B_SEVERE)) {
-				Aeloria_Debug_Log("PLAYER EXEMPTION (Phase B, name): SEVERE shape corruption for human house %d (w=%d h=%d) — drawing safe rect placeholder instead of blitter",
-				                  (int)owner, w, h);
+		if (Aeloria_IsStatelessUntrackedTechno(object)) {
+			if (w <= 0 || h <= 0 || shapenum <= 0) {
+				DrawSafePlayerPlaceholder(object, x, y, (int)flags, rotation, virtualscale, shape_file_name, override_owner);
+				return;
+			}
+		} else {
+		uintptr_t key = reinterpret_cast<uintptr_t>(object);
+		auto& stab = g_AeloriaObjectStability[key];
+
+		// Cache RTTI for richer summaries (Item 3)
+		if (stab.rtti == 0 && object) {
+			stab.rtti = (uint8_t)object->What_Am_I();
+		}
+
+		if (w > 0 && h > 0 && shapenum > 0) {
+			stab.successfulRealDraws++;
+			stab.lastGoodFrame = Frame;
+
+			// Logging QoL Item 1: First real draw age (creation-to-first-good-draw)
+			auto cIt = g_AeloriaObjectCreationFrame.find(reinterpret_cast<uintptr_t>(object));
+			if (stab.successfulRealDraws == 1 && cIt != g_AeloriaObjectCreationFrame.end()) {
+				int age = Frame - cIt->second;
+				if (g_AeloriaEnableVerboseDrawLogs && Aeloria_ShouldLogOncePerObject(object, AEL_LOG_FIRST_REAL_DRAW)) {
+					Aeloria_Debug_Log("FIRST_REAL_DRAW (name) this=%p RTTI=%d owner=%d age=%d",
+					                  (void*)object, object->What_Am_I(), (int)object->Owner(), age);
+				}
 			}
 
-			// Safe placeholder rect for the human player (same reason as the main overload).
-			LogicPage->Fill_Rect(x, y, x + 32, y + 32, 14);
-			return;
+			if (stab.stabilityLevel < 2 && stab.successfulRealDraws >= 10 && Aeloria_HasValidMainDrawCache(object)) {
+				stab.stabilityLevel = 2;
+				// Phase C spam reduction: drop this object from the once-per log mask now that
+				// it has graduated. Future draw diagnostics for it will use the lighter gate.
+				g_AeloriaObjectLogMask.erase(reinterpret_cast<uintptr_t>(object));
+				if (g_AeloriaEnableVerboseDrawLogs) {
+					auto cIt = g_AeloriaObjectCreationFrame.find(reinterpret_cast<uintptr_t>(object));
+					int age = (cIt != g_AeloriaObjectCreationFrame.end()) ? (int)(Frame - cIt->second) : -1;
+					Aeloria_Debug_Log("OBJECT STABILIZED (name) this=%p RTTI=%d owner=%d draws=%u age=%d level=2",
+					                  (void*)object, object->What_Am_I(), (int)object->Owner(), stab.successfulRealDraws, age);
+				}
+			}
+		} else {
+			if (stab.stabilityLevel >= 2) {
+				stab.stabilityLevel = 1;
+				g_AeloriaPromotedThenDemoted++;
+			}
+			g_HumanPlayerFallbackUses++;
+			stab.fallbackUses++;
+
+			// Logging QoL Item 1: First fallback with creation age
+			auto cIt = g_AeloriaObjectCreationFrame.find(reinterpret_cast<uintptr_t>(object));
+			if (stab.fallbackUses == 1 && cIt != g_AeloriaObjectCreationFrame.end()) {
+				int age = Frame - cIt->second;
+				if (g_AeloriaEnableVerboseDrawLogs && Aeloria_ShouldLogOncePerObject(object, AEL_LOG_FIRST_FALLBACK)) {
+					Aeloria_Debug_Log("FIRST_FALLBACK (name) this=%p RTTI=%d owner=%d age=%d born_bad_or_became_bad=1",
+					                  (void*)object, object->What_Am_I(), (int)object->Owner(), age);
+				}
+			}
+
+			HousesType owner = object ? object->Owner() : HOUSE_NONE;
+
+			if (Aeloria_ShouldLogOncePerObject(object, AEL_LOG_PLAYER_PHASE_B_SEVERE)) {
+				Aeloria_Debug_Log("PLAYER_EXEMPTION_SEVERE (name) house=%d w=%d h=%d action=placeholder this=%p RTTI=%d",
+				                  (int)owner, w, h, (void*)object, object->What_Am_I());
+			}
+
+			if (stab.stabilityLevel < 2 || Aeloria_IsHumanDeployedBuilding(object)) {
+				auto cIt = g_AeloriaObjectCreationFrame.find(reinterpret_cast<uintptr_t>(object));
+				int age = (cIt != g_AeloriaObjectCreationFrame.end()) ? (int)(Frame - cIt->second) : -1;
+				Aeloria_Debug_Log("PRE_PLACEHOLDER (name) this=%p RTTI=%d owner=%d w=%d h=%d age=%d",
+				                  (void*)object, object->What_Am_I(), (int)object->Owner(), w, h, age);
+
+				DrawSafePlayerPlaceholder(object, x, y, (int)flags, rotation, virtualscale, shape_file_name, override_owner);
+				return;
+			}
+		}
+		}
+	}
+
+	if (window != WINDOW_VIRTUAL && object && Aeloria_NeedsSafeMainDrawGuard(object)) {
+		DrawSafePlayerPlaceholder(object, x, y, (int)flags, rotation, virtualscale, shape_file_name, override_owner);
+		return;
+	}
+
+	if (window != WINDOW_VIRTUAL && object && shapenum > 0) {
+		int w = Get_Build_Frame_Width(shapefile);
+		int h = Get_Build_Frame_Height(shapefile);
+		if (w > 0 && h > 0) {
+			Aeloria_NotifyMainDrawCache(object, shapenum, w, h, x, y);
 		}
 	}
 
 	CC_Draw_Shape(shapefile, shapenum, x, y, window, flags, fadingdata, ghostdata, rotation);
 }
 
+
+// Helper for B: Draw a reliable small visible placeholder for non-stabilized
+// player objects when their real shape data is corrupted.
+// This attempts to go through the Remastered client's rendering path
+// (DLL_Draw_Intercept) so the player actually sees something.
+// Called from: Phase B bad-shape paths, virtual-window bad exempt paths,
+// and the +8 hard-reject last-line for non-stable players.
+static void DrawSafePlaceholder(const ObjectClass* object,
+                                int x, int y,
+                                int flags,
+                                DirType rotation,
+                                long virtualscale,
+                                const char* shape_file_name,
+                                char override_owner)
+{
+	if (!object) return;
+
+	int size = 32; // larger and more visible placeholder during long exemption for corrupted early objects
+
+	// B: Deep breadcrumb inside placeholder
+	Aeloria_Debug_Log("PLACEHOLDER_ENTER this=%p size=%d has_creation=%d", (void*)object, size,
+	                  g_AeloriaObjectCreationFrame.find(reinterpret_cast<uintptr_t>(object)) != g_AeloriaObjectCreationFrame.end() ? 1 : 0);
+
+	// Guard: during the absolute first Map.Render() (g_EarlyLoadGraceActive is only true for
+	// that one call, set/cleared in the CNC_Start_* arming blocks). The DLL client path can AV
+	// on raw objects with still-corrupted shape data (w/h=0) at absolute t=0 on custom maps.
+	// The legacy rect already has the matching guard. This is a one-frame safety net only;
+	// the long player exemption (18k frames) uses the normal placeholder + DLL path.
+	if (g_EarlyLoadGraceActive) {
+		// Narrow bypass for human-player early objects (hasCreation + Owner == human house).
+		// These are the exact units that have been invisible on custom 4p maps.
+		// The strengthened per-draw REAL_FIRST needs at least the first exposures to work.
+		// Everything else keeps the original one-frame AV safety net.
+		bool isHumanEarly = false;
+		uintptr_t key = reinterpret_cast<uintptr_t>(object);
+		if (g_AeloriaObjectCreationFrame.find(key) != g_AeloriaObjectCreationFrame.end() &&
+		    g_HumanPlayerHouse != HOUSE_NONE &&
+		    object->Owner() == g_HumanPlayerHouse) {
+			isHumanEarly = true;
+		}
+
+		if (!isHumanEarly) {
+			Aeloria_Debug_Log("PLACEHOLDER_SKIP_DURING_GRACE this=%p (DLL_Draw_Intercept not safe during absolute first render on custom map)", (void*)object);
+			return;
+		}
+
+		Aeloria_Debug_Log("PLACEHOLDER_BYPASS_GRACE_FOR_HUMAN_EARLY this=%p (letting strengthened per-draw force run)", (void*)object);
+
+		// Double registration on the *very first* client exposure for these critical early human units.
+		// The bypass lets us reach the DLL path on the absolute first render (where we used to hard-skip).
+		// A single registration is often not enough for the Remastered client to fully accept and retain
+		// the object when its internal state is still recovering. Give it two clean registrations back-to-back
+		// on this critical first draw.
+		DLL_Draw_Intercept(0, x, y, size, size, flags, const_cast<ObjectClass*>(object),
+		                   rotation, virtualscale, shape_file_name, override_owner);
+		Aeloria_Debug_Log("PLACEHOLDER_DOUBLE_FORCE_ON_FIRST_BYPASS this=%p", (void*)object);
+	}
+
+	// Always try the client path first — this is what the Remastered renderer sees.
+	// Using a larger forced size + the object's house via override_owner to maximize chance
+	// the client actually draws something even when the object's Class/shape data is still garbage.
+	DLL_Draw_Intercept(0, x, y, size, size, flags, const_cast<ObjectClass*>(object),
+	                   rotation, virtualscale, shape_file_name, override_owner);
+
+	if (g_AeloriaEnableVerboseDrawLogs) {
+		Aeloria_Debug_Log("PLACEHOLDER_DLL_CALLED this=%p", (void*)object);
+	}
+
+	// Strong visibility marker for player objects during the long exemption when their real
+	// shape data is still corrupted (common on custom maps). The DLL sprite often doesn't
+	// appear for these objects, so we force a prominent bright yellow box that the player
+	// can see and click on. This makes units "visible" as markers so you can locate and
+	// command them even if the normal sprite is missing.
+	// Size is larger than the DLL placeholder to create an obvious selection box/halo.
+	if (LogicPage != nullptr && !g_EarlyLoadGraceActive) {
+		int marker = 48; // prominent yellow marker box
+		LogicPage->Fill_Rect(x-4, y-4, x + marker, y + marker, 14); // bright yellow
+		if (g_AeloriaEnableVerboseDrawLogs) {
+			Aeloria_Debug_Log("PLACEHOLDER_VISIBILITY_MARKER_YELLOW_BOX this=%p size=%d", (void*)object, marker);
+		}
+	}
+}
+
+// Main entry point for safe placeholder from the two CC_Draw_Shape overloads
+static void DrawSafePlayerPlaceholder(const ObjectClass* object,
+                                      int x, int y,
+                                      int flags,
+                                      DirType rotation,
+                                      long virtualscale,
+                                      const char* shape_file_name,
+                                      char override_owner)
+{
+	DrawSafePlaceholder(object, x, y, flags, rotation, virtualscale, shape_file_name, override_owner);
+}
 
 void CC_Draw_Pip(const ObjectClass *object, void const * shapefile, int shapenum, int x, int y, WindowNumberType window, ShapeFlags_Type flags, void const * fadingdata, void const * ghostdata, DirType rotation)
 {

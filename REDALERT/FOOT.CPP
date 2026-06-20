@@ -80,7 +80,6 @@
 
 #include	"function.h"
 
-
 /***********************************************************************************************
  * FootClass::FootClass -- Default constructor for foot class objects.                         *
  *                                                                                             *
@@ -997,9 +996,12 @@ int FootClass::Mission_Guard_Area(void)
 		}
 	}
 
-	if (What_Am_I() == RTTI_UNIT && ((UnitClass *)this)->Class->IsToHarvest) {
-		Assign_Mission(MISSION_HARVEST);
-		return(1+Random_Pick(1, 10));
+	if (What_Am_I() == RTTI_UNIT) {
+		UnitTypeClass const* utype = static_cast<UnitTypeClass const*>(Aeloria_Safe_Techno_Type(this));
+		if (utype && utype->IsToHarvest) {
+			Assign_Mission(MISSION_HARVEST);
+			return(1+Random_Pick(1, 10));
+		}
 	}
 
 	/*
@@ -1267,21 +1269,23 @@ void FootClass::Active_Click_With(ActionType action, ObjectClass * object)
 		case ACTION_NOMOVE:
 		case ACTION_MOVE:
 			if (Can_Player_Move()) {
+				TechnoTypeClass const* ttype = Aeloria_Safe_Techno_Type(this);
+				if (!ttype) break;
 
 				TARGET targ = object->As_Target();
 
 				/*
 				**	If the destination object is not the same zone, then pick a nearby location.
 				*/
-				if (object->What_Am_I() != RTTI_AIRCRAFT && Techno_Type_Class()->Speed != SPEED_WINGED && Map[Coord].Zones[Techno_Type_Class()->MZone] != Map[object->Center_Coord()].Zones[Techno_Type_Class()->MZone]) {
+				if (object->What_Am_I() != RTTI_AIRCRAFT && ttype->Speed != SPEED_WINGED && Map[Coord].Zones[ttype->MZone] != Map[object->Center_Coord()].Zones[ttype->MZone]) {
 
 #ifdef FIXIT_MINE_PASSABLE
 					// Fixes units not driving onto mines.
 					if (Can_Enter_Cell(Coord_Cell(object->Center_Coord())) > MOVE_OK) {
-						targ = ::As_Target(Map.Nearby_Location(Coord_Cell(object->Center_Coord()), Techno_Type_Class()->Speed, Map[Coord].Zones[Techno_Type_Class()->MZone], Techno_Type_Class()->MZone));
+						targ = ::As_Target(Map.Nearby_Location(Coord_Cell(object->Center_Coord()), ttype->Speed, Map[Coord].Zones[ttype->MZone], ttype->MZone));
 					}
 #else
-					targ = ::As_Target(Map.Nearby_Location(Coord_Cell(object->Center_Coord()), Techno_Type_Class()->Speed, Map[Coord].Zones[Techno_Type_Class()->MZone], Techno_Type_Class()->MZone));
+					targ = ::As_Target(Map.Nearby_Location(Coord_Cell(object->Center_Coord()), ttype->Speed, Map[Coord].Zones[ttype->MZone], ttype->MZone));
 #endif
 				}
 
@@ -1336,6 +1340,8 @@ void FootClass::Active_Click_With(ActionType action, CELL cell)
 		case ACTION_NOMOVE:
 			//using function for IsVisible so we have different results for different players - JAS 2019/09/30
 			if (What_Am_I() != RTTI_AIRCRAFT || Map[cell].Is_Visible(PlayerPtr)) {
+				TechnoTypeClass const* ttype = Aeloria_Safe_Techno_Type(this);
+				if (!ttype) break;
 
 				/*
 				** Find the closest same-zoned cell to where the unit currently is.
@@ -1349,12 +1355,12 @@ void FootClass::Active_Click_With(ActionType action, CELL cell)
 				if (What_Am_I() != RTTI_AIRCRAFT) {
 
 					if (Can_Enter_Cell(Coord_Cell(Center_Coord())) == MOVE_OK) {
-						cell = Map.Nearby_Location(cell, Techno_Type_Class()->Speed, cellptr->Zones[Techno_Type_Class()->MZone], Techno_Type_Class()->MZone);
+						cell = Map.Nearby_Location(cell, ttype->Speed, cellptr->Zones[ttype->MZone], ttype->MZone);
 					} else {
-						cell = Map.Nearby_Location(cell, Techno_Type_Class()->Speed);
+						cell = Map.Nearby_Location(cell, ttype->Speed);
 					}
 #ifdef OBSOLETE
-					cell = Map.Nearby_Location(cell, Techno_Type_Class()->Speed, cellptr->Zones[Techno_Type_Class()->MZone], Techno_Type_Class()->MZone);
+					cell = Map.Nearby_Location(cell, ttype->Speed, cellptr->Zones[ttype->MZone], ttype->MZone);
 #endif
 				}
 
@@ -1764,10 +1770,15 @@ int FootClass::Mission_Enter(void)
 			**	If this is a harvester, then return to harvesting.
 			**	Set a hacky target so we know to skip to the proper state.
 			*/
-			if (What_Am_I() == RTTI_UNIT && ((UnitClass*)this)->Class->IsToHarvest) {
-				Assign_Mission(MISSION_HARVEST);
-				Assign_Target(As_Target());
-				Assign_Destination(TARGET_NONE);
+			if (What_Am_I() == RTTI_UNIT) {
+				UnitTypeClass const* utype = static_cast<UnitTypeClass const*>(Aeloria_Safe_Techno_Type(this));
+				if (utype && utype->IsToHarvest) {
+					Assign_Mission(MISSION_HARVEST);
+					Assign_Target(As_Target());
+					Assign_Destination(TARGET_NONE);
+				} else {
+					Enter_Idle_Mode();
+				}
 			} else {
 				Enter_Idle_Mode();
 			}

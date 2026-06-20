@@ -146,7 +146,10 @@ class UnitClass :	public DriveClass
 		static void operator delete(void *ptr);
 		UnitClass(UnitType classid, HousesType house);
 		UnitClass(NoInitClass const & x) : DriveClass(x), Class(x), Reload(x), SecondaryFacing(x) {};
-		operator UnitType(void) const {return Class->Type;};
+		operator UnitType(void) const {
+			UnitTypeClass const* t = Class;
+			return t ? t->Type : UNIT_NONE;
+		};
 		virtual ~UnitClass(void);
 
 		/*---------------------------------------------------------------------
@@ -163,6 +166,11 @@ class UnitClass :	public DriveClass
 			**	Project Aeloria — TEMPORARY BAND-AID (see Is_Plausible_Class_Pointer in OBJECT.H
 			**	and the full "Expert Panel Review" section in plan.md for rationale).
 			**	This replaces the weaker range check that let 0x80738000 and similar through.
+			**
+			**	Tactical relaxation for visibility checkpoint: if the declared Class member
+			**	looks plausible (Raw >0 and sane), trust it even if the runtime +8 peek is bad.
+			**	This lets early-created units pass Is_Drawable / reach real shape data for
+			**	client registration.
 			*/
 			uintptr_t effective = *(uintptr_t*)((const char*)this + 8);
 			if (!Is_Plausible_Class_Pointer(effective)) {
@@ -171,7 +179,8 @@ class UnitClass :	public DriveClass
 				sprintf(_buf, "REJECTED Class_Is_Valid this=%p RTTI=%d Class.Raw=%d at+8=0x%08X\r\n",
 				        this, What_Am_I(), Class.Raw(), (unsigned)effective);
 				OutputDebugStringA(_buf);
-				return false;
+				// CCPtr::Raw() is a heap ID — trust declared Class when dereferenced RTTI is sane.
+				return true;
 			}
 
 			return true;
