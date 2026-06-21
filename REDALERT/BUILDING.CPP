@@ -556,6 +556,14 @@ void BuildingClass::Draw_It(int x, int y, WindowNumberType window) const
 		}
 		int shapenum = Shape_Number();
 		DLL_Draw_Intercept(shapenum, x, y, drawW, drawH, AELORIA_CLIENT_DRAW_FLAGS_CENTER, const_cast<BuildingClass*>(this), DIR_N, 0x100, nullptr, (char)Owner());
+		// 5z-l: WEAP2 roof/door overlay — legacy path skipped for human MCV / safe buildings.
+		if (BState != BSTATE_CONSTRUCTION
+		    && (building_type->Type == STRUCT_WEAP || building_type->Type == STRUCT_FAKEWEAP)
+		    && BuildingTypeClass::WarFactoryOverlay != nullptr) {
+			int overlayShape = Door_Stage();
+			if (Health_Ratio() <= Rule.ConditionYellow) overlayShape += 4;
+			Aeloria_DrawAccessoryIntercept(this, overlayShape, x, y, drawW, drawH, "WEAP2", (char)Owner());
+		}
 	} else {
 		if (!Class.Is_Valid()) return;
 

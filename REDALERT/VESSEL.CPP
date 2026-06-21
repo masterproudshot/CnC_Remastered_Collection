@@ -392,6 +392,51 @@ static void Aeloria_LogProducedVesselFirstDrawIfNeeded(const VesselClass* vessel
 	                  (int)it->second.cachedTypeEnum);
 }
 
+static void Aeloria_DrawGuardedVesselTurret(const VesselClass* vessel, const VesselTypeClass* vessel_type,
+                                            FacingClass const& primaryFacing, FacingClass const& secondaryFacing,
+                                            int x, int y, int drawW, int drawH)
+{
+	if (vessel == nullptr || vessel_type == nullptr || !vessel_type->IsTurretEquipped) {
+		return;
+	}
+	int xx = x;
+	int yy = y;
+	DirType turdir = DirType(Dir_To_16(primaryFacing) * 16);
+	const char* turret_shape_name = nullptr;
+	int shapenum = TechnoClass::BodyShape[Dir_To_32(secondaryFacing)];
+
+	switch (vessel_type->Type) {
+		case VESSEL_CA:
+			turret_shape_name = "TURR";
+			vessel_type->Turret_Adjust(turdir, xx, yy);
+			Aeloria_DrawAccessoryIntercept(vessel, shapenum, xx, yy, drawW, drawH, turret_shape_name, (char)vessel->Owner());
+			xx = x;
+			yy = y;
+			turdir = DirType(Dir_To_16(primaryFacing + DIR_S) * 16);
+			vessel_type->Turret_Adjust(turdir, xx, yy);
+			Aeloria_DrawAccessoryIntercept(vessel, shapenum, xx, yy, drawW, drawH, turret_shape_name, (char)vessel->Owner());
+			return;
+
+		case VESSEL_DD:
+			turret_shape_name = "SSAM";
+			vessel_type->Turret_Adjust(turdir, xx, yy);
+			break;
+
+		case VESSEL_PT:
+			turret_shape_name = "MGUN";
+			vessel_type->Turret_Adjust(turdir, xx, yy);
+			break;
+
+		default:
+			vessel_type->Turret_Adjust(turdir, xx, yy);
+			break;
+	}
+
+	if (turret_shape_name != nullptr) {
+		Aeloria_DrawAccessoryIntercept(vessel, shapenum, xx, yy, drawW, drawH, turret_shape_name, (char)vessel->Owner());
+	}
+}
+
 
 /***********************************************************************************************
  * VesselClass::Draw_It -- Draws the vessel.                                                   *
@@ -454,6 +499,7 @@ void VesselClass::Draw_It(int x, int y, WindowNumberType window) const
 		}
 		DLL_Draw_Intercept(virtualShape, x, y, drawW, drawH, AELORIA_CLIENT_DRAW_FLAGS_CENTER,
 		                   const_cast<VesselClass*>(this), DIR_N, 0x100, nullptr, (char)Owner());
+		Aeloria_DrawGuardedVesselTurret(this, vessel_type, PrimaryFacing, SecondaryFacing, x, y, drawW, drawH);
 		return;
 	}
 
@@ -471,6 +517,7 @@ void VesselClass::Draw_It(int x, int y, WindowNumberType window) const
 		int interceptShape = producedTracked ? 0 : shapenum;
 		DLL_Draw_Intercept(interceptShape, x, y, drawW, drawH, AELORIA_CLIENT_DRAW_FLAGS_CENTER,
 		                   const_cast<VesselClass*>(this), DIR_N, 0x100, nullptr, (char)Owner());
+		Aeloria_DrawGuardedVesselTurret(this, vessel_type, PrimaryFacing, SecondaryFacing, x, y, drawW, drawH);
 		return;
 	}
 

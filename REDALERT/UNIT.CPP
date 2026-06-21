@@ -2165,6 +2165,32 @@ static void Aeloria_LogProducedUnitFirstDrawIfNeeded(const UnitClass* unit, Wind
 	                  (int)it->second.cachedTypeEnum);
 }
 
+static void Aeloria_DrawGuardedUnitTurret(const UnitClass* unit, const UnitTypeClass* unit_type,
+                                          FacingClass const& primaryFacing, FacingClass const& secondaryFacing,
+                                          bool isInRecoilState, int x, int y, int drawW, int drawH)
+{
+	if (unit == nullptr || unit_type == nullptr || !unit_type->IsTurretEquipped) {
+		return;
+	}
+	int tfacing = Dir_To_32(secondaryFacing);
+	int shapenum = TechnoClass::BodyShape[tfacing] + 32;
+#ifdef FIXIT_PHASETRANSPORT	//	checked - ajw 9/28/98
+	if (unit_type->Type == UNIT_PHASE) {
+		shapenum += 6;
+	}
+#endif
+	int xx = x;
+	int yy = y;
+	if (isInRecoilState) {
+		Recoil_Adjust(secondaryFacing, xx, yy);
+	}
+	unit_type->Turret_Adjust(primaryFacing, xx, yy);
+	const char* shape_name = unit_type->Graphic_Name();
+	if (shape_name != nullptr && shape_name[0] != '\0') {
+		Aeloria_DrawAccessoryIntercept(unit, shapenum, xx, yy, drawW, drawH, shape_name, (char)unit->Owner());
+	}
+}
+
 void UnitClass::Draw_It(int x, int y, WindowNumberType window) const
 {
 	assert(Units.ID(this) == ID);
@@ -2218,6 +2244,7 @@ void UnitClass::Draw_It(int x, int y, WindowNumberType window) const
 		}
 		DLL_Draw_Intercept(virtualShape, x, y, drawW, drawH, AELORIA_CLIENT_DRAW_FLAGS_CENTER,
 		                   const_cast<UnitClass*>(this), DIR_N, 0x100, nullptr, (char)Owner());
+		Aeloria_DrawGuardedUnitTurret(this, unit_type, PrimaryFacing, SecondaryFacing, IsInRecoilState, x, y, drawW, drawH);
 		return;
 	}
 
@@ -2239,6 +2266,7 @@ void UnitClass::Draw_It(int x, int y, WindowNumberType window) const
 		int interceptShape = producedTracked ? 0 : shapenum;
 		DLL_Draw_Intercept(interceptShape, x, y, drawW, drawH, AELORIA_CLIENT_DRAW_FLAGS_CENTER,
 		                   const_cast<UnitClass*>(this), DIR_N, 0x100, nullptr, (char)Owner());
+		Aeloria_DrawGuardedUnitTurret(this, unit_type, PrimaryFacing, SecondaryFacing, IsInRecoilState, x, y, drawW, drawH);
 		// Phase 5i: skip DriveClass::Draw_It on guarded MAIN — matches infantry (no FootClass on safe path).
 		return;
 	}

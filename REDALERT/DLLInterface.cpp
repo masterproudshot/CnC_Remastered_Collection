@@ -1569,6 +1569,24 @@ bool Aeloria_TrySafeVirtualDrawIntercept(const ObjectClass* object, int shapenum
 	return true;
 }
 
+void Aeloria_DrawAccessoryIntercept(const ObjectClass* obj, int shapenum, int x, int y,
+                                    int drawW, int drawH, const char* shape_file_name,
+                                    char override_owner)
+{
+	if (obj == nullptr || shape_file_name == nullptr || shape_file_name[0] == '\0') {
+		return;
+	}
+	if (drawW <= 0) drawW = 48;
+	if (drawH <= 0) drawH = 48;
+	char owner = (override_owner != HOUSE_NONE) ? override_owner : (char)obj->Owner();
+	if (g_AeloriaEnableVerboseDrawLogs && Aeloria_ShouldLogOncePerObject(obj, AEL_LOG_ACCESSORY_DRAW)) {
+		Aeloria_Debug_Log("AELORIA_ACCESSORY_DRAW this=%p RTTI=%d owner=%d asset=%s shapenum=%d frame=%u",
+		                  (void*)obj, (int)obj->What_Am_I(), (int)owner, shape_file_name, shapenum, Frame);
+	}
+	DLLExportClass::DLL_Draw_Intercept(shapenum, x, y, drawW, drawH, AELORIA_CLIENT_DRAW_FLAGS_CENTER,
+	                                   const_cast<ObjectClass*>(obj), DIR_N, 0x100, shape_file_name, owner);
+}
+
 static void Aeloria_PruneStaleTracking()
 {
 	static unsigned lastPruneFrame = 0;

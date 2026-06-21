@@ -416,6 +416,7 @@ enum AeloriaLogTag {
 	AEL_LOG_FIRST_REAL_DRAW = 15,     // Item 1
 	AEL_LOG_FIRST_FALLBACK  = 16,     // Item 1
 	AEL_LOG_INFANTRY_DEATH  = 17,     // Phase 5j: once per death-anim MAIN draw
+	AEL_LOG_ACCESSORY_DRAW  = 18,     // Phase 5z-l: once per accessory sub-draw (WEAP2, turrets)
 	// Room for more
 	AEL_LOG_MAX = 31
 };
@@ -678,6 +679,12 @@ TechnoTypeClass const* Aeloria_Safe_Techno_Type(TechnoClass const* techno);
 void Aeloria_Repair_Early_Class_Pointer(TechnoClass* techno);
 void Aeloria_Seed_Building_Creation(BuildingClass* building);
 void Aeloria_Seed_Human_Building_Stability(BuildingClass* building);
+
+// 5z-l: Accessory layer (WEAP2 roof, tank/vessel turrets) on guarded safe-draw paths.
+// Does not touch main-draw cache or graduation; uses explicit shape_file_name for client export.
+void Aeloria_DrawAccessoryIntercept(const ObjectClass* obj, int shapenum, int x, int y,
+                                    int drawW, int drawH, const char* shape_file_name,
+                                    char override_owner = HOUSE_NONE);
 
 /*
 **	Project Aeloria (Draw Guard helper):
