@@ -897,9 +897,18 @@ TechnoTypeClass const* Aeloria_Safe_Techno_Type(TechnoClass const* techno)
 		return &AircraftTypeClass::As_Reference(AIRCRAFT_TRANSPORT);
 	}
 
-	case RTTI_VESSEL:
-		ttype = static_cast<VesselClass const*>(techno)->Class;
-		return ttype;
+	case RTTI_VESSEL: {
+		VesselClass const* vessel = static_cast<VesselClass const*>(techno);
+		ttype = vessel->Class;
+		if (ttype && vessel->Class.Is_Valid() && ttype->RTTI == RTTI_VESSELTYPE) {
+			return ttype;
+		}
+		auto it = g_AeloriaObjectStability.find(reinterpret_cast<uintptr_t>(techno));
+		if (it != g_AeloriaObjectStability.end() && it->second.cachedTypeEnum >= 0) {
+			return &VesselTypeClass::As_Reference((VesselType)it->second.cachedTypeEnum);
+		}
+		return &VesselTypeClass::As_Reference(VESSEL_DD);
+	}
 
 	case RTTI_BUILDING: {
 		BuildingClass const* building = static_cast<BuildingClass const*>(techno);
@@ -1427,8 +1436,7 @@ void Aeloria_ResetProducedTechnoTracking(TechnoClass* techno)
 			stab.cachedWidth = 0;
 			stab.cachedHeight = 0;
 			stab.cachedAssetName[0] = '\0';
-			stab.producedUnitUnlimboSeeded = false;
-			stab.producedUnitBadPlus8 = false;
+			// Keep WF eternal-safe flags across same-type pool recycle until Unlimbo re-seeds (5z-n8c).
 			stab.producedUnitFirstDrawMask = 0;
 		}
 		g_AeloriaObjectLogMask.erase(key);
@@ -5401,9 +5409,12 @@ bool Aeloria_TryNotifyProducedUnitMainDrawCache(const ObjectClass* obj, int shap
 		it->second.producedUnitBadPlus8 = true;
 	}
 	int cacheShape = (shape_number > 0) ? shape_number : 16;
+	bool firstCache = !it->second.hasCachedMainDraw;
 	Aeloria_NotifyMainDrawCache(obj, cacheShape, width, height, draw_x, draw_y);
-	Aeloria_Debug_Log("PRODUCED_UNIT_MAIN_CACHE this=%p owner=%d shape=%d pos=(%d,%d) frame=%u",
-	                  (void*)obj, (int)obj->Owner(), cacheShape, draw_x, draw_y, Frame);
+	if (firstCache) {
+		Aeloria_Debug_Log("PRODUCED_UNIT_MAIN_CACHE this=%p owner=%d shape=%d pos=(%d,%d) frame=%u",
+		                  (void*)obj, (int)obj->Owner(), cacheShape, draw_x, draw_y, Frame);
+	}
 	return true;
 }
 

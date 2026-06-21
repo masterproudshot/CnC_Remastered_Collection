@@ -64,6 +64,8 @@
 
 #include "function.h"
 
+extern void DLL_Draw_Intercept(int shape_number, int x, int y, int width, int height, int flags, const ObjectClass *object, DirType rotation, long scale, const char *shape_file_name, char override_owner);
+
 
 /***********************************************************************************************
  * VesselClass::VesselClass -- Constructor for vessel class objects.                           *
@@ -363,6 +365,33 @@ int VesselClass::Shape_Number(void) const
 	return(shapenum);
 }
 
+static int Aeloria_GuardedVesselShapeNumber(const VesselClass* vessel)
+{
+	if (!vessel) {
+		return UnitClass::BodyShape[16];
+	}
+	return UnitClass::BodyShape[Dir_To_32(vessel->PrimaryFacing)];
+}
+
+static void Aeloria_LogProducedVesselFirstDrawIfNeeded(const VesselClass* vessel, WindowNumberType window,
+                                                       int guarded, int bad_plus_8)
+{
+	uintptr_t key = reinterpret_cast<uintptr_t>(vessel);
+	auto it = g_AeloriaObjectStability.find(key);
+	if (it == g_AeloriaObjectStability.end() || !it->second.producedUnitUnlimboSeeded) {
+		return;
+	}
+	uint8_t bit = (window == WINDOW_VIRTUAL) ? 0x01u : 0x02u;
+	if (it->second.producedUnitFirstDrawMask & bit) {
+		return;
+	}
+	it->second.producedUnitFirstDrawMask |= bit;
+	const char* winName = (window == WINDOW_VIRTUAL) ? "VIRTUAL" : "MAIN";
+	Aeloria_Debug_Log("PRODUCED_VESSEL_FIRST_DRAW this=%p owner=%d frame=%u window=%s guarded=%d bad_plus_8=%d type_enum=%d",
+	                  (void*)vessel, (int)vessel->Owner(), Frame, winName, guarded, bad_plus_8,
+	                  (int)it->second.cachedTypeEnum);
+}
+
 
 /***********************************************************************************************
  * VesselClass::Draw_It -- Draws the vessel.                                                   *
@@ -386,11 +415,64 @@ void VesselClass::Draw_It(int x, int y, WindowNumberType window) const
 	assert(Vessels.ID(this) == ID);
 	assert(IsActive);
 
+	Aeloria_Repair_Early_Class_Pointer(const_cast<VesselClass*>(this));
+
 	/*
 	**	Early-out if the Class pointer is not yet valid (can happen very early
 	**	during scenario load before TypeClasses are fully constructed).
 	*/
 	if (!Is_Drawable(this)) return;
+
+	VesselTypeClass const* vessel_type = static_cast<VesselTypeClass const*>(Aeloria_Safe_Techno_Type(this));
+	if (vessel_type == nullptr) return;
+
+	int drawW = 48;
+	int drawH = 48;
+	vessel_type->Dimensions(drawW, drawH);
+	if (drawW <= 0) drawW = 48;
+	if (drawH <= 0) drawH = 48;
+
+	uintptr_t at_plus_8 = *(uintptr_t*)((const char*)this + 8);
+	bool bad_plus_8 = !Is_Plausible_Class_Pointer(at_plus_8);
+	const ObjectClass* selfObj = static_cast<const ObjectClass*>(this);
+	const bool producedTracked = Aeloria_IsProducedUnitUnlimboSeeded(selfObj);
+	const bool eternalProduced = Aeloria_IsEternalSafeProducedUnit(selfObj);
+	const bool producedBadPlus8 = eternalProduced
+	                              || Aeloria_IsProducedBadPlus8Unit(selfObj)
+	                              || producedTracked
+	                              || (bad_plus_8 && producedTracked);
+	const bool needsMainGuard = Aeloria_IsEarlyStartingUnitMainGuarded(selfObj);
+	const int guardedFlag = (needsMainGuard || producedBadPlus8) ? 1 : 0;
+
+	if (window == WINDOW_VIRTUAL) {
+		Aeloria_LogProducedVesselFirstDrawIfNeeded(this, window, guardedFlag, bad_plus_8 ? 1 : 0);
+		int virtualShape = 0;
+		if (producedTracked) {
+			virtualShape = 0;
+		} else if (producedBadPlus8 || needsMainGuard) {
+			virtualShape = Aeloria_GuardedVesselShapeNumber(this);
+		}
+		DLL_Draw_Intercept(virtualShape, x, y, drawW, drawH, AELORIA_CLIENT_DRAW_FLAGS_CENTER,
+		                   const_cast<VesselClass*>(this), DIR_N, 0x100, nullptr, (char)Owner());
+		return;
+	}
+
+	if ((producedBadPlus8 || needsMainGuard)
+	    && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_PLAYER_CREATION)) {
+		Aeloria_Debug_Log("PRODUCED_VESSEL_MAIN_GUARD this=%p owner=%d frame=%u (safe MAIN draw; corrupt +8 guard)",
+		                  (void*)this, (int)Owner(), Frame);
+	}
+	if (bad_plus_8 || producedBadPlus8 || needsMainGuard) {
+		Aeloria_LogProducedVesselFirstDrawIfNeeded(this, window, guardedFlag, bad_plus_8 ? 1 : 0);
+		int shapenum = Aeloria_GuardedVesselShapeNumber(this);
+		if (drawW > 0 && drawH > 0 && producedTracked) {
+			Aeloria_TryNotifyProducedUnitMainDrawCache(selfObj, shapenum, drawW, drawH, x, y, bad_plus_8);
+		}
+		int interceptShape = producedTracked ? 0 : shapenum;
+		DLL_Draw_Intercept(interceptShape, x, y, drawW, drawH, AELORIA_CLIENT_DRAW_FLAGS_CENTER,
+		                   const_cast<VesselClass*>(this), DIR_N, 0x100, nullptr, (char)Owner());
+		return;
+	}
 
 	if (g_AeloriaEnableVerboseDrawLogs && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_GUARD_PASSED)) {
 		Aeloria_Debug_Log("Vessel guard passed this=%p Class.Raw=%ld - proceeding to draw", (void*)this, Class.Raw());

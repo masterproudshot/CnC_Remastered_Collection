@@ -1275,7 +1275,7 @@ bool TechnoClass::Unlimbo(COORDINATE coord, DirType dir)
 		// mid power-plant build in the 1823 session).
 		bool scenarioStart = g_EarlyLoadGraceActive || (Frame < 10);
 		RTTIType rtti = What_Am_I();
-		bool trackableTechno = (rtti == RTTI_INFANTRY || rtti == RTTI_UNIT || rtti == RTTI_AIRCRAFT);
+		bool trackableTechno = (rtti == RTTI_INFANTRY || rtti == RTTI_UNIT || rtti == RTTI_AIRCRAFT || rtti == RTTI_VESSEL);
 		// Barracks/factory infantry for the human player can unlimbo far after frame 10; they still
 		// need creation tracking + SAFE_CLIENT_REG (1844 session: rifleman invisible with has_creation=0).
 		bool humanPlayerInfantry = (rtti == RTTI_INFANTRY && g_HumanPlayerHouse != HOUSE_NONE && Owner() == g_HumanPlayerHouse);
@@ -1286,6 +1286,8 @@ bool TechnoClass::Unlimbo(COORDINATE coord, DirType dir)
 		bool producedUnit = (rtti == RTTI_UNIT && !scenarioStart);
 		// Helipad aircraft (human + AI) bypass creation tracking and HARD_REJECT at export (age=-1).
 		bool producedAircraft = (rtti == RTTI_AIRCRAFT && !scenarioStart);
+		// Shipyard vessels (human + AI) need the same pool-reuse eternal-safe draw path (5z-n10).
+		bool producedVessel = (rtti == RTTI_VESSEL && !scenarioStart);
 		// Human MCV-deployed buildings (power, barracks, refinery) unlimbo after frame 10; cache type
 		// for safe client export without adding them to sustain bulk (mid-game slowdown root cause).
 		bool humanPlayerBuilding = (rtti == RTTI_BUILDING && g_HumanPlayerHouse != HOUSE_NONE && Owner() == g_HumanPlayerHouse);
@@ -1299,7 +1301,7 @@ bool TechnoClass::Unlimbo(COORDINATE coord, DirType dir)
 				preSeededHarvester = true;
 			}
 		}
-		if ((producedInfantry || producedUnit || producedAircraft) && !preSeededHarvester) {
+		if ((producedInfantry || producedUnit || producedAircraft || producedVessel) && !preSeededHarvester) {
 			Aeloria_ResetProducedTechnoTracking(this);
 		}
 
@@ -1319,7 +1321,7 @@ bool TechnoClass::Unlimbo(COORDINATE coord, DirType dir)
 		if ((scenarioStart && trackableTechno)
 		    || (humanPlayerInfantry && !skipProducedInfantryTracking)
 		    || (producedInfantry && !skipProducedInfantryTracking)
-		    || producedUnit || producedAircraft) {
+		    || producedUnit || producedAircraft || producedVessel) {
 			uintptr_t key = reinterpret_cast<uintptr_t>(this);
 			if (g_AeloriaObjectCreationFrame.find(key) == g_AeloriaObjectCreationFrame.end()) {
 				g_AeloriaObjectCreationFrame[key] = Frame;
@@ -1340,6 +1342,9 @@ bool TechnoClass::Unlimbo(COORDINATE coord, DirType dir)
 							break;
 						case RTTI_AIRCRAFT:
 							stab.cachedTypeEnum = (int16_t)static_cast<AircraftTypeClass const*>(safe)->Type;
+							break;
+						case RTTI_VESSEL:
+							stab.cachedTypeEnum = (int16_t)static_cast<VesselTypeClass const*>(safe)->Type;
 							break;
 						default:
 							break;
@@ -1464,6 +1469,15 @@ bool TechnoClass::Unlimbo(COORDINATE coord, DirType dir)
 			} else if (producedAircraft) {
 				uintptr_t key = reinterpret_cast<uintptr_t>(this);
 				auto& stab = g_AeloriaObjectStability[key];
+				// Spy plane / helipad pool-reuse: same eternal-safe flags as WF vehicles (5z-n9).
+				stab.producedUnitUnlimboSeeded = true;
+				stab.producedUnitFirstDrawMask = 0;
+				stab.producedUnitBadPlus8 = true;
+				uintptr_t at_plus_8 = *(uintptr_t*)((const char*)this + 8);
+				if (Is_Plausible_Class_Pointer(at_plus_8)) {
+					Aeloria_Debug_Log("PRODUCED_AIRCRAFT_PLAUSIBLE_PLUS8 this=%p owner=%d type_enum=%d frame=%u (eternal safe draw anyway)",
+					                  (void*)this, (int)Owner(), (int)stab.cachedTypeEnum, Frame);
+				}
 				if (!stab.earlySafeClientRegistered) {
 					char overrideOwner = (char)Owner();
 					if (overrideOwner != HOUSE_NONE) {
@@ -1480,6 +1494,36 @@ bool TechnoClass::Unlimbo(COORDINATE coord, DirType dir)
 						stab.clientListInserted = false;
 						stab.sustainRetired = false;
 						Aeloria_Debug_Log("PRODUCED_AIRCRAFT_UNLIMBO_SEED this=%p owner=%d type_enum=%d w=%d h=%d frame=%u",
+						                  (void*)this, (int)Owner(), (int)stab.cachedTypeEnum, drawW, drawH, Frame);
+					}
+				}
+			} else if (producedVessel) {
+				uintptr_t key = reinterpret_cast<uintptr_t>(this);
+				auto& stab = g_AeloriaObjectStability[key];
+				stab.producedUnitUnlimboSeeded = true;
+				stab.producedUnitFirstDrawMask = 0;
+				stab.producedUnitBadPlus8 = true;
+				uintptr_t at_plus_8 = *(uintptr_t*)((const char*)this + 8);
+				if (Is_Plausible_Class_Pointer(at_plus_8)) {
+					Aeloria_Debug_Log("PRODUCED_VESSEL_PLAUSIBLE_PLUS8 this=%p owner=%d type_enum=%d frame=%u (eternal safe draw anyway)",
+					                  (void*)this, (int)Owner(), (int)stab.cachedTypeEnum, Frame);
+				}
+				if (!stab.earlySafeClientRegistered) {
+					char overrideOwner = (char)Owner();
+					if (overrideOwner != HOUSE_NONE) {
+						int drawW = 48;
+						int drawH = 48;
+						VesselTypeClass const* vtype = static_cast<VesselTypeClass const*>(Aeloria_Safe_Techno_Type(this));
+						if (vtype) {
+							vtype->Dimensions(drawW, drawH);
+						}
+						if (drawW <= 0) drawW = 48;
+						if (drawH <= 0) drawH = 48;
+						DLL_Draw_Intercept(0, 0, 0, drawW, drawH, 0, this, DIR_N, 0x100, nullptr, overrideOwner);
+						stab.earlySafeClientRegistered = true;
+						stab.clientListInserted = false;
+						stab.sustainRetired = false;
+						Aeloria_Debug_Log("PRODUCED_VESSEL_UNLIMBO_SEED this=%p owner=%d type_enum=%d w=%d h=%d frame=%u",
 						                  (void*)this, (int)Owner(), (int)stab.cachedTypeEnum, drawW, drawH, Frame);
 					}
 				}

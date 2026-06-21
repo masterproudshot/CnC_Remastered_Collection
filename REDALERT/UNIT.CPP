@@ -1321,6 +1321,19 @@ void UnitClass::Active_Click_With(ActionType action, CELL cell)
 	assert(Units.ID(this) == ID);
 	assert(IsActive);
 
+	UnitTypeClass const* unit_type = static_cast<UnitTypeClass const*>(Aeloria_Safe_Techno_Type(this));
+	if (unit_type && unit_type->IsToHarvest) {
+		if (action == ACTION_HARVEST
+		    || ((action == ACTION_NOMOVE || action == ACTION_MOVE) && Map[cell].Land_Type() == LAND_TIBERIUM)) {
+			CELL check = cell;
+			if (Tiberium_Check(check, 0, 0) <= 0) {
+				Aeloria_Debug_Log("HARVEST_ORDER_REJECTED cell=%d overlay=%d land=%d action=%d frame=%u",
+				                  (int)cell, (int)Map[cell].Overlay, (int)Map[cell].Land_Type(), (int)action, Frame);
+				return;
+			}
+		}
+	}
+
 #ifdef FIXIT_CSII	//	checked - ajw 9/28/98
 	if (*this == UNIT_MAD && (IsDumping || Gold)) {
 	} else {
@@ -2414,7 +2427,9 @@ int UnitClass::Tiberium_Check(CELL & center, int x, int y)
 	center = XY_Cell(Cell_X(center)+x, Cell_Y(center)+y);
 
 	if ((Session.Type != GAME_NORMAL || (!IsOwnedByPlayer || Map[center].Is_Mapped(PlayerPtr)))) {
-		if (Map[Coord].Zones[Class->MZone] != Map[center].Zones[Class->MZone]) return(0);
+		TechnoTypeClass const* safe_type = Aeloria_Safe_Techno_Type(this);
+		if (!safe_type) return(0);
+		if (Map[Coord].Zones[safe_type->MZone] != Map[center].Zones[safe_type->MZone]) return(0);
 		if (!Map[center].Cell_Techno() && Map[center].Land_Type() == LAND_TIBERIUM) {
 			int value = 0;
 			switch (Map[center].Overlay) {
@@ -3966,8 +3981,14 @@ ActionType UnitClass::What_Action(CELL cell) const
 
 	ActionType action = DriveClass::What_Action(cell);
 	const UnitTypeClass* unit_type = static_cast<const UnitTypeClass*>(Aeloria_Safe_Techno_Type(this));
-	if (unit_type && action == ACTION_MOVE && Map[cell].Land_Type() == LAND_TIBERIUM && unit_type->IsToHarvest) {
-		return(ACTION_HARVEST);
+	if (unit_type && unit_type->IsToHarvest && Map[cell].Land_Type() == LAND_TIBERIUM) {
+		CELL check = cell;
+		if (const_cast<UnitClass*>(this)->Tiberium_Check(check, 0, 0) > 0) {
+			return(ACTION_HARVEST);
+		}
+		if (action == ACTION_MOVE) {
+			return(ACTION_NOMOVE);
+		}
 	}
 #ifdef FIXIT_CSII	//	checked - ajw 9/28/98
 	if (*this == UNIT_MAD && (IsDumping || Gold)) {

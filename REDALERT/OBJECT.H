@@ -515,7 +515,7 @@ inline bool Aeloria_IsRepurposedHarvester(const ObjectClass* obj)
 	return true;
 }
 
-inline bool Aeloria_IsProducedUnitUnlimboSeeded(const ObjectClass* obj)
+inline bool Aeloria_IsProducedTechnoUnlimboSeeded(const ObjectClass* obj)
 {
 	if (obj == nullptr) return false;
 	uintptr_t key = reinterpret_cast<uintptr_t>(obj);
@@ -523,10 +523,18 @@ inline bool Aeloria_IsProducedUnitUnlimboSeeded(const ObjectClass* obj)
 	return it != g_AeloriaObjectStability.end() && it->second.producedUnitUnlimboSeeded;
 }
 
-// War-factory produced units with corrupt +8 at Unlimbo — never use legacy blitter for the match.
+// Back-compat alias — WF vehicles and mid-game aircraft (spy plane, helipad) share this flag.
+inline bool Aeloria_IsProducedUnitUnlimboSeeded(const ObjectClass* obj)
+{
+	return Aeloria_IsProducedTechnoUnlimboSeeded(obj);
+}
+
+// WF / reinforcement aircraft with corrupt +8 at Unlimbo — never use legacy blitter for the match.
 inline bool Aeloria_IsProducedBadPlus8Unit(const ObjectClass* obj)
 {
-	if (obj == nullptr || obj->What_Am_I() != RTTI_UNIT) return false;
+	if (obj == nullptr) return false;
+	RTTIType rtti = obj->What_Am_I();
+	if (rtti != RTTI_UNIT && rtti != RTTI_AIRCRAFT && rtti != RTTI_VESSEL) return false;
 	uintptr_t key = reinterpret_cast<uintptr_t>(obj);
 	auto it = g_AeloriaObjectStability.find(key);
 	return it != g_AeloriaObjectStability.end()
@@ -544,16 +552,17 @@ inline bool Aeloria_IsProducedBadPlus8Harvester(const ObjectClass* obj)
 	    && it->second.cachedTypeEnum == (int16_t)UNIT_HARVESTER;
 }
 
-// All WF-produced vehicles: pool-reuse slots always need eternal safe draw (5z-n8).
+// WF/shipyard-produced vehicles, aircraft, and vessels: eternal safe draw (5z-n8/n9/n10).
 inline bool Aeloria_IsEternalSafeProducedUnit(const ObjectClass* obj)
 {
-	if (obj == nullptr || obj->What_Am_I() != RTTI_UNIT) return false;
+	if (obj == nullptr) return false;
+	RTTIType rtti = obj->What_Am_I();
+	if (rtti != RTTI_UNIT && rtti != RTTI_AIRCRAFT && rtti != RTTI_VESSEL) return false;
 	if (Aeloria_IsRepurposedHarvester(obj)) return true;
 	uintptr_t key = reinterpret_cast<uintptr_t>(obj);
 	auto it = g_AeloriaObjectStability.find(key);
 	return it != g_AeloriaObjectStability.end()
-	    && it->second.producedUnitUnlimboSeeded
-	    && it->second.producedUnitBadPlus8;
+	    && it->second.producedUnitUnlimboSeeded;
 }
 
 // Human MCV/sidebar-placed buildings: type cached at Unlimbo, corrupt +8 persists for the whole match.

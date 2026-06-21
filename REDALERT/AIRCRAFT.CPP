@@ -93,6 +93,8 @@
 
 #include	"function.h"
 
+extern void DLL_Draw_Intercept(int shape_number, int x, int y, int width, int height, int flags, const ObjectClass *object, DirType rotation, long scale, const char *shape_file_name, char override_owner);
+
 
 /***********************************************************************************************
  * _Counts_As_Civ_Evac -- Is the specified object a candidate for civilian evac logic?         *
@@ -400,16 +402,116 @@ int AircraftClass::Shape_Number(void) const
  * HISTORY:                                                                                    *
  *   07/26/1994 JLB : Created.                                                                 *
  *=============================================================================================*/
+static int Aeloria_GuardedAircraftShapeNumber(const AircraftClass* aircraft)
+{
+	if (!aircraft) {
+		return UnitClass::BodyShape[16];
+	}
+	AircraftTypeClass const* atype = static_cast<AircraftTypeClass const*>(
+	    Aeloria_Safe_Techno_Type(const_cast<AircraftClass*>(aircraft)));
+	int rotation = atype ? atype->Rotation : 32;
+	int shapenum = 0;
+	switch (rotation) {
+		case 32:
+			shapenum = UnitClass::BodyShape[Dir_To_32(aircraft->SecondaryFacing)];
+			break;
+		case 16:
+			shapenum = UnitClass::BodyShape[Dir_To_16(aircraft->SecondaryFacing) * 2] / 2;
+			break;
+		case 8:
+			shapenum = UnitClass::BodyShape[Dir_To_8(aircraft->SecondaryFacing) * 4] / 4;
+			break;
+		default:
+			break;
+	}
+	if (shapenum > 0) {
+		return shapenum;
+	}
+	return UnitClass::BodyShape[16];
+}
+
+static void Aeloria_LogProducedAircraftFirstDrawIfNeeded(const AircraftClass* aircraft, WindowNumberType window,
+                                                         int guarded, int bad_plus_8)
+{
+	uintptr_t key = reinterpret_cast<uintptr_t>(aircraft);
+	auto it = g_AeloriaObjectStability.find(key);
+	if (it == g_AeloriaObjectStability.end() || !it->second.producedUnitUnlimboSeeded) {
+		return;
+	}
+	uint8_t bit = (window == WINDOW_VIRTUAL) ? 0x01u : 0x02u;
+	if (it->second.producedUnitFirstDrawMask & bit) {
+		return;
+	}
+	it->second.producedUnitFirstDrawMask |= bit;
+	const char* winName = (window == WINDOW_VIRTUAL) ? "VIRTUAL" : "MAIN";
+	Aeloria_Debug_Log("PRODUCED_AIRCRAFT_FIRST_DRAW this=%p owner=%d frame=%u window=%s guarded=%d bad_plus_8=%d type_enum=%d",
+	                  (void*)aircraft, (int)aircraft->Owner(), Frame, winName, guarded, bad_plus_8,
+	                  (int)it->second.cachedTypeEnum);
+}
+
 void AircraftClass::Draw_It(int x, int y, WindowNumberType window) const
 {
 	assert(Aircraft.ID(this) == ID);
 	assert(IsActive);
+
+	Aeloria_Repair_Early_Class_Pointer(const_cast<AircraftClass*>(this));
 
 	/*
 	**	Early-out if the Class pointer is not yet valid (can happen very early
 	**	during scenario load before TypeClasses are fully constructed).
 	*/
 	if (!Is_Drawable(this)) return;
+
+	AircraftTypeClass const* aircraft_type = static_cast<AircraftTypeClass const*>(Aeloria_Safe_Techno_Type(this));
+	if (aircraft_type == nullptr) return;
+
+	int drawW = 48;
+	int drawH = 48;
+	aircraft_type->Dimensions(drawW, drawH);
+	if (drawW <= 0) drawW = 48;
+	if (drawH <= 0) drawH = 48;
+
+	uintptr_t at_plus_8 = *(uintptr_t*)((const char*)this + 8);
+	const bool bad_plus_8 = !Is_Plausible_Class_Pointer(at_plus_8);
+	const ObjectClass* selfObj = static_cast<const ObjectClass*>(this);
+	const bool producedTracked = Aeloria_IsProducedUnitUnlimboSeeded(selfObj);
+	const bool eternalProduced = Aeloria_IsEternalSafeProducedUnit(selfObj);
+	const bool producedBadPlus8 = eternalProduced
+	                              || Aeloria_IsProducedBadPlus8Unit(selfObj)
+	                              || producedTracked
+	                              || (bad_plus_8 && producedTracked);
+	const bool needsMainGuard = Aeloria_IsEarlyStartingUnitMainGuarded(selfObj);
+	const int guardedFlag = (needsMainGuard || producedBadPlus8) ? 1 : 0;
+
+	if (window == WINDOW_VIRTUAL) {
+		Aeloria_LogProducedAircraftFirstDrawIfNeeded(this, window, guardedFlag, bad_plus_8 ? 1 : 0);
+		int virtualShape = 0;
+		if (producedTracked) {
+			virtualShape = 0;
+		} else if (producedBadPlus8 || needsMainGuard) {
+			virtualShape = Aeloria_GuardedAircraftShapeNumber(this);
+		}
+		DLL_Draw_Intercept(virtualShape, x, y, drawW, drawH, AELORIA_CLIENT_DRAW_FLAGS_CENTER,
+		                   const_cast<AircraftClass*>(this), DIR_N, 0x100, nullptr, (char)Owner());
+		return;
+	}
+
+	if ((producedBadPlus8 || needsMainGuard)
+	    && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_PLAYER_CREATION)) {
+		Aeloria_Debug_Log("PRODUCED_AIRCRAFT_MAIN_GUARD this=%p owner=%d frame=%u (safe MAIN draw; corrupt +8 guard)",
+		                  (void*)this, (int)Owner(), Frame);
+	}
+	if (bad_plus_8 || producedBadPlus8 || needsMainGuard) {
+		Aeloria_LogProducedAircraftFirstDrawIfNeeded(this, window, guardedFlag, bad_plus_8 ? 1 : 0);
+		int shapenum = Aeloria_GuardedAircraftShapeNumber(this);
+		if (drawW > 0 && drawH > 0 && producedTracked) {
+			Aeloria_TryNotifyProducedUnitMainDrawCache(selfObj, shapenum, drawW, drawH, x, y, bad_plus_8);
+		}
+		int interceptShape = producedTracked ? 0 : shapenum;
+		DLL_Draw_Intercept(interceptShape, x, y, drawW, drawH, AELORIA_CLIENT_DRAW_FLAGS_CENTER,
+		                   const_cast<AircraftClass*>(this), DIR_N, 0x100, nullptr, (char)Owner());
+		return;
+	}
 
 	if (g_AeloriaEnableVerboseDrawLogs && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_GUARD_PASSED)) {
 		Aeloria_Debug_Log("Aircraft guard passed this=%p Class.Raw=%ld - proceeding to draw", (void*)this, Class.Raw());
@@ -431,7 +533,7 @@ void AircraftClass::Draw_It(int x, int y, WindowNumberType window) const
 	**	rotation value accordingly. A rotation of DIR_N means no rotation at all.
 	*/
 	DirType rotation = DIR_N;
-	if (Class->Rotation == 16) {
+	if (aircraft_type->Rotation == 16) {
 		rotation = DirType(Rotation16[SecondaryFacing]);
 	}
 
