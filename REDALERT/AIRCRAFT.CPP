@@ -603,11 +603,15 @@ void AircraftClass::Draw_It(int x, int y, WindowNumberType window) const
 			if (!stabIt->second.sustainRetired) {
 				producedAircraftBulkHandoff = true;
 			}
-			// 5z-m4: stale Unlimbo BAD_PLUS8 with plausible runtime +8 kept helis on eternal guarded draw.
+			// Phase E: do not clear stale Unlimbo BAD_PLUS8 for rotor aircraft until MAIN draw cache
+			// exists (premature clear left Hind/Longbow on defer+early-return with no LAYERS export).
 			if (!bad_plus_8 && stabIt->second.producedUnitBadPlus8) {
-				stabIt->second.producedUnitBadPlus8 = false;
-				Aeloria_Debug_Log("PRODUCED_AIRCRAFT_BAD_PLUS8_CLEARED this=%p owner=%d frame=%u type_enum=%d (runtime +8 ok)",
-				                  (void*)this, (int)Owner(), Frame, (int)stabIt->second.cachedTypeEnum);
+				const bool rotorProduced = !aircraft_type->IsFixedWing;
+				if (!rotorProduced || Aeloria_HasValidMainDrawCache(selfObj)) {
+					stabIt->second.producedUnitBadPlus8 = false;
+					Aeloria_Debug_Log("PRODUCED_AIRCRAFT_BAD_PLUS8_CLEARED this=%p owner=%d frame=%u type_enum=%d (runtime +8 ok)",
+					                  (void*)this, (int)Owner(), Frame, (int)stabIt->second.cachedTypeEnum);
+				}
 			}
 		}
 	}
@@ -689,7 +693,8 @@ void AircraftClass::Draw_It(int x, int y, WindowNumberType window) const
 		Aeloria_LogProducedAircraftFirstDrawIfNeeded(this, window, 0, bad_plus_8 ? 1 : 0);
 	}
 
-	// 5z-m8/m12: seed MAIN cache without legacy blitter; VIRTUAL waits until cache exists.
+	// 5z-m8/m12: seed MAIN cache without legacy blitter; fixed-wing VIRTUAL waits until cache exists.
+	// Phase E: rotor helis virtual-emit on LAYERS with guarded shapes when +8 is plausible.
 	if (producedTracked && !mainCacheReady && !useGuardedIntercept) {
 		if (window != WINDOW_VIRTUAL) {
 			int liteShape = Aeloria_GuardedAircraftShapeNumber(this);
@@ -704,6 +709,8 @@ void AircraftClass::Draw_It(int x, int y, WindowNumberType window) const
 				Aeloria_ProducedAircraftBulkDrawCoords(this, x, y, bulkX, bulkY);
 				Aeloria_TryNotifyProducedUnitMainDrawCache(selfObj, liteShape, drawW, drawH, bulkX, bulkY, bad_plus_8);
 			}
+		} else if (!aircraft_type->IsFixedWing && !bad_plus_8) {
+			Aeloria_ProducedAircraftEmitClientDraw(this, x, y, window, drawW, drawH, aircraft_type);
 		}
 		return;
 	}

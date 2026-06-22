@@ -253,6 +253,16 @@ void AnimClass::Draw_It(int x, int y, WindowNumberType window) const
 	*/
 	if (!Is_Drawable(this)) return;
 
+	// Phase E (5z-d2): resolve dynamic stage count before draw (matches ctor / logic paths).
+	if (Class->Stages == -1) {
+		IsTheaterShape = Class->IsTheater;
+		((int&)Class->Stages) = Get_Build_Frame_Count(Class->Get_Image_Data());
+		IsTheaterShape = false;
+	}
+	if (Class->LoopEnd == -1) {
+		((int&)Class->LoopEnd) = Class->Stages;
+	}
+
 	bool render_legacy = !IsInvisible && (Class->VirtualAnim == ANIM_NONE || window != WINDOW_VIRTUAL);
 	bool render_virtual = Target_Legal(VirtualAnimTarget) && window == WINDOW_VIRTUAL;
 

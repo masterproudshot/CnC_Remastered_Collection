@@ -1577,13 +1577,20 @@ void Aeloria_SeedProducedAircraftOnUnlimbo(TechnoClass* techno)
 	stab.producedUnitUnlimboSeeded = true;
 	stab.producedUnitFirstDrawMask = 0;
 	uintptr_t at_plus_8 = *(uintptr_t*)((const char*)techno + 8);
-	stab.producedUnitBadPlus8 = !Is_Plausible_Class_Pointer(at_plus_8);
+	const bool runtimeBadPlus8 = !Is_Plausible_Class_Pointer(at_plus_8);
+	AircraftTypeClass const* atypeSeed = static_cast<AircraftTypeClass const*>(safe);
+	const bool fixedWingProduced = (atypeSeed == nullptr || atypeSeed->IsFixedWing);
+	// Phase E: rotor helis use guarded LAYERS virtual-emit — do not pin eternal bad+8 at Unlimbo.
+	stab.producedUnitBadPlus8 = runtimeBadPlus8 && fixedWingProduced;
 	if (stab.producedUnitBadPlus8) {
 		Aeloria_Debug_Log("PRODUCED_AIRCRAFT_BAD_PLUS8 this=%p owner=%d type_enum=%d frame=%u (eternal safe draw)",
 		                  (void*)techno, (int)techno->Owner(), (int)stab.cachedTypeEnum, Frame);
+	} else if (runtimeBadPlus8 && atypeSeed && !atypeSeed->IsFixedWing) {
+		Aeloria_Debug_Log("PRODUCED_ROTOR_AIRCRAFT_UNLIMBO this=%p owner=%d type_enum=%d frame=%u (+8 suspect; defer eternal bad+8 to guarded virtual)",
+		                  (void*)techno, (int)techno->Owner(), (int)stab.cachedTypeEnum, Frame);
 	}
 
-	// 5z-m2/m7: no DLL_Draw_Intercept from Unlimbo; earlySafeClientRegistered only when +8 corrupt.
+	// 5z-m2/m7: no DLL_Draw_Intercept from Unlimbo; earlySafeClientRegistered only when +8 corrupt (fixed-wing).
 	stab.earlySafeClientRegistered = stab.producedUnitBadPlus8;
 
 	char overrideOwner = (char)techno->Owner();
@@ -5129,9 +5136,12 @@ void DLLExportClass::DLL_Draw_Intercept(int shape_number, int x, int y, int widt
 		    && !Aeloria_HasValidMainDrawCache(object)) {
 			uintptr_t at8 = *(uintptr_t*)((const char*)object + 8);
 			if (Is_Plausible_Class_Pointer(at8)) {
-				Aeloria_Debug_Log("PRODUCED_AIRCRAFT_INTERCEPT_DEFER this=%p owner=%d frame=%u (defer to bulk after MAIN cache)",
-				                  (void*)object, (int)object->Owner(), Frame);
-				return;
+				// Phase E: Mig (fixed-wing) — LAYERS intercept only after MAIN cache; rotor may intercept now.
+				if (!Aeloria_IsProducedRotorAircraft(object)) {
+					Aeloria_Debug_Log("PRODUCED_AIRCRAFT_INTERCEPT_DEFER this=%p owner=%d frame=%u (defer to bulk after MAIN cache)",
+					                  (void*)object, (int)object->Owner(), Frame);
+					return;
+				}
 			}
 		}
 	}
@@ -5612,6 +5622,41 @@ void Aeloria_GraduateTrackedObject(const ObjectClass* obj)
 	}
 }
 
+// Phase E: produced Hind/Longbow (rotor, !IsFixedWing) helpers — Mig fixed-wing rules unchanged.
+static bool Aeloria_IsProducedRotorAircraft(const ObjectClass* obj, bool* runtime_plus8_plausible = nullptr)
+{
+	if (!obj || obj->What_Am_I() != RTTI_AIRCRAFT) {
+		return false;
+	}
+	uintptr_t key = reinterpret_cast<uintptr_t>(obj);
+	auto it = g_AeloriaObjectStability.find(key);
+	if (it == g_AeloriaObjectStability.end() || !it->second.producedUnitUnlimboSeeded) {
+		return false;
+	}
+	TechnoTypeClass const* tt = Aeloria_Safe_Techno_Type(static_cast<TechnoClass const*>(obj));
+	AircraftTypeClass const* at = tt ? static_cast<AircraftTypeClass const*>(tt) : nullptr;
+	if (!at || at->IsFixedWing) {
+		return false;
+	}
+	if (runtime_plus8_plausible) {
+		uintptr_t at8 = *(uintptr_t*)((const char*)obj + 8);
+		*runtime_plus8_plausible = Is_Plausible_Class_Pointer(at8);
+	}
+	return true;
+}
+
+static bool Aeloria_ProducedRotorMayBulkWithoutMainCache(const ObjectClass* obj, const AeloriaObjectStability& stab)
+{
+	bool plausible = false;
+	if (!Aeloria_IsProducedRotorAircraft(obj, &plausible) || !plausible) {
+		return false;
+	}
+	if (Aeloria_HasValidMainDrawCache(obj)) {
+		return false;
+	}
+	return stab.sustainNormalHits > 0 || stab.hasCachedDraw || stab.earlySafeClientRegistered;
+}
+
 bool Aeloria_TryNotifyProducedUnitMainDrawCache(const ObjectClass* obj, int shape_number, int width, int height,
                                               int draw_x, int draw_y, bool runtime_bad_plus_8)
 {
@@ -5625,6 +5670,8 @@ bool Aeloria_TryNotifyProducedUnitMainDrawCache(const ObjectClass* obj, int shap
 	}
 	if (runtime_bad_plus_8) {
 		it->second.producedUnitBadPlus8 = true;
+	} else if (Aeloria_IsProducedRotorAircraft(obj)) {
+		it->second.producedUnitBadPlus8 = false;
 	}
 	int cacheShape = (shape_number > 0) ? shape_number : 16;
 	bool firstCache = !it->second.hasCachedMainDraw;
@@ -5950,6 +5997,10 @@ void Aeloria_SyncVirtualSelectionHud(const TechnoClass* tc)
 	if (!tc || !DLLExportClass::ObjectList) {
 		return;
 	}
+	// Phase E perf: HUD field sync only for player-selected units (hot per-frame virtual draw path).
+	if (!tc->Is_Selected_By_Player()) {
+		return;
+	}
 	for (int i = 0; i < DLLExportClass::CurrentDrawCount; ++i) {
 		CNCObjectStruct& draw_object = DLLExportClass::ObjectList->Objects[DLLExportClass::TotalObjectCount + i];
 		if (draw_object.CNCInternalObjectPointer == tc && draw_object.SubObject == 0) {
@@ -5970,10 +6021,16 @@ void Aeloria_RecordProducedAircraftVirtualEmit(const ObjectClass* obj)
 		return;
 	}
 	if (Aeloria_IsProducedBadPlus8Unit(obj)) {
-		return;
+		bool plausible = false;
+		if (!Aeloria_IsProducedRotorAircraft(obj, &plausible) || !plausible) {
+			return;
+		}
 	}
 	if (!Aeloria_HasValidMainDrawCache(obj)) {
-		return;
+		bool plausible = false;
+		if (!Aeloria_IsProducedRotorAircraft(obj, &plausible) || !plausible) {
+			return;
+		}
 	}
 	if (it->second.sustainRetired) {
 		return;
@@ -6491,7 +6548,10 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 			if (!obj || !obj->IsActive || obj->IsInLimbo) continue;
 			if (Aeloria_IsHumanDeployedBuilding(obj)) continue;
 			// Produced war-factory units: defer bulk until tactical MAIN draw caches coords (5z-n4).
-			if (stab.producedUnitUnlimboSeeded && !Aeloria_HasValidMainDrawCache(obj)) continue;
+			if (stab.producedUnitUnlimboSeeded && !Aeloria_HasValidMainDrawCache(obj)
+			    && !Aeloria_ProducedRotorMayBulkWithoutMainCache(obj, stab)) {
+				continue;
+			}
 
 			int listCountSoFar = normalTotal + bulkAdded;
 			if (Aeloria_ObjectAlreadyInExportList(ObjectList, listCountSoFar, obj)) continue;
@@ -6543,7 +6603,10 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 			const ObjectClass* obj = reinterpret_cast<const ObjectClass*>(k);
 			if (!obj || !obj->IsActive || obj->IsInLimbo) { sustainSkippedInactive++; continue; }
 			// Produced war-factory units: defer sustain until MAIN draw caches coords (5z-n5).
-			if (stab.producedUnitUnlimboSeeded && !Aeloria_HasValidMainDrawCache(obj)) continue;
+			if (stab.producedUnitUnlimboSeeded && !Aeloria_HasValidMainDrawCache(obj)
+			    && !Aeloria_ProducedRotorMayBulkWithoutMainCache(obj, stab)) {
+				continue;
+			}
 
 			const bool aircraftSustainHandoff = (obj->What_Am_I() == RTTI_AIRCRAFT
 			                                   && !Aeloria_IsProducedBadPlus8Unit(obj)
