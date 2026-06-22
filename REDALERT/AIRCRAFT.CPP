@@ -288,6 +288,7 @@ bool AircraftClass::Unlimbo(COORDINATE coord, DirType dir)
 	assert(IsActive);
 
 	if (FootClass::Unlimbo(coord, dir)) {
+		// 5z-m9: produced aircraft seed only in TechnoClass::Unlimbo (producedAircraft branch).
 
 		if (*this == AIRCRAFT_BADGER || (Class->PrimaryWeapon != NULL && Class->PrimaryWeapon->IsCamera)) {
 			IsALoaner = true;
@@ -449,6 +450,69 @@ static void Aeloria_LogProducedAircraftFirstDrawIfNeeded(const AircraftClass* ai
 	                  (int)it->second.cachedTypeEnum);
 }
 
+// Flying aircraft MAIN Draw_It coords can be negative (tactical anchor); bulk needs non-negative pixels (6faaaa88 Hind pos=-12).
+static void Aeloria_ProducedAircraftBulkDrawCoords(const AircraftClass* aircraft, int drawX, int drawY, int& outX, int& outY)
+{
+	outX = drawX;
+	outY = drawY;
+	if (outX >= 0 && outY >= 0) {
+		return;
+	}
+	int px = 0;
+	int py = 0;
+	if (Map.Coord_To_Pixel(aircraft->Render_Coord(), px, py) && px >= 0 && py >= 0) {
+		outX = px;
+		outY = py;
+		return;
+	}
+	if (Map.Coord_To_Pixel(aircraft->Center_Coord(), px, py) && px >= 0 && py >= 0) {
+		outX = px;
+		outY = py;
+	}
+}
+
+// 5z-m12: client population only on LAYERS (WINDOW_VIRTUAL). MAIN tactical pass must not intercept (Mig blink).
+// Rotor aircraft need body facing shape + Draw_Rotors sub-emits (shape 0 alone = invisible Hind/Longbow).
+static void Aeloria_ProducedAircraftEmitClientDraw(const AircraftClass* aircraft, int x, int y,
+                                                    WindowNumberType window, int drawW, int drawH,
+                                                    AircraftTypeClass const* aircraft_type)
+{
+	if (window != WINDOW_VIRTUAL || aircraft_type == nullptr) {
+		return;
+	}
+
+	const bool fixedWing = aircraft_type->IsFixedWing;
+	const bool rotorEquipped = aircraft_type->IsRotorEquipped;
+	int bodyShape = 0;
+	if (!fixedWing) {
+		bodyShape = Aeloria_GuardedAircraftShapeNumber(aircraft);
+		if (bodyShape <= 0) {
+			bodyShape = 16;
+		}
+	}
+
+	DLL_Draw_Intercept(bodyShape, x, y, drawW, drawH, AELORIA_CLIENT_DRAW_FLAGS_CENTER,
+	                   const_cast<AircraftClass*>(aircraft), DIR_N, 0x100, nullptr, (char)aircraft->Owner());
+
+	if (rotorEquipped) {
+		int jitter = 0;
+		if (aircraft->Height == ObjectClass::FLIGHT_LEVEL && aircraft->Get_Speed() < 3) {
+			static int _jitter[] = {0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, -1, -1, -1, 0};
+			jitter = _jitter[::Frame % 16];
+		}
+		const_cast<AircraftClass*>(aircraft)->Draw_Rotors(x, y + jitter, window);
+	}
+
+	uintptr_t key = reinterpret_cast<uintptr_t>(aircraft);
+	auto it = g_AeloriaObjectStability.find(key);
+	if (it != g_AeloriaObjectStability.end() && it->second.producedUnitUnlimboSeeded) {
+		it->second.earlySafeClientRegistered = true;
+		if (it->second.stabilityLevel < 1) {
+			it->second.stabilityLevel = 1;
+		}
+	}
+}
+
 void AircraftClass::Draw_It(int x, int y, WindowNumberType window) const
 {
 	assert(Aircraft.ID(this) == ID);
@@ -465,6 +529,20 @@ void AircraftClass::Draw_It(int x, int y, WindowNumberType window) const
 	AircraftTypeClass const* aircraft_type = static_cast<AircraftTypeClass const*>(Aeloria_Safe_Techno_Type(this));
 	if (aircraft_type == nullptr) return;
 
+	const ObjectClass* selfObj = static_cast<const ObjectClass*>(this);
+	bool scenarioStart = g_EarlyLoadGraceActive || (Frame < 10);
+	if (!scenarioStart && !Aeloria_IsProducedUnitUnlimboSeeded(selfObj)) {
+		Aeloria_SeedProducedAircraftOnUnlimbo(const_cast<AircraftClass*>(this));
+		int typeEnum = (int)aircraft_type->Type;
+		uintptr_t stabKey = reinterpret_cast<uintptr_t>(this);
+		auto stabIt = g_AeloriaObjectStability.find(stabKey);
+		if (stabIt != g_AeloriaObjectStability.end()) {
+			typeEnum = (int)stabIt->second.cachedTypeEnum;
+		}
+		Aeloria_Debug_Log("PRODUCED_AIRCRAFT_DRAW_EMERGENCY_SEED this=%p owner=%d frame=%u type_enum=%d",
+		                  (void*)this, (int)Owner(), Frame, typeEnum);
+	}
+
 	int drawW = 48;
 	int drawH = 48;
 	aircraft_type->Dimensions(drawW, drawH);
@@ -473,43 +551,132 @@ void AircraftClass::Draw_It(int x, int y, WindowNumberType window) const
 
 	uintptr_t at_plus_8 = *(uintptr_t*)((const char*)this + 8);
 	const bool bad_plus_8 = !Is_Plausible_Class_Pointer(at_plus_8);
-	const ObjectClass* selfObj = static_cast<const ObjectClass*>(this);
 	const bool producedTracked = Aeloria_IsProducedUnitUnlimboSeeded(selfObj);
-	const bool eternalProduced = Aeloria_IsEternalSafeProducedUnit(selfObj);
-	const bool producedBadPlus8 = eternalProduced
-	                              || Aeloria_IsProducedBadPlus8Unit(selfObj)
-	                              || producedTracked
+	bool producedAircraftBulkHandoff = false;
+	if (producedTracked) {
+		uintptr_t stabKey = reinterpret_cast<uintptr_t>(this);
+		auto stabIt = g_AeloriaObjectStability.find(stabKey);
+		if (stabIt != g_AeloriaObjectStability.end()) {
+			if (!stabIt->second.sustainRetired) {
+				producedAircraftBulkHandoff = true;
+			}
+			// 5z-m4: stale Unlimbo BAD_PLUS8 with plausible runtime +8 kept helis on eternal guarded draw.
+			if (!bad_plus_8 && stabIt->second.producedUnitBadPlus8) {
+				stabIt->second.producedUnitBadPlus8 = false;
+				Aeloria_Debug_Log("PRODUCED_AIRCRAFT_BAD_PLUS8_CLEARED this=%p owner=%d frame=%u type_enum=%d (runtime +8 ok)",
+				                  (void*)this, (int)Owner(), Frame, (int)stabIt->second.cachedTypeEnum);
+			}
+		}
+	}
+	const bool producedBadPlus8 = Aeloria_IsProducedBadPlus8Unit(selfObj)
+	                              || Aeloria_IsEternalSafeProducedUnit(selfObj)
 	                              || (bad_plus_8 && producedTracked);
-	const bool needsMainGuard = Aeloria_IsEarlyStartingUnitMainGuarded(selfObj);
-	const int guardedFlag = (needsMainGuard || producedBadPlus8) ? 1 : 0;
+	bool needsMainGuard = Aeloria_IsEarlyStartingUnitMainGuarded(selfObj);
+	// 5z-m6: lite unlimbo sets earlySafeClientRegistered — must not force guarded intercept for
+	// produced aircraft with plausible +8 (13de5598 Mig crash: guarded=1 bad_plus_8=0).
+	if (needsMainGuard && producedTracked && !bad_plus_8 && !producedBadPlus8) {
+		needsMainGuard = false;
+	}
+	const bool mainCacheReady = producedTracked && Aeloria_HasValidMainDrawCache(selfObj);
+	bool producedAircraftAwaitingSustainHandoff = false;
+	if (producedTracked && mainCacheReady && !bad_plus_8 && !producedBadPlus8) {
+		uintptr_t handoffKey = reinterpret_cast<uintptr_t>(this);
+		auto handoffIt = g_AeloriaObjectStability.find(handoffKey);
+		if (handoffIt != g_AeloriaObjectStability.end() && !handoffIt->second.sustainRetired) {
+			producedAircraftAwaitingSustainHandoff = true;
+		}
+	}
+	// 5z-m5: bulk handoff guard only when +8 is suspect — first Mig with plausible +8 crashed in
+	// guarded DLL_Draw_Intercept (3b0ac4f6@48048); helis still use guard when producedBadPlus8 until cleared (m4).
+	const bool bulkHandoffNeedsGuard = producedAircraftBulkHandoff && !mainCacheReady
+	                                   && (bad_plus_8 || producedBadPlus8);
+	bool useGuardedIntercept = bad_plus_8 || producedBadPlus8 || needsMainGuard
+	                           || bulkHandoffNeedsGuard;
+	// 5z-m7: never guarded intercept for produced aircraft when runtime +8 is OK (Mig InstanceServer crash).
+	if (useGuardedIntercept && producedTracked && !bad_plus_8 && !producedBadPlus8) {
+		useGuardedIntercept = false;
+	}
+	const int guardedFlag = useGuardedIntercept ? 1 : 0;
 
-	if (window == WINDOW_VIRTUAL) {
+	if (window == WINDOW_VIRTUAL && useGuardedIntercept) {
 		Aeloria_LogProducedAircraftFirstDrawIfNeeded(this, window, guardedFlag, bad_plus_8 ? 1 : 0);
-		int virtualShape = 0;
-		if (producedTracked) {
-			virtualShape = 0;
-		} else if (producedBadPlus8 || needsMainGuard) {
-			virtualShape = Aeloria_GuardedAircraftShapeNumber(this);
+		int virtualShape = Aeloria_GuardedAircraftShapeNumber(this);
+		if (virtualShape <= 0) {
+			virtualShape = 16;
 		}
 		DLL_Draw_Intercept(virtualShape, x, y, drawW, drawH, AELORIA_CLIENT_DRAW_FLAGS_CENTER,
 		                   const_cast<AircraftClass*>(this), DIR_N, 0x100, nullptr, (char)Owner());
+		if (aircraft_type->IsRotorEquipped) {
+			int jitter = 0;
+			if (Height == FLIGHT_LEVEL && Get_Speed() < 3) {
+				static int _jitter[] = {0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, -1, -1, -1, 0};
+				jitter = _jitter[::Frame % 16];
+			}
+			const_cast<AircraftClass*>(this)->Draw_Rotors(x, y + jitter, window);
+		}
 		return;
 	}
 
-	if ((producedBadPlus8 || needsMainGuard)
-	    && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_PLAYER_CREATION)) {
-		Aeloria_Debug_Log("PRODUCED_AIRCRAFT_MAIN_GUARD this=%p owner=%d frame=%u (safe MAIN draw; corrupt +8 guard)",
-		                  (void*)this, (int)Owner(), Frame);
-	}
-	if (bad_plus_8 || producedBadPlus8 || needsMainGuard) {
-		Aeloria_LogProducedAircraftFirstDrawIfNeeded(this, window, guardedFlag, bad_plus_8 ? 1 : 0);
-		int shapenum = Aeloria_GuardedAircraftShapeNumber(this);
-		if (drawW > 0 && drawH > 0 && producedTracked) {
-			Aeloria_TryNotifyProducedUnitMainDrawCache(selfObj, shapenum, drawW, drawH, x, y, bad_plus_8);
+	if (window != WINDOW_VIRTUAL) {
+		if ((producedBadPlus8 || needsMainGuard)
+		    && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_PLAYER_CREATION)) {
+			Aeloria_Debug_Log("PRODUCED_AIRCRAFT_MAIN_GUARD this=%p owner=%d frame=%u (safe MAIN draw; corrupt +8 guard)",
+			                  (void*)this, (int)Owner(), Frame);
 		}
-		int interceptShape = producedTracked ? 0 : shapenum;
-		DLL_Draw_Intercept(interceptShape, x, y, drawW, drawH, AELORIA_CLIENT_DRAW_FLAGS_CENTER,
-		                   const_cast<AircraftClass*>(this), DIR_N, 0x100, nullptr, (char)Owner());
+		if (useGuardedIntercept) {
+			Aeloria_LogProducedAircraftFirstDrawIfNeeded(this, window, guardedFlag, bad_plus_8 ? 1 : 0);
+			int shapenum = Aeloria_GuardedAircraftShapeNumber(this);
+			if (shapenum <= 0) {
+				shapenum = 16;
+			}
+			if (drawW > 0 && drawH > 0 && producedTracked) {
+				int bulkX = x;
+				int bulkY = y;
+				Aeloria_ProducedAircraftBulkDrawCoords(this, x, y, bulkX, bulkY);
+				Aeloria_TryNotifyProducedUnitMainDrawCache(selfObj, shapenum, drawW, drawH, bulkX, bulkY, bad_plus_8);
+			}
+			// 5z-m14: MAIN guarded — cache only (client + rotors on VIRTUAL block above).
+			return;
+		}
+	}
+
+	if (producedTracked) {
+		Aeloria_LogProducedAircraftFirstDrawIfNeeded(this, window, 0, bad_plus_8 ? 1 : 0);
+	}
+
+	// 5z-m8/m12: seed MAIN cache without legacy blitter; VIRTUAL waits until cache exists.
+	if (producedTracked && !mainCacheReady && !useGuardedIntercept) {
+		if (window != WINDOW_VIRTUAL) {
+			int liteShape = Aeloria_GuardedAircraftShapeNumber(this);
+			if (liteShape <= 0) {
+				liteShape = 16;
+			}
+			Aeloria_Debug_Log("PRODUCED_AIRCRAFT_LITE_MAIN_SEED this=%p owner=%d frame=%u shape=%d (defer legacy MAIN draw)",
+			                  (void*)this, (int)Owner(), Frame, liteShape);
+			if (drawW > 0 && drawH > 0) {
+				int bulkX = x;
+				int bulkY = y;
+				Aeloria_ProducedAircraftBulkDrawCoords(this, x, y, bulkX, bulkY);
+				Aeloria_TryNotifyProducedUnitMainDrawCache(selfObj, liteShape, drawW, drawH, bulkX, bulkY, bad_plus_8);
+			}
+		}
+		return;
+	}
+
+	// 5z-m10/m12: safe client path until sustain handoff — intercept on VIRTUAL only; MAIN updates cache.
+	if (producedAircraftAwaitingSustainHandoff && !useGuardedIntercept) {
+		if (window != WINDOW_VIRTUAL) {
+			int facingShape = Aeloria_GuardedAircraftShapeNumber(this);
+			if (drawW > 0 && drawH > 0) {
+				int cacheShape = (facingShape > 0) ? facingShape : 16;
+				int bulkX = x;
+				int bulkY = y;
+				Aeloria_ProducedAircraftBulkDrawCoords(this, x, y, bulkX, bulkY);
+				Aeloria_TryNotifyProducedUnitMainDrawCache(selfObj, cacheShape, drawW, drawH, bulkX, bulkY, bad_plus_8);
+			}
+			return;
+		}
+		Aeloria_ProducedAircraftEmitClientDraw(this, x, y, window, drawW, drawH, aircraft_type);
 		return;
 	}
 
@@ -587,6 +754,9 @@ void AircraftClass::Draw_It(int x, int y, WindowNumberType window) const
 			Aeloria_Debug_Log("Aircraft about to call Techno_Draw_Object this=%p Class.Raw=%ld", (void*)this, Class.Raw());
 		}
 		Techno_Draw_Object(shapefile, shapenum, x, y+jitter, window, rotation);
+		if (producedTracked && drawW > 0 && drawH > 0) {
+			Aeloria_TryNotifyProducedUnitMainDrawCache(selfObj, shapenum, drawW, drawH, x, y + jitter, bad_plus_8);
+		}
 	}
 
 	/*
@@ -3764,6 +3934,7 @@ DirType AircraftClass::Fire_Direction(void) const
 AircraftClass::~AircraftClass(void)
 {
 	if (GameActive && Class) {
+		Aeloria_ClearObjectTracking(this);
 
 		/*
 		**	Remove this member from any team it may be associated with. This must occur at the

@@ -1467,36 +1467,7 @@ bool TechnoClass::Unlimbo(COORDINATE coord, DirType dir)
 					}
 				}
 			} else if (producedAircraft) {
-				uintptr_t key = reinterpret_cast<uintptr_t>(this);
-				auto& stab = g_AeloriaObjectStability[key];
-				// Spy plane / helipad pool-reuse: same eternal-safe flags as WF vehicles (5z-n9).
-				stab.producedUnitUnlimboSeeded = true;
-				stab.producedUnitFirstDrawMask = 0;
-				stab.producedUnitBadPlus8 = true;
-				uintptr_t at_plus_8 = *(uintptr_t*)((const char*)this + 8);
-				if (Is_Plausible_Class_Pointer(at_plus_8)) {
-					Aeloria_Debug_Log("PRODUCED_AIRCRAFT_PLAUSIBLE_PLUS8 this=%p owner=%d type_enum=%d frame=%u (eternal safe draw anyway)",
-					                  (void*)this, (int)Owner(), (int)stab.cachedTypeEnum, Frame);
-				}
-				if (!stab.earlySafeClientRegistered) {
-					char overrideOwner = (char)Owner();
-					if (overrideOwner != HOUSE_NONE) {
-						int drawW = 48;
-						int drawH = 48;
-						AircraftTypeClass const* atype = static_cast<AircraftTypeClass const*>(Aeloria_Safe_Techno_Type(this));
-						if (atype) {
-							atype->Dimensions(drawW, drawH);
-						}
-						if (drawW <= 0) drawW = 48;
-						if (drawH <= 0) drawH = 48;
-						DLL_Draw_Intercept(0, 0, 0, drawW, drawH, 0, this, DIR_N, 0x100, nullptr, overrideOwner);
-						stab.earlySafeClientRegistered = true;
-						stab.clientListInserted = false;
-						stab.sustainRetired = false;
-						Aeloria_Debug_Log("PRODUCED_AIRCRAFT_UNLIMBO_SEED this=%p owner=%d type_enum=%d w=%d h=%d frame=%u",
-						                  (void*)this, (int)Owner(), (int)stab.cachedTypeEnum, drawW, drawH, Frame);
-					}
-				}
+				Aeloria_SeedProducedAircraftOnUnlimbo(this);
 			} else if (producedVessel) {
 				uintptr_t key = reinterpret_cast<uintptr_t>(this);
 				auto& stab = g_AeloriaObjectStability[key];
@@ -4450,9 +4421,18 @@ void TechnoClass::Record_The_Kill(TechnoClass * source)
 {
 	assert(IsActive);
 
+	if (!House.Is_Valid()) {
+		return;
+	}
+
+	TechnoTypeClass const* victimType = Aeloria_Safe_Techno_Type(this);
+	if (!victimType) {
+		return;
+	}
+
 	int total_recorded = 0;
 
-	int points = Techno_Type_Class()->Points;
+	int points = victimType->Points;
 
 	/*
 	**	Handle any trigger event associated with this object.
@@ -4463,7 +4443,7 @@ void TechnoClass::Record_The_Kill(TechnoClass * source)
 
 	if (Trigger.Is_Valid()) Trigger->Spring(TEVENT_DESTROYED, this);
 
-	if (source != NULL) {
+	if (source != NULL && source->House.Is_Valid()) {
 		Crew.Made_A_Kill();
 
 		House->WhoLastHurtMe = source->Owner();
@@ -4490,9 +4470,12 @@ void TechnoClass::Record_The_Kill(TechnoClass * source)
 						House->BuildingsLost++;
 					}
 
-					if (source != NULL) {
+					if (source != NULL && source->House.Is_Valid() && Owner() != HOUSE_NONE) {
 						if (Session.Type == GAME_INTERNET) {
-							source->House->DestroyedBuildings->Increment_Unit_Total( ((BuildingClass*)this)->Class->Type );
+							BuildingTypeClass const* btype = static_cast<BuildingTypeClass const*>(victimType);
+							if (btype) {
+								source->House->DestroyedBuildings->Increment_Unit_Total(btype->Type);
+							}
 						}
 						source->House->BuildingsKilled[Owner()]++;
 					}
@@ -4509,30 +4492,44 @@ void TechnoClass::Record_The_Kill(TechnoClass * source)
 			break;
 
 		case RTTI_AIRCRAFT:
-			if (source != NULL && Session.Type == GAME_INTERNET) {
-				source->House->DestroyedAircraft->Increment_Unit_Total( ((AircraftClass*)this)->Class->Type );
+			if (source != NULL && source->House.Is_Valid() && Session.Type == GAME_INTERNET) {
+				AircraftTypeClass const* atype = static_cast<AircraftTypeClass const*>(victimType);
+				if (atype) {
+					source->House->DestroyedAircraft->Increment_Unit_Total(atype->Type);
+				}
 				total_recorded++;
 			}
 			//Fall through.....
 		case RTTI_INFANTRY:
-			if (source != NULL && !total_recorded && Session.Type == GAME_INTERNET) {
-				source->House->DestroyedInfantry->Increment_Unit_Total( ((InfantryClass*)this)->Class->Type );
+			if (source != NULL && source->House.Is_Valid() && !total_recorded && Session.Type == GAME_INTERNET) {
+				InfantryTypeClass const* itype = static_cast<InfantryTypeClass const*>(victimType);
+				if (itype) {
+					source->House->DestroyedInfantry->Increment_Unit_Total(itype->Type);
+				}
 				total_recorded++;
 			}
 			//Fall through.....
 		case RTTI_UNIT:
-			if (source != NULL && !total_recorded && Session.Type == GAME_INTERNET) {
-				source->House->DestroyedUnits->Increment_Unit_Total( ((UnitClass*)this)->Class->Type );
+			if (source != NULL && source->House.Is_Valid() && !total_recorded && Session.Type == GAME_INTERNET) {
+				UnitTypeClass const* utype = static_cast<UnitTypeClass const*>(victimType);
+				if (utype) {
+					source->House->DestroyedUnits->Increment_Unit_Total(utype->Type);
+				}
 				total_recorded++;
 			}
 			//Fall through.....
 		case RTTI_VESSEL:
-			if (source != NULL && !total_recorded && Session.Type == GAME_INTERNET) {
-				source->House->DestroyedUnits->Increment_Unit_Total( ((VesselClass*)this)->Class->Type );
+			if (source != NULL && source->House.Is_Valid() && !total_recorded && Session.Type == GAME_INTERNET) {
+				VesselTypeClass const* vtype = static_cast<VesselTypeClass const*>(victimType);
+				if (vtype) {
+					source->House->DestroyedUnits->Increment_Unit_Total(vtype->Type);
+				}
 			}
 
 			House->UnitsLost++;
-			if (source != NULL) source->House->UnitsKilled[Owner()]++;
+			if (source != NULL && source->House.Is_Valid() && Owner() != HOUSE_NONE) {
+				source->House->UnitsKilled[Owner()]++;
+			}
 
 			/*
 			** If the map is displaying the multiplayer player names & their

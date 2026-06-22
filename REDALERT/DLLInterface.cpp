@@ -714,6 +714,16 @@ static bool Aeloria_IsCriticalLogMessage(const char *fmt)
 		"UNIT_VIRTUAL_GUARD",
 		"PRODUCED_UNIT_FIRST_DRAW",
 		"PRODUCED_UNIT_MAIN_CACHE",
+		"PRODUCED_AIRCRAFT_MAIN_CACHE",
+		"PRODUCED_AIRCRAFT_UNLIMBO_LITE_SEED",
+		"PRODUCED_AIRCRAFT_FIRST_DRAW",
+		"PRODUCED_AIRCRAFT_MAIN_GUARD",
+		"PRODUCED_AIRCRAFT_BAD_PLUS8",
+		"PRODUCED_AIRCRAFT_BAD_PLUS8_CLEARED",
+		"PRODUCED_AIRCRAFT_INTERCEPT_DEFER",
+		"PRODUCED_AIRCRAFT_LITE_MAIN_SEED",
+		"PRODUCED_AIRCRAFT_RESET",
+		"PRODUCED_AIRCRAFT_DRAW_EMERGENCY_SEED",
 		"PRODUCED_UNIT_MAIN_GUARD",
 		"HARVESTER_MAIN_GUARD",
 		"GET_LAYER_BULK_HASCREATION_INSERT",
@@ -721,6 +731,7 @@ static bool Aeloria_IsCriticalLogMessage(const char *fmt)
 		"INFANTRY_DEATH_DRAW",
 		"PRODUCED_INFANTRY_CORRUPT_TRACK",
 		"CONSTRUCTION_SEED",
+		"BUILDING_STAB_REFRESH",
 		"GRAND_OPENING",
 		"HARVESTER_",
 		"TRACKING_CLEARED",
@@ -1075,6 +1086,62 @@ void Aeloria_Repair_Early_Class_Pointer(TechnoClass* techno)
 	}
 }
 
+void Aeloria_RefreshBuildingStabilityOnSeed(BuildingClass* building, bool humanDeployed)
+{
+	if (!building) {
+		return;
+	}
+
+	Aeloria_Repair_Early_Class_Pointer(building);
+
+	uintptr_t key = reinterpret_cast<uintptr_t>(building);
+	auto& stab = g_AeloriaObjectStability[key];
+
+	stab.rtti = (uint8_t)RTTI_BUILDING;
+	stab.stabilityLevel = 0;
+	stab.successfulRealDraws = 0;
+	stab.fallbackUses = 0;
+	stab.earlySafeClientRegistered = true;
+	stab.clientListInserted = false;
+	stab.sustainRetired = false;
+	stab.sustainNormalHits = 0;
+
+	stab.producedUnitUnlimboSeeded = false;
+	stab.producedUnitBadPlus8 = false;
+	stab.producedUnitFirstDrawMask = 0;
+
+	stab.hasCachedMainDraw = false;
+	stab.hasCachedDraw = false;
+	stab.cachedShapeNumber = 0;
+	stab.cachedDrawFlags = 0;
+	stab.cachedRotation = 0;
+	stab.cachedScale = 0x100;
+	stab.cachedDrawX = 0;
+	stab.cachedDrawY = 0;
+	stab.cachedWidth = 0;
+	stab.cachedHeight = 0;
+	stab.cachedAssetName[0] = '\0';
+
+	int16_t typeEnum = -1;
+	if (building->Class.Is_Valid()) {
+		BuildingTypeClass const* t = building->Class;
+		if (t && t->RTTI == RTTI_BUILDINGTYPE) {
+			typeEnum = (int16_t)t->Type;
+		}
+	}
+	if (typeEnum < 0 && building->Class.Raw() >= 0) {
+		BuildingTypeClass const* viaRaw = BuildingTypes.Ptr(building->Class.Raw());
+		if (viaRaw && viaRaw->RTTI == RTTI_BUILDINGTYPE) {
+			typeEnum = (int16_t)viaRaw->Type;
+		}
+	}
+	stab.cachedTypeEnum = typeEnum;
+
+	Aeloria_Debug_Log("BUILDING_STAB_REFRESH this=%p owner=%d type_enum=%d human=%d frame=%u",
+	                  (void*)building, (int)building->Owner(), (int)stab.cachedTypeEnum,
+	                  humanDeployed ? 1 : 0, Frame);
+}
+
 void Aeloria_Seed_Building_Creation(BuildingClass* building)
 {
 	if (!building || !building->IsActive) {
@@ -1096,27 +1163,13 @@ void Aeloria_Seed_Building_Creation(BuildingClass* building)
 		g_AeloriaObjectCreationFrame.erase(key);
 	}
 
-	auto& stab = g_AeloriaObjectStability[key];
-	if (stab.rtti == 0) {
-		stab.rtti = (uint8_t)RTTI_BUILDING;
-	}
-	if (stab.cachedTypeEnum < 0 && building->Class.Raw() >= 0) {
-		BuildingTypeClass const* viaRaw = BuildingTypes.Ptr(building->Class.Raw());
-		if (viaRaw && viaRaw->RTTI == RTTI_BUILDINGTYPE) {
-			stab.cachedTypeEnum = (int16_t)viaRaw->Type;
-		}
-	}
-	if (stab.cachedTypeEnum < 0 && building->Class.Is_Valid()) {
-		BuildingTypeClass const* t = building->Class;
-		if (t && t->RTTI == RTTI_BUILDINGTYPE) {
-			stab.cachedTypeEnum = (int16_t)t->Type;
-		}
-	}
-	stab.earlySafeClientRegistered = true;
+	Aeloria_RefreshBuildingStabilityOnSeed(building, humanDeployed);
 
 	if (Aeloria_ShouldLogOncePerObject(building, AEL_LOG_PLAYER_CREATION)) {
+		auto it = g_AeloriaObjectStability.find(key);
+		int type_enum = (it != g_AeloriaObjectStability.end()) ? (int)it->second.cachedTypeEnum : -1;
 		Aeloria_Debug_Log("CONSTRUCTION_SEED this=%p owner=%d type_enum=%d raw=%d frame=%u",
-		                  (void*)building, (int)building->Owner(), (int)stab.cachedTypeEnum, building->Class.Raw(), Frame);
+		                  (void*)building, (int)building->Owner(), type_enum, building->Class.Raw(), Frame);
 	}
 }
 
@@ -1181,7 +1234,7 @@ void Aeloria_RelocateHarvesterStability(UnitClass* unit)
 	}
 }
 
-static int Aeloria_PeekTechnoTypeEnum(TechnoClass const* techno)
+int Aeloria_PeekTechnoTypeEnum(TechnoClass const* techno)
 {
 	if (!techno) return -1;
 	switch (techno->What_Am_I()) {
@@ -1203,6 +1256,23 @@ static int Aeloria_PeekTechnoTypeEnum(TechnoClass const* techno)
 	case RTTI_VESSEL: {
 		VesselClass const* vessel = static_cast<VesselClass const*>(techno);
 		if (vessel->Class.Raw() >= 0) return vessel->Class.Raw();
+		break;
+	}
+	case RTTI_BUILDING: {
+		BuildingClass const* building = static_cast<BuildingClass const*>(techno);
+		Aeloria_Repair_Early_Class_Pointer(const_cast<BuildingClass*>(building));
+		if (building->Class.Is_Valid()) {
+			BuildingTypeClass const* t = building->Class;
+			if (t && t->RTTI == RTTI_BUILDINGTYPE) {
+				return (int)t->Type;
+			}
+		}
+		if (building->Class.Raw() >= 0) {
+			BuildingTypeClass const* viaRaw = BuildingTypes.Ptr(building->Class.Raw());
+			if (viaRaw && viaRaw->RTTI == RTTI_BUILDINGTYPE) {
+				return (int)viaRaw->Type;
+			}
+		}
 		break;
 	}
 	default:
@@ -1436,8 +1506,19 @@ void Aeloria_ResetProducedTechnoTracking(TechnoClass* techno)
 			stab.cachedWidth = 0;
 			stab.cachedHeight = 0;
 			stab.cachedAssetName[0] = '\0';
-			// Keep WF eternal-safe flags across same-type pool recycle until Unlimbo re-seeds (5z-n8c).
 			stab.producedUnitFirstDrawMask = 0;
+			// 5z-m9 B2: aircraft must re-lite-seed every spawn; stale client flags skipped UNLIMBO_LITE (c518414c).
+			if (currentRtti == RTTI_AIRCRAFT) {
+				bool hadStaleClient = stab.earlySafeClientRegistered || stab.producedUnitUnlimboSeeded;
+				stab.earlySafeClientRegistered = false;
+				stab.producedUnitUnlimboSeeded = false;
+				stab.producedUnitBadPlus8 = false;
+				if (hadStaleClient) {
+					Aeloria_Debug_Log("PRODUCED_AIRCRAFT_RESET this=%p owner=%d type_enum=%d frame=%u (same-slot recycle)",
+					                  (void*)techno, (int)techno->Owner(), (int)stab.cachedTypeEnum, Frame);
+				}
+			}
+			// Non-aircraft: keep WF eternal-safe flags across same-type pool recycle until Unlimbo re-seeds (5z-n8c).
 		}
 		g_AeloriaObjectLogMask.erase(key);
 		return;
@@ -1450,6 +1531,78 @@ void Aeloria_ResetProducedTechnoTracking(TechnoClass* techno)
 	Aeloria_Debug_Log("PRODUCED_POOL_REUSE_RESET this=%p prior_rtti=%u prior_type=%d new_rtti=%d new_type=%d owner=%d prior_creation=%u frame=%u",
 	                  (void*)techno, (unsigned)priorRtti, priorType, (int)currentRtti, currentType,
 	                  (int)techno->Owner(), priorCreationFrame, Frame);
+}
+
+// 5z-m9 B1: Idempotent produced-aircraft lite unlimbo seed (always logs; safe after long-session pool reuse).
+void Aeloria_SeedProducedAircraftOnUnlimbo(TechnoClass* techno)
+{
+	if (!techno || techno->What_Am_I() != RTTI_AIRCRAFT) {
+		return;
+	}
+
+	uintptr_t key = reinterpret_cast<uintptr_t>(techno);
+	const bool hadCreation = (g_AeloriaObjectCreationFrame.find(key) != g_AeloriaObjectCreationFrame.end());
+	const int reseed = hadCreation ? 1 : 0;
+
+	g_AeloriaObjectCreationFrame[key] = Frame;
+
+	auto& stab = g_AeloriaObjectStability[key];
+	if (stab.rtti == 0) {
+		stab.rtti = (uint8_t)RTTI_AIRCRAFT;
+	}
+
+	Aeloria_Repair_Early_Class_Pointer(techno);
+	TechnoTypeClass const* safe = Aeloria_Safe_Techno_Type(techno);
+	if (safe) {
+		stab.cachedTypeEnum = (int16_t)static_cast<AircraftTypeClass const*>(safe)->Type;
+	}
+
+	stab.clientListInserted = false;
+	stab.sustainRetired = false;
+	stab.sustainNormalHits = 0;
+	stab.hasCachedMainDraw = false;
+	stab.hasCachedDraw = false;
+	stab.cachedShapeNumber = 0;
+	stab.cachedDrawFlags = 0;
+	stab.cachedRotation = 0;
+	stab.cachedScale = 0x100;
+	stab.cachedDrawX = 0;
+	stab.cachedDrawY = 0;
+	stab.cachedWidth = 0;
+	stab.cachedHeight = 0;
+	stab.cachedAssetName[0] = '\0';
+
+	stab.producedUnitUnlimboSeeded = true;
+	stab.producedUnitFirstDrawMask = 0;
+	uintptr_t at_plus_8 = *(uintptr_t*)((const char*)techno + 8);
+	stab.producedUnitBadPlus8 = !Is_Plausible_Class_Pointer(at_plus_8);
+	if (stab.producedUnitBadPlus8) {
+		Aeloria_Debug_Log("PRODUCED_AIRCRAFT_BAD_PLUS8 this=%p owner=%d type_enum=%d frame=%u (eternal safe draw)",
+		                  (void*)techno, (int)techno->Owner(), (int)stab.cachedTypeEnum, Frame);
+	}
+
+	// 5z-m2/m7: no DLL_Draw_Intercept from Unlimbo; earlySafeClientRegistered only when +8 corrupt.
+	stab.earlySafeClientRegistered = stab.producedUnitBadPlus8;
+
+	char overrideOwner = (char)techno->Owner();
+	if (overrideOwner != HOUSE_NONE) {
+		int drawW = 48;
+		int drawH = 48;
+		AircraftTypeClass const* atype = static_cast<AircraftTypeClass const*>(safe);
+		if (atype) {
+			atype->Dimensions(drawW, drawH);
+		}
+		if (drawW <= 0) drawW = 48;
+		if (drawH <= 0) drawH = 48;
+		Aeloria_Debug_Log("PRODUCED_AIRCRAFT_UNLIMBO_LITE_SEED this=%p owner=%d type_enum=%d w=%d h=%d frame=%u reseed=%d (defer intercept to draw/bulk)",
+		                  (void*)techno, (int)overrideOwner, (int)stab.cachedTypeEnum, drawW, drawH, Frame, reseed);
+	}
+
+	const bool isPlayer = (g_HumanPlayerHouse != HOUSE_NONE && techno->Owner() == g_HumanPlayerHouse);
+	if (isPlayer || Aeloria_ShouldLogOncePerObject(techno, AEL_LOG_PLAYER_CREATION)) {
+		Aeloria_Debug_Log("PLAYER_OBJECT_CREATED this=%p RTTI=%d owner=%d type_enum=%d frame=%u early=0",
+		                  (void*)techno, (int)RTTI_AIRCRAFT, (int)techno->Owner(), (int)stab.cachedTypeEnum, Frame);
+	}
 }
 
 bool Aeloria_IsStatelessUntrackedTechno(const ObjectClass* obj)
@@ -1670,6 +1823,11 @@ static bool Aeloria_ShouldRetainTrackingAfterWindowExpire(uintptr_t key)
 
 	auto stabIt = g_AeloriaObjectStability.find(key);
 	if (stabIt != g_AeloriaObjectStability.end()) {
+		if (stabIt->second.producedUnitUnlimboSeeded
+		    && obj->What_Am_I() == RTTI_AIRCRAFT
+		    && !stabIt->second.sustainRetired) {
+			return true;
+		}
 		if (stabIt->second.earlySafeClientRegistered && !Aeloria_HasValidMainDrawCache(obj)) {
 			return true;
 		}
@@ -3740,6 +3898,7 @@ void DLLExportClass::Init(void)
 **************************************************************************************************/
 void DLLExportClass::Shutdown(void)
 {
+	Aeloria_Debug_Log("AELORIA_SESSION_END reason=shutdown frame=%u", Frame);
 	delete SpecialBackup;
 	SpecialBackup = NULL;
 
@@ -4957,6 +5116,23 @@ void DLLExportClass::DLL_Draw_Intercept(int shape_number, int x, int y, int widt
 		}
 	}
 
+	// 5z-m7/m11: defer root intercept only until MAIN draw cache exists (pre-cache InstanceServer risk).
+	// After cache, allow intercept so LAYERS export populates the client (m10 replay was invisible: defer + sustain gated off).
+	if (base_object == NULL && object && object->What_Am_I() == RTTI_AIRCRAFT) {
+		auto acIt = g_AeloriaObjectStability.find(key);
+		if (acIt != g_AeloriaObjectStability.end()
+		    && acIt->second.producedUnitUnlimboSeeded
+		    && !acIt->second.producedUnitBadPlus8
+		    && !Aeloria_HasValidMainDrawCache(object)) {
+			uintptr_t at8 = *(uintptr_t*)((const char*)object + 8);
+			if (Is_Plausible_Class_Pointer(at8)) {
+				Aeloria_Debug_Log("PRODUCED_AIRCRAFT_INTERCEPT_DEFER this=%p owner=%d frame=%u (defer to bulk after MAIN cache)",
+				                  (void*)object, (int)object->Owner(), Frame);
+				return;
+			}
+		}
+	}
+
 	new_object.CNCInternalObjectPointer = (void*)object;
 	new_object.OccupyListLength = 0;
 	if (CurrentDrawCount == 0) {
@@ -5391,20 +5567,29 @@ void Aeloria_GraduateTrackedObject(const ObjectClass* obj)
 	}
 	g_AeloriaObjectCreationFrame.erase(key);
 
-	stab.sustainRetired = true;
+	bool scenarioStart = (creationFrame <= 10);
+	RTTIType rtti = obj->What_Am_I();
+	// 5z-m bulk: produced aircraft graduate to normal MAIN draw but retain stab until sustain handoff.
+	const bool aircraftBulkRetain = (!scenarioStart && rtti == RTTI_AIRCRAFT
+	                                 && !Aeloria_IsProducedBadPlus8Unit(obj));
+
 	stab.stabilityLevel = 2;
+	if (!aircraftBulkRetain) {
+		stab.sustainRetired = true;
+	}
 
 	// Phase 4/5e/5g: drop mid-game produced techno from tracking maps once MAIN draw is safe.
 	// Retain stability until hasCachedMainDraw — virtual-only cache is not enough (1145 session).
-	bool scenarioStart = (creationFrame <= 10);
 	if (!scenarioStart && !Aeloria_IsHumanDeployedBuilding(obj) && !Aeloria_IsRepurposedHarvester(obj)
 	    && !Aeloria_IsProducedBadPlus8Unit(obj) && !Aeloria_IsEternalSafeProducedUnit(obj)) {
-		RTTIType rtti = obj->What_Am_I();
 		if ((rtti == RTTI_INFANTRY || rtti == RTTI_UNIT || rtti == RTTI_AIRCRAFT)
 		    && !Aeloria_HasValidMainDrawCache(obj)) {
 			g_AeloriaObjectLogMask.erase(key);
 			Aeloria_Debug_Log("PRODUCED_TECHNO_GRADUATE_DEFER this=%p owner=%d rtti=%d type_enum=%d frame=%u (retain stab until MAIN cache)",
 			                  (void*)obj, (int)obj->Owner(), (int)rtti, (int)stab.cachedTypeEnum, Frame);
+			return;
+		}
+		if (aircraftBulkRetain) {
 			return;
 		}
 		g_AeloriaObjectStability.erase(key);
@@ -5430,8 +5615,9 @@ bool Aeloria_TryNotifyProducedUnitMainDrawCache(const ObjectClass* obj, int shap
 	bool firstCache = !it->second.hasCachedMainDraw;
 	Aeloria_NotifyMainDrawCache(obj, cacheShape, width, height, draw_x, draw_y);
 	if (firstCache) {
-		Aeloria_Debug_Log("PRODUCED_UNIT_MAIN_CACHE this=%p owner=%d shape=%d pos=(%d,%d) frame=%u",
-		                  (void*)obj, (int)obj->Owner(), cacheShape, draw_x, draw_y, Frame);
+		const char* tag = (obj->What_Am_I() == RTTI_AIRCRAFT) ? "PRODUCED_AIRCRAFT_MAIN_CACHE" : "PRODUCED_UNIT_MAIN_CACHE";
+		Aeloria_Debug_Log("%s this=%p owner=%d shape=%d pos=(%d,%d) frame=%u",
+		                  tag, (void*)obj, (int)obj->Owner(), cacheShape, draw_x, draw_y, Frame);
 	}
 	return true;
 }
@@ -5453,6 +5639,16 @@ void Aeloria_NotifyMainDrawCache(const ObjectClass* obj, int shape_number, int w
 	if (draw_x >= 0 && draw_y >= 0) {
 		stab.cachedDrawX = draw_x;
 		stab.cachedDrawY = draw_y;
+	} else if (obj->What_Am_I() == RTTI_AIRCRAFT) {
+		int px = 0;
+		int py = 0;
+		if (Map.Coord_To_Pixel(obj->Render_Coord(), px, py) && px >= 0 && py >= 0) {
+			stab.cachedDrawX = px;
+			stab.cachedDrawY = py;
+		} else if (Map.Coord_To_Pixel(obj->Center_Coord(), px, py) && px >= 0 && py >= 0) {
+			stab.cachedDrawX = px;
+			stab.cachedDrawY = py;
+		}
 	}
 	stab.lastGoodFrame = Frame;
 	Aeloria_GraduateTrackedObject(obj);
@@ -5476,10 +5672,16 @@ static void Aeloria_CopyEarlyDefaultAssetName(char* dest, int destLen, RTTIType 
 			strncpy(dest, ref.Graphic_Name(), destLen);
 			return;
 		}
+		if (rtti == RTTI_AIRCRAFT) {
+			const AircraftTypeClass& ref = AircraftTypeClass::As_Reference((AircraftType)stab->cachedTypeEnum);
+			strncpy(dest, ref.Graphic_Name(), destLen);
+			return;
+		}
 	}
 	if (rtti == RTTI_INFANTRY) strncpy(dest, "E1", destLen);
 	else if (rtti == RTTI_UNIT) strncpy(dest, "JEEP", destLen);
 	else if (rtti == RTTI_BUILDING) strncpy(dest, "FTUR", destLen);
+	else if (rtti == RTTI_AIRCRAFT) strncpy(dest, "MIG", destLen);
 	else strncpy(dest, "ICON", destLen);
 }
 
@@ -5618,6 +5820,7 @@ static void Aeloria_PopulateEarlyBulkSlot(CNCObjectStruct& slot, const ObjectCla
 	RTTIType rtti = obj->What_Am_I();
 	if (rtti == RTTI_INFANTRY) { slot.Type = INFANTRY; slot.ID = Infantry.ID((InfantryClass*)obj); }
 	else if (rtti == RTTI_UNIT) { slot.Type = UNIT; slot.ID = Units.ID((UnitClass*)obj); }
+	else if (rtti == RTTI_AIRCRAFT) { slot.Type = AIRCRAFT; slot.ID = Aircraft.ID((AircraftClass*)obj); }
 	else if (rtti == RTTI_BUILDING) { slot.Type = BUILDING; slot.ID = Buildings.ID((BuildingClass*)obj); }
 
 	slot.Owner = (char)obj->Owner();
@@ -5643,10 +5846,10 @@ static void Aeloria_PopulateEarlyBulkSlot(CNCObjectStruct& slot, const ObjectCla
 	slot.PositionY = py;
 
 	short realStr = 0;
-	if (rtti == RTTI_INFANTRY || rtti == RTTI_UNIT || rtti == RTTI_BUILDING) {
+	if (rtti == RTTI_INFANTRY || rtti == RTTI_UNIT || rtti == RTTI_BUILDING || rtti == RTTI_AIRCRAFT) {
 		realStr = (short)((TechnoClass*)const_cast<ObjectClass*>(obj))->Strength;
 	}
-	slot.MaxStrength = (slot.Type == INFANTRY ? 50 : (slot.Type == UNIT ? 100 : 400));
+	slot.MaxStrength = (slot.Type == INFANTRY ? 50 : (slot.Type == UNIT ? 100 : (slot.Type == AIRCRAFT ? 100 : 400)));
 	slot.Strength = (realStr > 0 ? realStr : slot.MaxStrength);
 	if (slot.Strength > slot.MaxStrength) slot.Strength = slot.MaxStrength;
 	if (slot.Strength <= 0) slot.Strength = slot.MaxStrength;
@@ -5655,7 +5858,7 @@ static void Aeloria_PopulateEarlyBulkSlot(CNCObjectStruct& slot, const ObjectCla
 	strncpy(slot.TypeName, tn, CNC_OBJECT_ASSET_NAME_LENGTH);
 	Aeloria_CopyEarlyDefaultAssetName(slot.AssetName, CNC_OBJECT_ASSET_NAME_LENGTH, rtti, stab);
 
-	if (rtti == RTTI_UNIT || rtti == RTTI_INFANTRY || rtti == RTTI_BUILDING) {
+	if (rtti == RTTI_UNIT || rtti == RTTI_INFANTRY || rtti == RTTI_BUILDING || rtti == RTTI_AIRCRAFT) {
 		TechnoClass* tc = const_cast<TechnoClass*>(static_cast<TechnoClass const*>(obj));
 		Aeloria_Repair_Early_Class_Pointer(tc);
 		TechnoTypeClass const* ttype = Aeloria_Safe_Techno_Type(tc);
@@ -5745,6 +5948,13 @@ static void Aeloria_PopulateEarlyBulkSlot(CNCObjectStruct& slot, const ObjectCla
 	slot.CanHarvest = false;
 	slot.CanPlaceBombs = false;
 	slot.IsFixedWingedAircraft = false;
+	if (rtti == RTTI_AIRCRAFT) {
+		const AircraftClass* aircraft = static_cast<const AircraftClass*>(obj);
+		AircraftTypeClass const* atype = static_cast<AircraftTypeClass const*>(Aeloria_Safe_Techno_Type(aircraft));
+		if (atype) {
+			slot.IsFixedWingedAircraft = atype->IsFixedWing;
+		}
+	}
 	slot.IsInFormation = false;
 	slot.ProductionAssetName[0] = '\0';
 	slot.OverrideDisplayName = "\0";
@@ -5857,6 +6067,11 @@ static bool Aeloria_ObjectNeedsBulkOrSustain(const ObjectClass* obj, AeloriaObje
 	if (!stab.clientListInserted) return true;
 	if (stab.sustainRetired) return false;
 	if (Aeloria_HasValidMainDrawCache(obj)) {
+		// 5z-m11: produced aircraft still need sustain until handoff while intercept was deferred pre-cache.
+		if (obj->What_Am_I() == RTTI_AIRCRAFT && stab.producedUnitUnlimboSeeded
+		    && !Aeloria_IsProducedBadPlus8Unit(obj) && !stab.sustainRetired) {
+			return true;
+		}
 		Aeloria_GraduateTrackedObject(obj);
 		return false;
 	}
@@ -6126,6 +6341,13 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 
 			Aeloria_Debug_Log("GET_LAYER_BULK_HASCREATION_INSERT this=%p owner=%d rtti=%d idx=%d pos=(%d,%d) str=%d/%d (complementary bulk registration when client list is live - closes timing gap for north star)",
 			                  (void*)obj, (int)obj->Owner(), (int)rtti, proposedIdx, (int)slot.PositionX, (int)slot.PositionY, (int)slot.Strength, (int)slot.MaxStrength);
+			// 5z-m3: produced aircraft on client list — bias toward normal draw + rotors after first bulk.
+			if (rtti == RTTI_AIRCRAFT && stab.producedUnitUnlimboSeeded && Aeloria_HasValidMainDrawCache(obj)
+			    && !Aeloria_IsProducedBadPlus8Unit(obj)) {
+				if (stab.sustainNormalHits < 2) {
+					stab.sustainNormalHits = 2;
+				}
+			}
 		}
 
 		// Sustain pass (approved plan 2026-06-13): re-feed graduated early units every export until normal layer walk includes them.
@@ -6145,21 +6367,43 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 			// Produced war-factory units: defer sustain until MAIN draw caches coords (5z-n5).
 			if (stab.producedUnitUnlimboSeeded && !Aeloria_HasValidMainDrawCache(obj)) continue;
 
-			if (sustainCapReached || Aeloria_HasValidMainDrawCache(obj)) {
-				if (Aeloria_HasValidMainDrawCache(obj)) {
-					Aeloria_GraduateTrackedObject(obj);
-				} else {
+			const bool aircraftSustainHandoff = (obj->What_Am_I() == RTTI_AIRCRAFT
+			                                   && !Aeloria_IsProducedBadPlus8Unit(obj)
+			                                   && Aeloria_HasValidMainDrawCache(obj)
+			                                   && !stab.sustainRetired);
+
+			if (sustainCapReached) {
+				if (aircraftSustainHandoff && stab.sustainNormalHits >= 3) {
 					stab.sustainRetired = true;
-					g_AeloriaObjectCreationFrame.erase(k);
+					g_AeloriaObjectStability.erase(k);
+					g_AeloriaObjectLogMask.erase(k);
+				} else if (!aircraftSustainHandoff) {
+					if (Aeloria_HasValidMainDrawCache(obj)) {
+						Aeloria_GraduateTrackedObject(obj);
+					} else {
+						stab.sustainRetired = true;
+						g_AeloriaObjectCreationFrame.erase(k);
+					}
 				}
 				continue;
 			}
+
+			if (Aeloria_HasValidMainDrawCache(obj) && !aircraftSustainHandoff) {
+				Aeloria_GraduateTrackedObject(obj);
+				continue;
+			}
+
+			// aircraftSustainHandoff: no per-export Graduate — first real draw + bulk/sustain only.
 
 			// Normal layer walk got this object into the export this frame — hand off, no sustain duplicate.
 			if (normalTotal > 0 && Aeloria_ObjectAlreadyInExportList(ObjectList, normalTotal, obj)) {
 				if (stab.sustainNormalHits < 255) stab.sustainNormalHits++;
 				if (stab.sustainNormalHits >= 3) {
 					stab.sustainRetired = true;
+					if (obj->What_Am_I() == RTTI_AIRCRAFT && !Aeloria_IsProducedBadPlus8Unit(obj)) {
+						g_AeloriaObjectStability.erase(k);
+						g_AeloriaObjectLogMask.erase(k);
+					}
 				}
 				sustainSkippedNormal++;
 				continue;

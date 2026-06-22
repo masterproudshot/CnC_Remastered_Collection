@@ -417,6 +417,8 @@ enum AeloriaLogTag {
 	AEL_LOG_FIRST_FALLBACK  = 16,     // Item 1
 	AEL_LOG_INFANTRY_DEATH  = 17,     // Phase 5j: once per death-anim MAIN draw
 	AEL_LOG_ACCESSORY_DRAW  = 18,     // Phase 5z-l: once per accessory sub-draw (WEAP2, turrets)
+	AEL_LOG_PLACEHOLDER_ENTER = 19,   // Phase 5z-n9 PR4: once per DrawSafePlaceholder entry
+	AEL_LOG_PLACEHOLDER_MARKER = 20,  // Phase 5z-n9 PR4: once per yellow visibility marker log
 	// Room for more
 	AEL_LOG_MAX = 31
 };
@@ -491,6 +493,7 @@ void Aeloria_NotifyMainDrawCache(const ObjectClass* obj, int shape_number, int w
 bool Aeloria_TryNotifyProducedUnitMainDrawCache(const ObjectClass* obj, int shape_number, int width, int height,
                                                 int draw_x, int draw_y, bool runtime_bad_plus_8);
 void Aeloria_GraduateTrackedObject(const ObjectClass* obj);
+int Aeloria_PeekTechnoTypeEnum(TechnoClass const* techno);
 
 inline bool Aeloria_IsTrackedStartingUnit(const ObjectClass* obj)
 {
@@ -553,7 +556,8 @@ inline bool Aeloria_IsProducedBadPlus8Harvester(const ObjectClass* obj)
 	    && it->second.cachedTypeEnum == (int16_t)UNIT_HARVESTER;
 }
 
-// WF/shipyard-produced vehicles, aircraft, and vessels: eternal safe draw (5z-n8/n9/n10).
+// WF/shipyard-produced vehicles and vessels: eternal safe draw (5z-n8/n10).
+// Aircraft (5z-m10): safe intercept until sustainRetired; bad+8 eternal; legacy MAIN only after handoff.
 inline bool Aeloria_IsEternalSafeProducedUnit(const ObjectClass* obj)
 {
 	if (obj == nullptr) return false;
@@ -562,8 +566,13 @@ inline bool Aeloria_IsEternalSafeProducedUnit(const ObjectClass* obj)
 	if (Aeloria_IsRepurposedHarvester(obj)) return true;
 	uintptr_t key = reinterpret_cast<uintptr_t>(obj);
 	auto it = g_AeloriaObjectStability.find(key);
-	return it != g_AeloriaObjectStability.end()
-	    && it->second.producedUnitUnlimboSeeded;
+	if (it == g_AeloriaObjectStability.end() || !it->second.producedUnitUnlimboSeeded) {
+		return false;
+	}
+	if (rtti == RTTI_AIRCRAFT) {
+		return it->second.producedUnitBadPlus8;
+	}
+	return true;
 }
 
 // Human MCV/sidebar-placed buildings: type cached at Unlimbo, corrupt +8 persists for the whole match.
@@ -576,6 +585,22 @@ inline bool Aeloria_IsHumanDeployedBuilding(const ObjectClass* obj)
 	return it != g_AeloriaObjectStability.end() && it->second.cachedTypeEnum >= 0;
 }
 
+// Human-deployed building may use legacy MAIN blitter only after MAIN draw cache is valid and
+// stab.cachedTypeEnum still matches live building type (5z-n9 PR2).
+inline bool Aeloria_HasTrustedHumanBuildingMainCache(const ObjectClass* obj)
+{
+	if (!Aeloria_IsHumanDeployedBuilding(obj)) return false;
+	if (!Aeloria_HasValidMainDrawCache(obj)) return false;
+	uintptr_t key = reinterpret_cast<uintptr_t>(obj);
+	auto it = g_AeloriaObjectStability.find(key);
+	if (it == g_AeloriaObjectStability.end()) return false;
+	int cachedType = (int)it->second.cachedTypeEnum;
+	if (cachedType < 0) return false;
+	int currentType = Aeloria_PeekTechnoTypeEnum(reinterpret_cast<TechnoClass const*>(obj));
+	if (currentType < 0) return false;
+	return cachedType == currentType;
+}
+
 // Starting units seeded at Unlimbo must not hit the legacy MAIN blitter until a confirmed-safe
 // MAIN-window draw (shape>0) has been cached. Virtual cache alone is not enough.
 // Also covers earlySafeClientRegistered units that were prematurely graduated off the creation
@@ -583,12 +608,25 @@ inline bool Aeloria_IsHumanDeployedBuilding(const ObjectClass* obj)
 inline bool Aeloria_IsEarlyStartingUnitMainGuarded(const ObjectClass* obj)
 {
 	if (obj == nullptr) return false;
+	if (Aeloria_IsHumanDeployedBuilding(obj)) {
+		if (Aeloria_HasTrustedHumanBuildingMainCache(obj)) return false;
+		return true;
+	}
 	if (Aeloria_HasValidMainDrawCache(obj)) return false;
 	// Eternal-safe produced / repurposed units use the WF safe-client path, not starting-unit placeholder guard.
 	if (Aeloria_IsRepurposedHarvester(obj) || Aeloria_IsEternalSafeProducedUnit(obj)) return false;
-	if (Aeloria_IsHumanDeployedBuilding(obj)) return true;
 	uintptr_t key = reinterpret_cast<uintptr_t>(obj);
-	if (g_AeloriaObjectCreationFrame.find(key) != g_AeloriaObjectCreationFrame.end()) return true;
+	if (g_AeloriaObjectCreationFrame.find(key) != g_AeloriaObjectCreationFrame.end()) {
+		// 5z-m7: mid-game airfield/helipad aircraft with plausible +8 use normal draw + bulk, not intercept guard.
+		auto it = g_AeloriaObjectStability.find(key);
+		if (it != g_AeloriaObjectStability.end()
+		    && it->second.producedUnitUnlimboSeeded
+		    && obj->What_Am_I() == RTTI_AIRCRAFT
+		    && !it->second.producedUnitBadPlus8) {
+			return false;
+		}
+		return true;
+	}
 	auto it = g_AeloriaObjectStability.find(key);
 	return it != g_AeloriaObjectStability.end() && it->second.earlySafeClientRegistered;
 }
@@ -678,6 +716,7 @@ class TechnoTypeClass;
 TechnoTypeClass const* Aeloria_Safe_Techno_Type(TechnoClass const* techno);
 void Aeloria_Repair_Early_Class_Pointer(TechnoClass* techno);
 void Aeloria_Seed_Building_Creation(BuildingClass* building);
+void Aeloria_RefreshBuildingStabilityOnSeed(BuildingClass* building, bool humanDeployed);
 void Aeloria_Seed_Human_Building_Stability(BuildingClass* building);
 
 // 5z-l: Accessory layer (WEAP2 roof, tank/vessel turrets) on guarded safe-draw paths.
