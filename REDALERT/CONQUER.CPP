@@ -3449,6 +3449,33 @@ static void DrawSafePlayerPlaceholder(const ObjectClass* object,
                                       const char* shape_file_name = nullptr,
                                       char override_owner = HOUSE_NONE);
 
+// Phase E.1: LAYERS export must not HARD_REJECT on +8 — MAIN blitter is not used on WINDOW_VIRTUAL.
+static bool Aeloria_TryVirtualLayersExportDespiteBadPlus8(const ObjectClass* object, WindowNumberType window,
+                                                          int shapenum, int x, int y, int width, int height,
+                                                          ShapeFlags_Type flags, DirType rotation, long virtualscale,
+                                                          void const* shapefile)
+{
+	if (window != WINDOW_VIRTUAL || object == nullptr || shapenum < 0) {
+		return false;
+	}
+	int w = width;
+	int h = height;
+	if (w <= 0 && shapefile != nullptr) {
+		w = Get_Build_Frame_Width(shapefile);
+	}
+	if (h <= 0 && shapefile != nullptr) {
+		h = Get_Build_Frame_Height(shapefile);
+	}
+	if (w <= 0) {
+		w = 32;
+	}
+	if (h <= 0) {
+		h = 32;
+	}
+	DLL_Draw_Intercept(shapenum, x, y, w, h, (int)flags, object, rotation, virtualscale, nullptr, HOUSE_NONE);
+	return true;
+}
+
 void CC_Draw_Shape(const ObjectClass *object, void const * shapefile, int shapenum, int x, int y, WindowNumberType window, ShapeFlags_Type flags, void const * fadingdata, void const * ghostdata, DirType rotation, long virtualscale, int width, int height)
 {
 	if (object) {
@@ -3562,6 +3589,10 @@ void CC_Draw_Shape(const ObjectClass *object, void const * shapefile, int shapen
 		**	Now also exempts player House objects (via timeout) so they reach the blitter.
 		*/
 		if (!Is_Plausible_Class_Pointer(at_plus_8)) {
+			if (Aeloria_TryVirtualLayersExportDespiteBadPlus8(object, window, shapenum, x, y, width, height, flags,
+			                                                rotation, virtualscale, shapefile)) {
+				return;
+			}
 			if (Aeloria_TryStatelessTechnoDraw(object, shapenum, x, y, rotation, virtualscale, NULL, HOUSE_NONE)) {
 				return;
 			}
@@ -3855,6 +3886,10 @@ void CC_Draw_Shape(const ObjectClass *object, const char *shape_file_name, void 
 		**	Player exemption also applied here.
 		*/
 		if (!Is_Plausible_Class_Pointer(at_plus_8)) {
+			if (Aeloria_TryVirtualLayersExportDespiteBadPlus8(object, window, shapenum, x, y, 0, 0, flags,
+			                                                rotation, virtualscale, shapefile)) {
+				return;
+			}
 			if (Aeloria_TryStatelessTechnoDraw(object, shapenum, x, y, rotation, virtualscale, shape_file_name, override_owner)) {
 				return;
 			}
