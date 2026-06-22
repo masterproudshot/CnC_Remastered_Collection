@@ -2245,6 +2245,7 @@ void UnitClass::Draw_It(int x, int y, WindowNumberType window) const
 		DLL_Draw_Intercept(virtualShape, x, y, drawW, drawH, AELORIA_CLIENT_DRAW_FLAGS_CENTER,
 		                   const_cast<UnitClass*>(this), DIR_N, 0x100, nullptr, (char)Owner());
 		Aeloria_DrawGuardedUnitTurret(this, unit_type, PrimaryFacing, SecondaryFacing, IsInRecoilState, x, y, drawW, drawH);
+		Aeloria_SyncVirtualSelectionHud(this);
 		return;
 	}
 

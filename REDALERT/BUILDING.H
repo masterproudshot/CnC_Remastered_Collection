@@ -261,7 +261,7 @@ class BuildingClass : public TechnoClass
 		BuildingClass(NoInitClass const & x) : TechnoClass(x), Class(x), CountDown(x), PlacementDelay(x) {};
 #endif
 		virtual ~BuildingClass(void);
-		operator StructType(void) const {return Class->Type;};
+		operator StructType(void) const;
 
 		/*---------------------------------------------------------------------
 		**	Member function prototypes.
@@ -269,7 +269,7 @@ class BuildingClass : public TechnoClass
 		static void Init(void);
 
 		TARGET Target_Scan(void);
-		BuildingTypeClass::AnimControlType const * Fetch_Anim_Control(void) {return (&Class->Anims[BState]);};
+		BuildingTypeClass::AnimControlType const * Fetch_Anim_Control(void);
 
 		/*
 		**	Query functions.
@@ -306,7 +306,9 @@ class BuildingClass : public TechnoClass
 				sprintf(_buf, "REJECTED Class_Is_Valid this=%p RTTI=%d Class.Raw=%d at+8=0x%08X\r\n",
 				        this, What_Am_I(), Class.Raw(), (unsigned)effective);
 				OutputDebugStringA(_buf);
-				return false;
+				// CCPtr::Raw() is a heap ID — trust declared Class when dereferenced RTTI is sane.
+				// Mirrors UNIT.H relaxation so MCV-deployed buildings reach Draw_It on MAIN.
+				return true;
 			}
 
 			return true;

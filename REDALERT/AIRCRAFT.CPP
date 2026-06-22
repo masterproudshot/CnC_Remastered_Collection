@@ -471,8 +471,48 @@ static void Aeloria_ProducedAircraftBulkDrawCoords(const AircraftClass* aircraft
 	}
 }
 
+// 5z-d1: rotor blades as explicit accessory intercepts (bulk/sustain path never ran Draw_Rotors sub-emits).
+static void Aeloria_DrawProducedAircraftRotorIntercepts(const AircraftClass* aircraft, int x, int y,
+                                                        WindowNumberType window, int drawW, int drawH)
+{
+	if (window != WINDOW_VIRTUAL || aircraft == nullptr) {
+		return;
+	}
+	AircraftTypeClass const* atype = static_cast<AircraftTypeClass const*>(
+	    Aeloria_Safe_Techno_Type(const_cast<AircraftClass*>(aircraft)));
+	if (atype == nullptr || !atype->IsRotorEquipped) {
+		return;
+	}
+
+	ShapeFlags_Type flags = SHAPE_CENTER | SHAPE_WIN_REL;
+	int shapenum = 0;
+	if (aircraft->Height == 0) {
+		shapenum = (aircraft->Fetch_Stage() % 8) + 4;
+		flags = flags | SHAPE_GHOST;
+	} else {
+		shapenum = aircraft->Fetch_Stage() % 4;
+		flags = flags | SHAPE_FADING | SHAPE_PREDATOR;
+	}
+	char owner = (char)aircraft->Owner();
+
+	if (*aircraft == AIRCRAFT_TRANSPORT) {
+		int _stretch[FACING_COUNT] = {8, 9, 10, 9, 8, 9, 10, 9};
+		short xx = (short)x;
+		short yy = (short)(y - Lepton_To_Pixel(aircraft->Height));
+		FacingType face = Dir_Facing(aircraft->SecondaryFacing);
+		Move_Point(xx, yy, aircraft->SecondaryFacing.Current(), _stretch[face]);
+		Aeloria_DrawAccessoryIntercept(aircraft, shapenum, xx, yy - 2, drawW, drawH, "RROTOR", owner);
+		Move_Point(xx, yy, aircraft->SecondaryFacing.Current() + DIR_S, _stretch[face] * 2);
+		Aeloria_DrawAccessoryIntercept(aircraft, shapenum, xx, yy - 2, drawW, drawH, "LROTOR", owner);
+	} else {
+		int ry = y - Lepton_To_Pixel(aircraft->Height) - 2;
+		Aeloria_DrawAccessoryIntercept(aircraft, shapenum, x, ry, drawW, drawH, "RROTOR", owner);
+	}
+	(void)flags;
+}
+
 // 5z-m12: client population only on LAYERS (WINDOW_VIRTUAL). MAIN tactical pass must not intercept (Mig blink).
-// Rotor aircraft need body facing shape + Draw_Rotors sub-emits (shape 0 alone = invisible Hind/Longbow).
+// Rotor aircraft need body facing shape + rotor accessory intercepts (shape 0 alone = invisible Hind/Longbow).
 static void Aeloria_ProducedAircraftEmitClientDraw(const AircraftClass* aircraft, int x, int y,
                                                     WindowNumberType window, int drawW, int drawH,
                                                     AircraftTypeClass const* aircraft_type)
@@ -500,8 +540,11 @@ static void Aeloria_ProducedAircraftEmitClientDraw(const AircraftClass* aircraft
 			static int _jitter[] = {0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, -1, -1, -1, 0};
 			jitter = _jitter[::Frame % 16];
 		}
-		const_cast<AircraftClass*>(aircraft)->Draw_Rotors(x, y + jitter, window);
+		Aeloria_DrawProducedAircraftRotorIntercepts(aircraft, x, y + jitter, window, drawW, drawH);
 	}
+
+	Aeloria_SyncVirtualSelectionHud(aircraft);
+	Aeloria_RecordProducedAircraftVirtualEmit(aircraft);
 
 	uintptr_t key = reinterpret_cast<uintptr_t>(aircraft);
 	auto it = g_AeloriaObjectStability.find(key);
@@ -612,8 +655,10 @@ void AircraftClass::Draw_It(int x, int y, WindowNumberType window) const
 				static int _jitter[] = {0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, -1, -1, -1, 0};
 				jitter = _jitter[::Frame % 16];
 			}
-			const_cast<AircraftClass*>(this)->Draw_Rotors(x, y + jitter, window);
+			Aeloria_DrawProducedAircraftRotorIntercepts(this, x, y + jitter, window, drawW, drawH);
 		}
+		Aeloria_SyncVirtualSelectionHud(this);
+		Aeloria_RecordProducedAircraftVirtualEmit(this);
 		return;
 	}
 

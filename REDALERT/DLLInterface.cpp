@@ -290,6 +290,8 @@ public:
 
 	static bool Get_Game_Over() { return GameOver; }
 
+	friend void Aeloria_SyncVirtualSelectionHud(const TechnoClass* tc);
+
 private:
 	static void Calculate_Single_Player_Score(EventCallbackStruct&);
 
@@ -5017,6 +5019,7 @@ static void Aeloria_CopyEarlyDefaultAssetName(char* dest, int destLen, RTTIType 
 static const ObjectTypeClass& Aeloria_Safe_Object_Type_Of(const ObjectClass* object, bool hasCreation);
 static BuildingTypeClass const* Aeloria_Safe_Building_Type(BuildingClass const* building, bool hasCreation);
 static UnitType Aeloria_Intercept_Unit_Type_Enum(UnitClass const* unit);
+static void Aeloria_FillTechnoPipSlots(CNCObjectStruct& slot, const TechnoClass* tc, int maxPips);
 
 
 void DLLExportClass::DLL_Draw_Intercept(int shape_number, int x, int y, int width, int height, int flags, const ObjectClass *object, DirType rotation, long scale, const char *shape_file_name, char override_owner)
@@ -5476,9 +5479,21 @@ void DLLExportClass::DLL_Draw_Intercept(int shape_number, int x, int y, int widt
 		memset(new_object.ActionWithSelected, DAT_NONE, sizeof(new_object.ActionWithSelected));
 	}
 
+	if (base_object == NULL && object && object->Is_Techno()) {
+		Aeloria_PopulateTechnoHudFields(new_object, static_cast<const TechnoClass*>(object));
+	}
+
 	// Cache only real shape draws (not placeholder proxy shape_number=0).
 	if (object && width > 0 && height > 0 && shape_number > 0) {
 		Aeloria_CacheDrawParams(object, shape_number, x, y, width, height, flags, rotation, scale, shape_file_name);
+	}
+	// 5z-d1: rotor helis use facing shape 0 intercept — still cache when MAIN draw cache exists.
+	if (object && width > 0 && height > 0 && shape_number <= 0 && object->What_Am_I() == RTTI_AIRCRAFT) {
+		auto acStab = g_AeloriaObjectStability.find(reinterpret_cast<uintptr_t>(object));
+		if (acStab != g_AeloriaObjectStability.end() && acStab->second.hasCachedMainDraw
+		    && acStab->second.cachedShapeNumber > 0) {
+			Aeloria_CacheDrawParams(object, acStab->second.cachedShapeNumber, x, y, width, height, flags, rotation, scale, shape_file_name);
+		}
 	}
 
 	CurrentDrawCount++;
@@ -5807,6 +5822,167 @@ static bool Aeloria_PrepareContiguousBulkSlot(CNCObjectListStruct* list, int pro
 	return true;
 }
 
+// 5z-d3: Selection HUD parity for bulk/sustain and safe intercept (pips, harvester flags, CanFire/Move).
+static void Aeloria_FillTechnoPipSlots(CNCObjectStruct& slot, const TechnoClass* tc, int maxPips)
+{
+	if (!tc || maxPips <= 0) {
+		slot.NumPips = 0;
+		return;
+	}
+	if (maxPips > MAX_OBJECT_PIPS) {
+		maxPips = MAX_OBJECT_PIPS;
+	}
+	slot.MaxPips = maxPips;
+	slot.NumPips = 0;
+
+	int pips = tc->Pip_Count();
+	RTTIType rtti = tc->What_Am_I();
+
+	if (rtti == RTTI_UNIT && Aeloria_Intercept_Unit_Type_Enum(static_cast<const UnitClass*>(tc)) == UNIT_HARVESTER) {
+		const UnitClass* harv = static_cast<const UnitClass*>(tc);
+		int iron = harv->Gems;
+		int nickel = harv->Gold;
+		int graypips = pips * fixed(iron, Rule.BailCount);
+		int greenpips = pips * fixed(nickel, Rule.BailCount);
+		while (greenpips + graypips < pips) {
+			if (iron > nickel) {
+				graypips++;
+			} else {
+				greenpips++;
+			}
+		}
+		for (int index = 0; index < maxPips && slot.NumPips < MAX_OBJECT_PIPS; index++) {
+			int shape = PIP_EMPTY;
+			if (index < pips) {
+				if (greenpips) {
+					shape = PIP_FULL;
+					greenpips--;
+				} else {
+					shape = PIP_COMMANDO;
+					graypips--;
+				}
+			}
+			slot.Pips[slot.NumPips++] = shape;
+		}
+		return;
+	}
+
+	for (int index = 0; index < maxPips && slot.NumPips < MAX_OBJECT_PIPS; index++) {
+		slot.Pips[slot.NumPips++] = (index < pips) ? PIP_FULL : PIP_EMPTY;
+	}
+}
+
+void Aeloria_PopulateTechnoHudFields(CNCObjectStruct& slot, const TechnoClass* tc)
+{
+	if (!tc) {
+		return;
+	}
+	Aeloria_Repair_Early_Class_Pointer(const_cast<TechnoClass*>(tc));
+	TechnoTypeClass const* ttype = Aeloria_Safe_Techno_Type(tc);
+	if (!ttype) {
+		return;
+	}
+
+	slot.MaxStrength = ttype->MaxStrength;
+	slot.Strength = tc->Strength;
+	if (slot.Strength > slot.MaxStrength) {
+		slot.Strength = slot.MaxStrength;
+	}
+	if (slot.Strength <= 0) {
+		slot.Strength = slot.MaxStrength;
+	}
+
+	int maxPips = ttype->Max_Pips();
+	Aeloria_FillTechnoPipSlots(slot, tc, maxPips);
+
+	slot.MaxSpeed = (unsigned char)ttype->MaxSpeed;
+	slot.IsALoaner = tc->IsALoaner;
+	slot.IsNominal = ttype->IsNominal;
+	slot.IsAntiGround = (ttype->PrimaryWeapon != NULL) && (ttype->PrimaryWeapon->Bullet != NULL)
+	                    && ttype->PrimaryWeapon->Bullet->IsAntiGround;
+	slot.IsAntiAircraft = (ttype->PrimaryWeapon != NULL) && (ttype->PrimaryWeapon->Bullet != NULL)
+	                      && ttype->PrimaryWeapon->Bullet->IsAntiAircraft;
+	slot.IsSubSurface = (ttype->PrimaryWeapon != NULL) && (ttype->PrimaryWeapon->Bullet != NULL)
+	                    && ttype->PrimaryWeapon->Bullet->IsSubSurface;
+	slot.IsIronCurtain = tc->IronCurtainCountDown > 0;
+	slot.CanHarvest = false;
+	slot.IsDumping = false;
+
+	RTTIType rtti = tc->What_Am_I();
+	if (rtti == RTTI_UNIT) {
+		const UnitClass* unit = static_cast<const UnitClass*>(tc);
+		if (Aeloria_Intercept_Unit_Type_Enum(unit) == UNIT_HARVESTER) {
+			slot.CanHarvest = true;
+		}
+		slot.IsDumping = unit->IsDumping;
+	}
+	if (rtti == RTTI_AIRCRAFT) {
+		AircraftTypeClass const* atype = static_cast<AircraftTypeClass const*>(ttype);
+		slot.IsFixedWingedAircraft = atype ? atype->IsFixedWing : false;
+	}
+	if (rtti == RTTI_INFANTRY) {
+		InfantryTypeClass const* itype = static_cast<InfantryTypeClass const*>(ttype);
+		if (itype) {
+			slot.IsDog = itype->IsDog;
+			slot.CanPlaceBombs = itype->IsBomber;
+		}
+	}
+
+	memset(slot.CanMove, 0, sizeof(slot.CanMove));
+	memset(slot.CanFire, 0, sizeof(slot.CanFire));
+	memset(slot.ActionWithSelected, DAT_NONE, sizeof(slot.ActionWithSelected));
+
+	HouseClass* old_player_ptr = PlayerPtr;
+	for (int i = 0; i < Houses.Count(); ++i) {
+		HouseClass* hptr = Houses.Ptr(i);
+		if ((hptr != nullptr) && hptr->IsActive && hptr->IsHuman) {
+			DLLExportClass::Logic_Switch_Player_Context(hptr);
+			HousesType house = hptr->Class->House;
+			slot.CanMove[house] = tc->Can_Player_Move();
+			slot.CanFire[house] = tc->Can_Player_Fire();
+		}
+	}
+	DLLExportClass::Logic_Switch_Player_Context(old_player_ptr);
+}
+
+void Aeloria_SyncVirtualSelectionHud(const TechnoClass* tc)
+{
+	if (!tc || !DLLExportClass::ObjectList) {
+		return;
+	}
+	for (int i = 0; i < DLLExportClass::CurrentDrawCount; ++i) {
+		CNCObjectStruct& draw_object = DLLExportClass::ObjectList->Objects[DLLExportClass::TotalObjectCount + i];
+		if (draw_object.CNCInternalObjectPointer == tc && draw_object.SubObject == 0) {
+			Aeloria_PopulateTechnoHudFields(draw_object, tc);
+			return;
+		}
+	}
+}
+
+void Aeloria_RecordProducedAircraftVirtualEmit(const ObjectClass* obj)
+{
+	if (!obj || obj->What_Am_I() != RTTI_AIRCRAFT) {
+		return;
+	}
+	uintptr_t key = reinterpret_cast<uintptr_t>(obj);
+	auto it = g_AeloriaObjectStability.find(key);
+	if (it == g_AeloriaObjectStability.end() || !it->second.producedUnitUnlimboSeeded) {
+		return;
+	}
+	if (Aeloria_IsProducedBadPlus8Unit(obj)) {
+		return;
+	}
+	if (!Aeloria_HasValidMainDrawCache(obj)) {
+		return;
+	}
+	if (it->second.sustainRetired) {
+		return;
+	}
+	if (it->second.sustainNormalHits < 255) {
+		it->second.sustainNormalHits++;
+	}
+}
+
 // Shared safe LAYERS slot fill for first bulk insert + per-frame sustain re-insert (early custom 4p starting forces).
 // Uses cached virtual-draw params when available (no Class_Of — sustain must not reintroduce +8 AV).
 static void Aeloria_PopulateEarlyBulkSlot(CNCObjectStruct& slot, const ObjectClass* obj, int exportLayer)
@@ -5972,7 +6148,9 @@ static void Aeloria_PopulateEarlyBulkSlot(CNCObjectStruct& slot, const ObjectCla
 	memset(slot.CanMove, 0, sizeof(slot.CanMove));
 	memset(slot.CanFire, 0, sizeof(slot.CanFire));
 	memset(slot.ActionWithSelected, DAT_NONE, sizeof(slot.ActionWithSelected));
-	if (slot.Owner >= 0 && slot.Owner < MAX_HOUSES) {
+	if (rtti == RTTI_INFANTRY || rtti == RTTI_UNIT || rtti == RTTI_BUILDING || rtti == RTTI_AIRCRAFT || rtti == RTTI_VESSEL) {
+		Aeloria_PopulateTechnoHudFields(slot, static_cast<const TechnoClass*>(obj));
+	} else if (slot.Owner >= 0 && slot.Owner < MAX_HOUSES) {
 		slot.CanMove[slot.Owner] = true;
 		slot.CanFire[slot.Owner] = true;
 		slot.ActionWithSelected[slot.Owner] = DAT_MOVE;
@@ -6408,7 +6586,15 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 				sustainSkippedNormal++;
 				continue;
 			}
-			stab.sustainNormalHits = 0;
+			// 5z-d1: virtual LAYERS emits increment sustainNormalHits — do not reset for aircraft handoff.
+			if (!aircraftSustainHandoff) {
+				stab.sustainNormalHits = 0;
+			} else if (stab.sustainNormalHits >= 3) {
+				stab.sustainRetired = true;
+				g_AeloriaObjectStability.erase(k);
+				g_AeloriaObjectLogMask.erase(k);
+				continue;
+			}
 
 			int listCountSoFar = normalTotal + bulkAdded + sustainAdded;
 			if (Aeloria_ObjectAlreadyInExportList(ObjectList, listCountSoFar, obj)) continue;

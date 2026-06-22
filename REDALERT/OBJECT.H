@@ -725,6 +725,11 @@ void Aeloria_DrawAccessoryIntercept(const ObjectClass* obj, int shapenum, int x,
                                     int drawW, int drawH, const char* shape_file_name,
                                     char override_owner = HOUSE_NONE);
 
+struct CNCObjectStruct;
+void Aeloria_PopulateTechnoHudFields(CNCObjectStruct& slot, const TechnoClass* tc);
+void Aeloria_SyncVirtualSelectionHud(const TechnoClass* tc);
+void Aeloria_RecordProducedAircraftVirtualEmit(const ObjectClass* obj);
+
 /*
 **	Project Aeloria (Draw Guard helper):
 **	Centralized minimal helper to reduce duplication of the `if (!Class.Is_Valid()) return;`

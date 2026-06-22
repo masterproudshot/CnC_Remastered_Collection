@@ -358,9 +358,9 @@ ResultType InfantryClass::Take_Damage(int & damage, int distance, WarheadType wa
 	if (res == RESULT_NONE) return(res);
 
 	if (res == RESULT_DESTROYED) {
+		InfantryTypeClass const* itype = static_cast<InfantryTypeClass const*>(Aeloria_Safe_Techno_Type(this));
 		{
 			int typeEnum = -1;
-			InfantryTypeClass const* itype = static_cast<InfantryTypeClass const*>(Aeloria_Safe_Techno_Type(this));
 			if (itype) {
 				typeEnum = (int)itype->Type;
 			}
@@ -373,7 +373,7 @@ ResultType InfantryClass::Take_Damage(int & damage, int distance, WarheadType wa
 			                  (void*)this, (int)Owner(), typeEnum, Frame, warheadDeath);
 		}
 		Aeloria_ClearObjectTracking(this);
-		if (*this == INFANTRY_TANYA) {
+		if (itype && itype->Type == INFANTRY_TANYA) {
 			IsTanyaDead = true;
 		}
 		Death_Announcement(source);
@@ -387,10 +387,10 @@ ResultType InfantryClass::Take_Damage(int & damage, int distance, WarheadType wa
 		VocType altsound;
 		sound = Sim_Random_Pick(VOC_SCREAM1, VOC_SCREAM11);
 		altsound = VOC_YELL1;
-		if (*this == INFANTRY_TANYA) {
+		if (itype && itype->Type == INFANTRY_TANYA) {
 			sound = altsound = VOC_TANYA_DIE;
 		}
-		if (Class->IsDog) {
+		if (itype && itype->IsDog) {
 			sound = altsound = VOC_DOG_HURT;
 		}
 
@@ -429,7 +429,7 @@ ResultType InfantryClass::Take_Damage(int & damage, int distance, WarheadType wa
 			case 5:
 				Sound_Effect(sound, Coord);
 				AnimType anim = ANIM_ELECT_DIE;
-				if (Class->IsDog) anim = ANIM_DOG_ELECT_DIE;
+				if (itype && itype->IsDog) anim = ANIM_DOG_ELECT_DIE;
 				new AnimClass(anim, Coord);
 				delthis = true;
 				break;
@@ -600,6 +600,7 @@ void InfantryClass::Draw_It(int x, int y, WindowNumberType window) const
 	if (window == WINDOW_VIRTUAL && infantry_type != nullptr) {
 		DLL_Draw_Intercept(0, x, y, drawW, drawH, AELORIA_CLIENT_DRAW_FLAGS_CENTER,
 		                   const_cast<InfantryClass*>(this), rot, 0x100, nullptr, (char)Owner());
+		Aeloria_SyncVirtualSelectionHud(this);
 		return;
 	}
 

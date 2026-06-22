@@ -253,9 +253,6 @@ void AnimClass::Draw_It(int x, int y, WindowNumberType window) const
 	*/
 	if (!Is_Drawable(this)) return;
 
-	Aeloria_Debug_Log("Anim guard passed this=%p Class.Raw=%ld - proceeding to draw", (void*)this, Class.Raw());
-
-	Aeloria_Debug_Log("Anim about to access Class->VirtualAnim this=%p Class.Raw=%ld", (void*)this, Class.Raw());
 	bool render_legacy = !IsInvisible && (Class->VirtualAnim == ANIM_NONE || window != WINDOW_VIRTUAL);
 	bool render_virtual = Target_Legal(VirtualAnimTarget) && window == WINDOW_VIRTUAL;
 
@@ -320,8 +317,8 @@ void AnimClass::Draw_It(int x, int y, WindowNumberType window) const
 			/*
 			**	Draw the animation shape, but ignore legacy if beyond normal stage count.
 			*/
-			if ((window == WINDOW_VIRTUAL) || (Fetch_Stage() < Class->Stages)) {
-				// Add 'this' parameter to call new shape draw intercept. ST - 5/22/2019
+			// 5z-d2: LAYERS (VIRTUAL) always exports combat anims; MAIN respects stage cap.
+			if (window == WINDOW_VIRTUAL || Fetch_Stage() < Class->Stages) {
 				CC_Draw_Shape(this, shapefile, shapenum, x, y, window, flags, remap, transtable, DIR_N, Class->VirtualScale, width, height);
 			}
 		}
