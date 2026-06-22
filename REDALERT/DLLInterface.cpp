@@ -5027,6 +5027,8 @@ static const ObjectTypeClass& Aeloria_Safe_Object_Type_Of(const ObjectClass* obj
 static BuildingTypeClass const* Aeloria_Safe_Building_Type(BuildingClass const* building, bool hasCreation);
 static UnitType Aeloria_Intercept_Unit_Type_Enum(UnitClass const* unit);
 static void Aeloria_FillTechnoPipSlots(CNCObjectStruct& slot, const TechnoClass* tc, int maxPips);
+static bool Aeloria_IsProducedRotorAircraft(const ObjectClass* obj, bool* runtime_plus8_plausible = nullptr);
+static bool Aeloria_ProducedRotorMayBulkWithoutMainCache(const ObjectClass* obj, const AeloriaObjectStability& stab);
 
 
 void DLLExportClass::DLL_Draw_Intercept(int shape_number, int x, int y, int width, int height, int flags, const ObjectClass *object, DirType rotation, long scale, const char *shape_file_name, char override_owner)
@@ -5623,7 +5625,7 @@ void Aeloria_GraduateTrackedObject(const ObjectClass* obj)
 }
 
 // Phase E: produced Hind/Longbow (rotor, !IsFixedWing) helpers — Mig fixed-wing rules unchanged.
-static bool Aeloria_IsProducedRotorAircraft(const ObjectClass* obj, bool* runtime_plus8_plausible = nullptr)
+static bool Aeloria_IsProducedRotorAircraft(const ObjectClass* obj, bool* runtime_plus8_plausible)
 {
 	if (!obj || obj->What_Am_I() != RTTI_AIRCRAFT) {
 		return false;
