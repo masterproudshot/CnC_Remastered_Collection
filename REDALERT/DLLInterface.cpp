@@ -5182,11 +5182,13 @@ void DLLExportClass::DLL_Draw_Intercept(int shape_number, int x, int y, int widt
 		    && !acIt->second.producedUnitBadPlus8
 		    && !Aeloria_HasValidMainDrawCache(object)) {
 			uintptr_t at8 = *(uintptr_t*)((const char*)object + 8);
-			// Phase E.2: defer only when +8 is suspect — plausible fixed-wing needs every-frame LAYERS (Mig blink).
-			if (!Is_Plausible_Class_Pointer(at8) && !Aeloria_IsProducedRotorAircraft(object)) {
-				Aeloria_Debug_Log("PRODUCED_AIRCRAFT_INTERCEPT_DEFER this=%p owner=%d frame=%u (bad +8 fixed-wing; wait MAIN cache)",
-				                  (void*)object, (int)object->Owner(), Frame);
-				return;
+			if (Is_Plausible_Class_Pointer(at8)) {
+				// E.2.1: restore 5z-m7 defer — pre-cache Mig intercept crashed InstanceServer; blink fixed in AIRCRAFT lite-seed emit.
+				if (!Aeloria_IsProducedRotorAircraft(object)) {
+					Aeloria_Debug_Log("PRODUCED_AIRCRAFT_INTERCEPT_DEFER this=%p owner=%d frame=%u (defer to bulk after MAIN cache)",
+					                  (void*)object, (int)object->Owner(), Frame);
+					return;
+				}
 			}
 		}
 	}

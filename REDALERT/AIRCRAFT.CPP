@@ -544,6 +544,10 @@ static bool Aeloria_DrawProducedRotorVirtualLayers(const AircraftClass* aircraft
 	if (window != WINDOW_VIRTUAL || aircraft == nullptr || aircraft_type == nullptr || aircraft_type->IsFixedWing) {
 		return false;
 	}
+	// E.2.1: legacy Techno/rotors touch Class — unsafe when runtime +8 is corrupt (pool-reused helis).
+	if (bad_plus_8) {
+		return false;
+	}
 	void const* shapefile = aircraft->Get_Image_Data();
 	int shapenum = aircraft->Shape_Number();
 	if (shapefile == nullptr || shapenum < 0) {
