@@ -1640,6 +1640,51 @@ bool Aeloria_IsZeroMapUntrackedInfantry(const ObjectClass* obj)
 	return Aeloria_ShouldZeroMapProducedInfantry(static_cast<InfantryClass const*>(obj));
 }
 
+bool Aeloria_TryVirtualCombatAnimExport(const ObjectClass* object, WindowNumberType window, int shapenum, int x, int y,
+                                        int width, int height, ShapeFlags_Type flags, DirType rotation, long virtualscale,
+                                        void const* shapefile)
+{
+	if (!object || object->What_Am_I() != RTTI_ANIM || window != WINDOW_VIRTUAL) {
+		return false;
+	}
+	AnimClass* anim = const_cast<AnimClass*>(static_cast<const AnimClass*>(object));
+	if (!anim->IsActive || !Is_Drawable(anim)) {
+		return false;
+	}
+	AnimType animType = (AnimType)(*anim);
+	const char* asset = nullptr;
+	switch (animType) {
+		case ANIM_FBALL1:
+			asset = "FBALL1";
+			break;
+		case ANIM_FBALL_FADE:
+			asset = "FB2";
+			break;
+		default:
+			return false;
+	}
+	int w = width;
+	int h = height;
+	if (w <= 0 && shapefile != nullptr) {
+		w = Get_Build_Frame_Width(shapefile);
+	}
+	if (h <= 0 && shapefile != nullptr) {
+		h = Get_Build_Frame_Height(shapefile);
+	}
+	if (w <= 0) {
+		w = 32;
+	}
+	if (h <= 0) {
+		h = 32;
+	}
+	DLLExportClass::DLL_Draw_Intercept(shapenum, x, y, w, h, (int)flags, object, rotation, virtualscale, asset, HOUSE_NONE);
+	if (Aeloria_ShouldLogOncePerObject(object, AEL_LOG_FIRST_REAL_DRAW)) {
+		Aeloria_Debug_Log("VIRTUAL_COMBAT_ANIM_EXPORT this=%p type=%d asset=%s shapenum=%d frame=%u",
+		                  (void*)object, (int)animType, asset, shapenum, Frame);
+	}
+	return true;
+}
+
 bool Aeloria_TryStatelessTechnoDraw(const ObjectClass* object, int shapenum, int x, int y, DirType rotation, long virtualscale,
                                    const char* shape_file_name, char override_owner)
 {
@@ -5137,13 +5182,11 @@ void DLLExportClass::DLL_Draw_Intercept(int shape_number, int x, int y, int widt
 		    && !acIt->second.producedUnitBadPlus8
 		    && !Aeloria_HasValidMainDrawCache(object)) {
 			uintptr_t at8 = *(uintptr_t*)((const char*)object + 8);
-			if (Is_Plausible_Class_Pointer(at8)) {
-				// Phase E: Mig (fixed-wing) — LAYERS intercept only after MAIN cache; rotor may intercept now.
-				if (!Aeloria_IsProducedRotorAircraft(object)) {
-					Aeloria_Debug_Log("PRODUCED_AIRCRAFT_INTERCEPT_DEFER this=%p owner=%d frame=%u (defer to bulk after MAIN cache)",
-					                  (void*)object, (int)object->Owner(), Frame);
-					return;
-				}
+			// Phase E.2: defer only when +8 is suspect — plausible fixed-wing needs every-frame LAYERS (Mig blink).
+			if (!Is_Plausible_Class_Pointer(at8) && !Aeloria_IsProducedRotorAircraft(object)) {
+				Aeloria_Debug_Log("PRODUCED_AIRCRAFT_INTERCEPT_DEFER this=%p owner=%d frame=%u (bad +8 fixed-wing; wait MAIN cache)",
+				                  (void*)object, (int)object->Owner(), Frame);
+				return;
 			}
 		}
 	}

@@ -266,6 +266,19 @@ void AnimClass::Draw_It(int x, int y, WindowNumberType window) const
 	bool render_legacy = !IsInvisible && (Class->VirtualAnim == ANIM_NONE || window != WINDOW_VIRTUAL);
 	bool render_virtual = Target_Legal(VirtualAnimTarget) && window == WINDOW_VIRTUAL;
 
+	// Phase E.2: flame/combat stream anims must export on LAYERS every frame (flame tower, FBALL).
+	if (window == WINDOW_VIRTUAL && !IsInvisible) {
+		switch (Class->Type) {
+			case ANIM_FBALL1:
+			case ANIM_FBALL_FADE:
+				render_legacy = true;
+				render_virtual = false;
+				break;
+			default:
+				break;
+		}
+	}
+
 	if (render_legacy) {
 		BStart(BENCH_ANIMS);
 

@@ -511,6 +511,73 @@ static void Aeloria_DrawProducedAircraftRotorIntercepts(const AircraftClass* air
 	(void)flags;
 }
 
+static DirType Aeloria_ProducedAircraftInterceptRotation(const AircraftClass* aircraft, AircraftTypeClass const* aircraft_type)
+{
+	if (aircraft == nullptr || aircraft_type == nullptr) {
+		return DIR_N;
+	}
+	if (aircraft_type->Rotation == 16) {
+		return DirType(Rotation16[aircraft->SecondaryFacing]);
+	}
+	return DIR_N;
+}
+
+static const char* Aeloria_ProducedAircraftGraphicName(AircraftTypeClass const* aircraft_type)
+{
+	if (aircraft_type == nullptr) {
+		return nullptr;
+	}
+	const char* name = aircraft_type->Graphic_Name();
+	if (name != nullptr && name[0] != '\0') {
+		return name;
+	}
+	return nullptr;
+}
+
+// Phase E.2: full rotor LAYERS chain when shape data is available (returns false → caller uses emit).
+static bool Aeloria_DrawProducedRotorVirtualLayers(const AircraftClass* aircraft, int x, int y,
+                                                   WindowNumberType window, int drawW, int drawH,
+                                                   AircraftTypeClass const* aircraft_type,
+                                                   const ObjectClass* selfObj, bool bad_plus_8,
+                                                   const char* pathTag)
+{
+	if (window != WINDOW_VIRTUAL || aircraft == nullptr || aircraft_type == nullptr || aircraft_type->IsFixedWing) {
+		return false;
+	}
+	void const* shapefile = aircraft->Get_Image_Data();
+	int shapenum = aircraft->Shape_Number();
+	if (shapefile == nullptr || shapenum < 0) {
+		return false;
+	}
+	DirType rotation = Aeloria_ProducedAircraftInterceptRotation(aircraft, aircraft_type);
+	int jitter = 0;
+	if (aircraft->Height == ObjectClass::FLIGHT_LEVEL && aircraft->Get_Speed() < 3) {
+		static int _jitter[] = {0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, -1, -1, -1, 0};
+		jitter = _jitter[::Frame % 16];
+	}
+	AircraftClass* mut_aircraft = const_cast<AircraftClass*>(aircraft);
+	if (pathTag && Aeloria_ShouldLogOncePerObject(aircraft, AEL_LOG_PLAYER_CREATION)) {
+		Aeloria_Debug_Log("PRODUCED_ROTOR_VIRTUAL_PATH this=%p owner=%d frame=%u path=%s bad_plus_8=%d",
+		                  (void*)aircraft, (int)aircraft->Owner(), Frame, pathTag, bad_plus_8 ? 1 : 0);
+	}
+	mut_aircraft->Techno_Draw_Object(shapefile, shapenum, x, y + jitter, window, rotation);
+	if (aircraft->Visual_Character() <= VISUAL_DARKEN) {
+		CC_Draw_Shape(aircraft, shapefile, shapenum, x + 1, y + 2, window,
+		              SHAPE_PREDATOR | SHAPE_CENTER | SHAPE_WIN_REL | SHAPE_FADING,
+		              DisplayClass::FadingShade, NULL);
+	}
+	if (mut_aircraft->Class->IsRotorEquipped) {
+		mut_aircraft->Draw_Rotors(x, y + jitter, window);
+	}
+	mut_aircraft->FootClass::Draw_It(x, y - Lepton_To_Pixel(aircraft->Height), window);
+	Aeloria_SyncVirtualSelectionHud(aircraft);
+	Aeloria_RecordProducedAircraftVirtualEmit(aircraft);
+	if (drawW > 0 && drawH > 0) {
+		Aeloria_TryNotifyProducedUnitMainDrawCache(selfObj, shapenum, drawW, drawH, x, y + jitter, bad_plus_8);
+	}
+	return true;
+}
+
 // 5z-m12: client population only on LAYERS (WINDOW_VIRTUAL). MAIN tactical pass must not intercept (Mig blink).
 // Rotor aircraft need body facing shape + rotor accessory intercepts (shape 0 alone = invisible Hind/Longbow).
 static void Aeloria_ProducedAircraftEmitClientDraw(const AircraftClass* aircraft, int x, int y,
@@ -521,7 +588,6 @@ static void Aeloria_ProducedAircraftEmitClientDraw(const AircraftClass* aircraft
 		return;
 	}
 
-	const bool fixedWing = aircraft_type->IsFixedWing;
 	const bool rotorEquipped = aircraft_type->IsRotorEquipped;
 	int bodyShape = aircraft->Shape_Number();
 	if (bodyShape <= 0) {
@@ -530,13 +596,11 @@ static void Aeloria_ProducedAircraftEmitClientDraw(const AircraftClass* aircraft
 	if (bodyShape <= 0) {
 		bodyShape = 16;
 	}
-	DirType rotation = DIR_N;
-	if (aircraft_type->Rotation == 16) {
-		rotation = DirType(Rotation16[aircraft->SecondaryFacing]);
-	}
+	DirType rotation = Aeloria_ProducedAircraftInterceptRotation(aircraft, aircraft_type);
+	const char* graphicName = Aeloria_ProducedAircraftGraphicName(aircraft_type);
 
 	DLL_Draw_Intercept(bodyShape, x, y, drawW, drawH, AELORIA_CLIENT_DRAW_FLAGS_CENTER,
-	                   const_cast<AircraftClass*>(aircraft), rotation, 0x100, nullptr, (char)aircraft->Owner());
+	                   const_cast<AircraftClass*>(aircraft), rotation, 0x100, graphicName, (char)aircraft->Owner());
 
 	if (rotorEquipped) {
 		int jitter = 0;
@@ -650,48 +714,31 @@ void AircraftClass::Draw_It(int x, int y, WindowNumberType window) const
 	}
 	const int guardedFlag = useGuardedIntercept ? 1 : 0;
 
-	// Phase E.1: produced rotor — vanilla LAYERS chain (body + shadow + rotors + overlay) for client parity.
+	// Phase E.2: produced rotor — prefer full LAYERS chain before guarded/emit fallbacks.
 	if (window == WINDOW_VIRTUAL && rotorProducedAircraft) {
-		void const* shapefile = Get_Image_Data();
-		int shapenum = Shape_Number();
-		if (shapefile != nullptr && shapenum >= 0) {
-			DirType rotation = DIR_N;
-			if (aircraft_type->Rotation == 16) {
-				rotation = DirType(Rotation16[SecondaryFacing]);
-			}
-			int jitter = 0;
-			if (Height == FLIGHT_LEVEL && Get_Speed() < 3) {
-				static int _jitter[] = {0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, -1, -1, -1, 0};
-				jitter = _jitter[::Frame % 16];
-			}
-			Aeloria_LogProducedAircraftFirstDrawIfNeeded(this, window, 0, bad_plus_8 ? 1 : 0);
-			Techno_Draw_Object(shapefile, shapenum, x, y + jitter, window, rotation);
-			if (Visual_Character() <= VISUAL_DARKEN) {
-				CC_Draw_Shape(this, shapefile, shapenum, x + 1, y + 2, window,
-				              SHAPE_PREDATOR | SHAPE_CENTER | SHAPE_WIN_REL | SHAPE_FADING,
-				              DisplayClass::FadingShade, NULL);
-			}
-			if (Class->IsRotorEquipped) {
-				Draw_Rotors(x, y + jitter, window);
-			}
-			FootClass::Draw_It(x, y - Lepton_To_Pixel(Height), window);
-			Aeloria_SyncVirtualSelectionHud(this);
-			Aeloria_RecordProducedAircraftVirtualEmit(this);
-			if (drawW > 0 && drawH > 0) {
-				Aeloria_TryNotifyProducedUnitMainDrawCache(selfObj, shapenum, drawW, drawH, x, y + jitter, bad_plus_8);
-			}
+		Aeloria_LogProducedAircraftFirstDrawIfNeeded(this, window, 0, bad_plus_8 ? 1 : 0);
+		if (Aeloria_DrawProducedRotorVirtualLayers(this, x, y, window, drawW, drawH, aircraft_type, selfObj,
+		                                         bad_plus_8, "primary")) {
 			return;
 		}
 	}
 
 	if (window == WINDOW_VIRTUAL && useGuardedIntercept) {
+		if (rotorProducedAircraft
+		    && Aeloria_DrawProducedRotorVirtualLayers(this, x, y, window, drawW, drawH, aircraft_type, selfObj,
+		                                            bad_plus_8, "guarded_fallback")) {
+			Aeloria_LogProducedAircraftFirstDrawIfNeeded(this, window, guardedFlag, bad_plus_8 ? 1 : 0);
+			return;
+		}
 		Aeloria_LogProducedAircraftFirstDrawIfNeeded(this, window, guardedFlag, bad_plus_8 ? 1 : 0);
 		int virtualShape = Aeloria_GuardedAircraftShapeNumber(this);
 		if (virtualShape <= 0) {
 			virtualShape = 16;
 		}
 		DLL_Draw_Intercept(virtualShape, x, y, drawW, drawH, AELORIA_CLIENT_DRAW_FLAGS_CENTER,
-		                   const_cast<AircraftClass*>(this), DIR_N, 0x100, nullptr, (char)Owner());
+		                   const_cast<AircraftClass*>(this),
+		                   Aeloria_ProducedAircraftInterceptRotation(this, aircraft_type), 0x100,
+		                   Aeloria_ProducedAircraftGraphicName(aircraft_type), (char)Owner());
 		if (aircraft_type->IsRotorEquipped) {
 			int jitter = 0;
 			if (Height == FLIGHT_LEVEL && Get_Speed() < 3) {
@@ -748,8 +795,16 @@ void AircraftClass::Draw_It(int x, int y, WindowNumberType window) const
 				Aeloria_ProducedAircraftBulkDrawCoords(this, x, y, bulkX, bulkY);
 				Aeloria_TryNotifyProducedUnitMainDrawCache(selfObj, liteShape, drawW, drawH, bulkX, bulkY, bad_plus_8);
 			}
-		} else if (!aircraft_type->IsFixedWing && !bad_plus_8) {
-			Aeloria_ProducedAircraftEmitClientDraw(this, x, y, window, drawW, drawH, aircraft_type);
+		} else {
+			// Phase E.2: never leave VIRTUAL without a client draw (Mig blink + invisible helis).
+			if (rotorProducedAircraft) {
+				if (!Aeloria_DrawProducedRotorVirtualLayers(this, x, y, window, drawW, drawH, aircraft_type, selfObj,
+				                                          bad_plus_8, "lite_seed")) {
+					Aeloria_ProducedAircraftEmitClientDraw(this, x, y, window, drawW, drawH, aircraft_type);
+				}
+			} else {
+				Aeloria_ProducedAircraftEmitClientDraw(this, x, y, window, drawW, drawH, aircraft_type);
+			}
 		}
 		return;
 	}

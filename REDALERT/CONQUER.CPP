@@ -3593,6 +3593,10 @@ void CC_Draw_Shape(const ObjectClass *object, void const * shapefile, int shapen
 			                                                rotation, virtualscale, shapefile)) {
 				return;
 			}
+			if (Aeloria_TryVirtualCombatAnimExport(object, window, shapenum, x, y, width, height, flags,
+			                                       rotation, virtualscale, shapefile)) {
+				return;
+			}
 			if (Aeloria_TryStatelessTechnoDraw(object, shapenum, x, y, rotation, virtualscale, NULL, HOUSE_NONE)) {
 				return;
 			}
@@ -3888,6 +3892,10 @@ void CC_Draw_Shape(const ObjectClass *object, const char *shape_file_name, void 
 		if (!Is_Plausible_Class_Pointer(at_plus_8)) {
 			if (Aeloria_TryVirtualLayersExportDespiteBadPlus8(object, window, shapenum, x, y, 0, 0, flags,
 			                                                rotation, virtualscale, shapefile)) {
+				return;
+			}
+			if (Aeloria_TryVirtualCombatAnimExport(object, window, shapenum, x, y, 0, 0, flags,
+			                                       rotation, virtualscale, shapefile)) {
 				return;
 			}
 			if (Aeloria_TryStatelessTechnoDraw(object, shapenum, x, y, rotation, virtualscale, shape_file_name, override_owner)) {
