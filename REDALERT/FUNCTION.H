@@ -1119,6 +1119,9 @@ bool Aeloria_TechnoClassRawIsHealthy(TechnoClass const* techno);
 bool Aeloria_IsStatelessUntrackedTechno(const ObjectClass* obj);
 bool Aeloria_IsZeroMapUntrackedInfantry(const ObjectClass* obj);
 void Aeloria_OneShotProducedInfantryClientSeed(TechnoClass* techno);
+bool Aeloria_TryVirtualCombatAnimExport(const ObjectClass* object, WindowNumberType window, int shapenum, int x, int y,
+                                        int width, int height, ShapeFlags_Type flags, DirType rotation, long virtualscale,
+                                        void const* shapefile);
 bool Aeloria_TryStatelessTechnoDraw(const ObjectClass* object, int shapenum, int x, int y, DirType rotation, long virtualscale,
                                     const char* shape_file_name, char override_owner);
 bool Aeloria_TryStatelessInfantryVirtualDraw(const ObjectClass* object, int shapenum, int x, int y, DirType rotation, long virtualscale,
