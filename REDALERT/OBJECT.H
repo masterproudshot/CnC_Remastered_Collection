@@ -471,6 +471,12 @@ inline bool Is_Plausible_Class_Pointer(uintptr_t ptr)
 **	Used in CONQUER.CPP skip paths for loud bypass logging + relaxed checks.
 **	No log inside helper (would be too noisy); caller logs on actual exemption events.
 */
+// Bulk/sustain pixel bounds (matches DLLInterface.cpp Aeloria_IsValidBulkPixelPos).
+inline bool Aeloria_IsValidBulkPixelPos(int px, int py)
+{
+	return px >= 0 && py >= 0 && px < 8192 && py < 8192;
+}
+
 // True only when a MAIN-window draw cached non-zero width AND height (not bulk defaults).
 inline bool Aeloria_HasValidMainDrawCache(const ObjectClass* obj)
 {
@@ -482,6 +488,20 @@ inline bool Aeloria_HasValidMainDrawCache(const ObjectClass* obj)
 	// Virtual-window intercept can cache shape>0 while +8 is still corrupt on MAIN (1836 session).
 	// Only a confirmed MAIN tactical blitter draw clears the starting-unit MAIN guard.
 	return s.hasCachedMainDraw && s.cachedWidth > 0 && s.cachedHeight > 0 && s.cachedShapeNumber > 0;
+}
+
+// E.2.5: MAIN cache must also have on-map pixel coords (971d8e51 pos=(1908,-12) crash).
+inline bool Aeloria_HasSaneMainDrawCache(const ObjectClass* obj)
+{
+	if (!Aeloria_HasValidMainDrawCache(obj)) {
+		return false;
+	}
+	uintptr_t key = reinterpret_cast<uintptr_t>(obj);
+	auto it = g_AeloriaObjectStability.find(key);
+	if (it == g_AeloriaObjectStability.end()) {
+		return false;
+	}
+	return Aeloria_IsValidBulkPixelPos(it->second.cachedDrawX, it->second.cachedDrawY);
 }
 
 // SHAPE_CENTER (0x0020) | SHAPE_WIN_REL (0x0010) — matches Techno_Draw_Object / CC_Draw_Shape.

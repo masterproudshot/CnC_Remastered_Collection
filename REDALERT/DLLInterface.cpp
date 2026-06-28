@@ -1582,15 +1582,12 @@ void Aeloria_SeedProducedAircraftOnUnlimbo(TechnoClass* techno)
 	uintptr_t at_plus_8 = *(uintptr_t*)((const char*)techno + 8);
 	const bool runtimeBadPlus8 = !Is_Plausible_Class_Pointer(at_plus_8);
 	AircraftTypeClass const* atypeSeed = static_cast<AircraftTypeClass const*>(safe);
-	const bool fixedWingProduced = (atypeSeed == nullptr || atypeSeed->IsFixedWing);
-	// Phase E: rotor helis use guarded LAYERS virtual-emit — do not pin eternal bad+8 at Unlimbo.
-	stab.producedUnitBadPlus8 = runtimeBadPlus8 && fixedWingProduced;
+	// E.2.4b: pin bad+8 for produced rotors too — keeps guarded MAIN/VIRTUAL off legacy Class until sustain.
+	stab.producedUnitBadPlus8 = runtimeBadPlus8;
 	if (stab.producedUnitBadPlus8) {
-		Aeloria_Debug_Log("PRODUCED_AIRCRAFT_BAD_PLUS8 this=%p owner=%d type_enum=%d frame=%u (eternal safe draw)",
-		                  (void*)techno, (int)techno->Owner(), (int)stab.cachedTypeEnum, Frame);
-	} else if (runtimeBadPlus8 && atypeSeed && !atypeSeed->IsFixedWing) {
-		Aeloria_Debug_Log("PRODUCED_ROTOR_AIRCRAFT_UNLIMBO this=%p owner=%d type_enum=%d frame=%u (+8 suspect; defer eternal bad+8 to guarded virtual)",
-		                  (void*)techno, (int)techno->Owner(), (int)stab.cachedTypeEnum, Frame);
+		const bool rotor = (atypeSeed != nullptr && !atypeSeed->IsFixedWing);
+		Aeloria_Debug_Log("PRODUCED_AIRCRAFT_BAD_PLUS8 this=%p owner=%d type_enum=%d frame=%u rotor=%d (eternal safe draw)",
+		                  (void*)techno, (int)techno->Owner(), (int)stab.cachedTypeEnum, Frame, rotor ? 1 : 0);
 	}
 
 	// 5z-m2/m7: no DLL_Draw_Intercept from Unlimbo; earlySafeClientRegistered only when +8 corrupt (fixed-wing).
@@ -5736,6 +5733,14 @@ bool Aeloria_TryNotifyProducedUnitMainDrawCache(const ObjectClass* obj, int shap
 	if (it == g_AeloriaObjectStability.end() || !it->second.producedUnitUnlimboSeeded) {
 		return false;
 	}
+	// E.2.5: reject garbage bulk coords while +8 corrupt (soak 971d8e51 pos=(1908,-12)).
+	if (!Aeloria_IsValidBulkPixelPos(draw_x, draw_y)) {
+		if (Aeloria_ShouldLogOncePerObject(obj, AEL_LOG_PLAYER_CREATION)) {
+			Aeloria_Debug_Log("MAIN_CACHE_REJECT_POS this=%p pos=(%d,%d) frame=%u",
+			                  (void*)obj, draw_x, draw_y, Frame);
+		}
+		return false;
+	}
 	if (runtime_bad_plus_8) {
 		it->second.producedUnitBadPlus8 = true;
 	} else if (Aeloria_IsProducedRotorAircraft(obj)) {
@@ -5859,11 +5864,6 @@ static BuildingTypeClass const* Aeloria_Safe_Building_Type(BuildingClass const* 
 		return static_cast<BuildingTypeClass const*>(ttype);
 	}
 	return &BuildingTypeClass::As_Reference(STRUCT_TURRET);
-}
-
-static bool Aeloria_IsValidBulkPixelPos(int px, int py)
-{
-	return px >= 0 && py >= 0 && px < 8192 && py < 8192;
 }
 
 // Moving foot units leave Map.Layer during MARK_UP; live Coord_To_Pixel can fail while MAIN draw coords are good.

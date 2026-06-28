@@ -534,6 +534,53 @@ static const char* Aeloria_ProducedAircraftGraphicName(AircraftTypeClass const* 
 	return nullptr;
 }
 
+// E.2.4b: Shape_Number() reads Class->Rotation — unsafe for pool-reused helis even when +8 looks OK.
+static bool Aeloria_ProducedRotorUseGuardedShapeOnly(const AircraftClass* aircraft,
+                                                     AircraftTypeClass const* aircraft_type)
+{
+	if (aircraft == nullptr || aircraft_type == nullptr || aircraft_type->IsFixedWing
+	    || !aircraft_type->IsRotorEquipped) {
+		return false;
+	}
+	uintptr_t key = reinterpret_cast<uintptr_t>(aircraft);
+	auto it = g_AeloriaObjectStability.find(key);
+	if (it == g_AeloriaObjectStability.end() || !it->second.producedUnitUnlimboSeeded) {
+		return false;
+	}
+	if (!it->second.sustainRetired) {
+		return true;
+	}
+	uintptr_t at_plus_8 = *(uintptr_t*)((const char*)aircraft + 8);
+	if (!Is_Plausible_Class_Pointer(at_plus_8)) {
+		return true;
+	}
+	return !Aeloria_TechnoClassRawIsHealthy(static_cast<const TechnoClass*>(aircraft));
+}
+
+// E.2.4/E.2.5: Plausible runtime +8 after MAIN cache is not enough for legacy Techno/rotors on
+// pool-reused helis — stay on guarded emit until sustain handoff and Class is healthy.
+static bool Aeloria_ProducedRotorPrefersSafeEmit(const AircraftClass* aircraft)
+{
+	if (aircraft == nullptr) {
+		return false;
+	}
+	AircraftTypeClass const* atype = static_cast<AircraftTypeClass const*>(
+	    Aeloria_Safe_Techno_Type(const_cast<AircraftClass*>(aircraft)));
+	if (atype == nullptr || atype->IsFixedWing) {
+		return false;
+	}
+	if (Aeloria_ProducedRotorUseGuardedShapeOnly(aircraft, atype)) {
+		return true;
+	}
+	uintptr_t key = reinterpret_cast<uintptr_t>(aircraft);
+	auto it = g_AeloriaObjectStability.find(key);
+	if (it == g_AeloriaObjectStability.end() || !it->second.producedUnitUnlimboSeeded
+	    || it->second.sustainRetired) {
+		return false;
+	}
+	return true;
+}
+
 // Phase E.2: full rotor LAYERS chain when shape data is available (returns false → caller uses emit).
 static bool Aeloria_DrawProducedRotorVirtualLayers(const AircraftClass* aircraft, int x, int y,
                                                    WindowNumberType window, int drawW, int drawH,
@@ -544,8 +591,8 @@ static bool Aeloria_DrawProducedRotorVirtualLayers(const AircraftClass* aircraft
 	if (window != WINDOW_VIRTUAL || aircraft == nullptr || aircraft_type == nullptr || aircraft_type->IsFixedWing) {
 		return false;
 	}
-	// E.2.1: legacy Techno/rotors touch Class — unsafe when runtime +8 is corrupt (pool-reused helis).
-	if (bad_plus_8) {
+	// E.2.1/E.2.5: legacy Techno/rotors touch Class — unsafe when +8 corrupt or Class unhealthy.
+	if (bad_plus_8 || Aeloria_ProducedRotorUseGuardedShapeOnly(aircraft, aircraft_type)) {
 		return false;
 	}
 	void const* shapefile = aircraft->Get_Image_Data();
@@ -593,9 +640,15 @@ static void Aeloria_ProducedAircraftEmitClientDraw(const AircraftClass* aircraft
 	}
 
 	const bool rotorEquipped = aircraft_type->IsRotorEquipped;
-	int bodyShape = aircraft->Shape_Number();
-	if (bodyShape <= 0) {
+	const bool guardedShapeOnly = Aeloria_ProducedRotorUseGuardedShapeOnly(aircraft, aircraft_type);
+	int bodyShape = 0;
+	if (guardedShapeOnly) {
 		bodyShape = Aeloria_GuardedAircraftShapeNumber(aircraft);
+	} else {
+		bodyShape = aircraft->Shape_Number();
+		if (bodyShape <= 0) {
+			bodyShape = Aeloria_GuardedAircraftShapeNumber(aircraft);
+		}
 	}
 	if (bodyShape <= 0) {
 		bodyShape = 16;
@@ -700,7 +753,11 @@ void AircraftClass::Draw_It(int x, int y, WindowNumberType window) const
 			// exists (premature clear left Hind/Longbow on defer+early-return with no LAYERS export).
 			if (!bad_plus_8 && stabIt->second.producedUnitBadPlus8) {
 				const bool rotorProduced = !aircraft_type->IsFixedWing;
-				if (!rotorProduced || Aeloria_HasValidMainDrawCache(selfObj)) {
+				// E.2.5: rotor pin clears only after sustain, sane MAIN cache, and healthy Class.
+				if (!rotorProduced
+				    || (stabIt->second.sustainRetired
+				        && Aeloria_HasSaneMainDrawCache(selfObj)
+				        && Aeloria_TechnoClassRawIsHealthy(this))) {
 					stabIt->second.producedUnitBadPlus8 = false;
 					Aeloria_Debug_Log("PRODUCED_AIRCRAFT_BAD_PLUS8_CLEARED this=%p owner=%d frame=%u type_enum=%d (runtime +8 ok)",
 					                  (void*)this, (int)Owner(), Frame, (int)stabIt->second.cachedTypeEnum);
@@ -739,28 +796,35 @@ void AircraftClass::Draw_It(int x, int y, WindowNumberType window) const
 	}
 	const int guardedFlag = useGuardedIntercept ? 1 : 0;
 
-	// Phase E.2.2: corrupt +8 rotors cannot use Techno/rotor layers — emit body + accessory rotors.
-	if (window == WINDOW_VIRTUAL && rotorProducedAircraft && bad_plus_8) {
-		Aeloria_LogProducedAircraftFirstDrawIfNeeded(this, window, guardedFlag, 1);
-		Aeloria_ProducedAircraftEmitClientDraw(this, x, y, window, drawW, drawH, aircraft_type);
-		return;
-	}
-
-	// Phase E.2: produced rotor — prefer full LAYERS chain before guarded/emit fallbacks.
+	// Phase E.2.2/E.2.4: produced rotors use guarded emit until sustain handoff (and when +8 corrupt).
 	if (window == WINDOW_VIRTUAL && rotorProducedAircraft) {
-		Aeloria_LogProducedAircraftFirstDrawIfNeeded(this, window, 0, bad_plus_8 ? 1 : 0);
+		const bool safeEmit = bad_plus_8 || Aeloria_ProducedRotorPrefersSafeEmit(this);
+		Aeloria_LogProducedAircraftFirstDrawIfNeeded(this, window, safeEmit ? guardedFlag : 0,
+		                                             bad_plus_8 ? 1 : 0);
+		if (safeEmit) {
+			Aeloria_ProducedAircraftEmitClientDraw(this, x, y, window, drawW, drawH, aircraft_type);
+			return;
+		}
 		if (Aeloria_DrawProducedRotorVirtualLayers(this, x, y, window, drawW, drawH, aircraft_type, selfObj,
 		                                         bad_plus_8, "primary")) {
 			return;
 		}
+		Aeloria_ProducedAircraftEmitClientDraw(this, x, y, window, drawW, drawH, aircraft_type);
+		return;
 	}
 
 	if (window == WINDOW_VIRTUAL && useGuardedIntercept) {
-		if (rotorProducedAircraft
-		    && Aeloria_DrawProducedRotorVirtualLayers(this, x, y, window, drawW, drawH, aircraft_type, selfObj,
-		                                            bad_plus_8, "guarded_fallback")) {
-			Aeloria_LogProducedAircraftFirstDrawIfNeeded(this, window, guardedFlag, bad_plus_8 ? 1 : 0);
-			return;
+		if (rotorProducedAircraft) {
+			if (Aeloria_ProducedRotorPrefersSafeEmit(this) || bad_plus_8) {
+				Aeloria_LogProducedAircraftFirstDrawIfNeeded(this, window, guardedFlag, bad_plus_8 ? 1 : 0);
+				Aeloria_ProducedAircraftEmitClientDraw(this, x, y, window, drawW, drawH, aircraft_type);
+				return;
+			}
+			if (Aeloria_DrawProducedRotorVirtualLayers(this, x, y, window, drawW, drawH, aircraft_type, selfObj,
+			                                            bad_plus_8, "guarded_fallback")) {
+				Aeloria_LogProducedAircraftFirstDrawIfNeeded(this, window, guardedFlag, bad_plus_8 ? 1 : 0);
+				return;
+			}
 		}
 		Aeloria_LogProducedAircraftFirstDrawIfNeeded(this, window, guardedFlag, bad_plus_8 ? 1 : 0);
 		int virtualShape = Aeloria_GuardedAircraftShapeNumber(this);
@@ -800,7 +864,9 @@ void AircraftClass::Draw_It(int x, int y, WindowNumberType window) const
 				int bulkX = x;
 				int bulkY = y;
 				Aeloria_ProducedAircraftBulkDrawCoords(this, x, y, bulkX, bulkY);
-				Aeloria_TryNotifyProducedUnitMainDrawCache(selfObj, shapenum, drawW, drawH, bulkX, bulkY, bad_plus_8);
+				if (Aeloria_IsValidBulkPixelPos(bulkX, bulkY)) {
+					Aeloria_TryNotifyProducedUnitMainDrawCache(selfObj, shapenum, drawW, drawH, bulkX, bulkY, bad_plus_8);
+				}
 			}
 			// 5z-m14: MAIN guarded — cache only (client + rotors on VIRTUAL block above).
 			return;
@@ -830,8 +896,10 @@ void AircraftClass::Draw_It(int x, int y, WindowNumberType window) const
 		} else {
 			// Phase E.2: never leave VIRTUAL without a client draw (Mig blink + invisible helis).
 			if (rotorProducedAircraft) {
-				if (!Aeloria_DrawProducedRotorVirtualLayers(this, x, y, window, drawW, drawH, aircraft_type, selfObj,
-				                                          bad_plus_8, "lite_seed")) {
+				if (bad_plus_8 || Aeloria_ProducedRotorPrefersSafeEmit(this)) {
+					Aeloria_ProducedAircraftEmitClientDraw(this, x, y, window, drawW, drawH, aircraft_type);
+				} else if (!Aeloria_DrawProducedRotorVirtualLayers(this, x, y, window, drawW, drawH, aircraft_type, selfObj,
+				                                                    bad_plus_8, "lite_seed")) {
 					Aeloria_ProducedAircraftEmitClientDraw(this, x, y, window, drawW, drawH, aircraft_type);
 				}
 			} else {
@@ -870,6 +938,23 @@ void AircraftClass::Draw_It(int x, int y, WindowNumberType window) const
 	if (producedTracked && window == WINDOW_VIRTUAL && !Is_Drawable(this)) {
 		Aeloria_LogProducedAircraftFirstDrawIfNeeded(this, window, 0, bad_plus_8 ? 1 : 0);
 		Aeloria_ProducedAircraftEmitClientDraw(this, x, y, window, drawW, drawH, aircraft_type);
+		return;
+	}
+
+	// E.2.4: never legacy Techno_Draw for produced helis until sustain handoff.
+	if (Aeloria_ProducedRotorPrefersSafeEmit(this)) {
+		if (window == WINDOW_VIRTUAL) {
+			Aeloria_ProducedAircraftEmitClientDraw(this, x, y, window, drawW, drawH, aircraft_type);
+		} else if (drawW > 0 && drawH > 0) {
+			int cacheShape = Aeloria_GuardedAircraftShapeNumber(this);
+			if (cacheShape <= 0) {
+				cacheShape = 16;
+			}
+			int bulkX = x;
+			int bulkY = y;
+			Aeloria_ProducedAircraftBulkDrawCoords(this, x, y, bulkX, bulkY);
+			Aeloria_TryNotifyProducedUnitMainDrawCache(selfObj, cacheShape, drawW, drawH, bulkX, bulkY, bad_plus_8);
+		}
 		return;
 	}
 
