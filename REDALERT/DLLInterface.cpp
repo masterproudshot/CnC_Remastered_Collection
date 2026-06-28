@@ -723,6 +723,9 @@ static bool Aeloria_IsCriticalLogMessage(const char *fmt)
 		"PRODUCED_AIRCRAFT_BAD_PLUS8",
 		"PRODUCED_AIRCRAFT_BAD_PLUS8_CLEARED",
 		"PRODUCED_AIRCRAFT_INTERCEPT_DEFER",
+		"MIG_VIRTUAL_FRAME",
+		"PRODUCED_HELI_DRAW_PATH",
+		"EPHEMERAL_ANIM_EXPORT",
 		"PRODUCED_AIRCRAFT_LITE_MAIN_SEED",
 		"PRODUCED_AIRCRAFT_RESET",
 		"PRODUCED_AIRCRAFT_DRAW_EMERGENCY_SEED",
@@ -1679,7 +1682,7 @@ bool Aeloria_TryVirtualCombatAnimExport(const ObjectClass* object, WindowNumberT
 	}
 	DLLExportClass::DLL_Draw_Intercept(shapenum, x, y, w, h, (int)flags, object, rotation, virtualscale, asset, HOUSE_NONE);
 	if (Aeloria_ShouldLogOncePerObject(object, AEL_LOG_FIRST_REAL_DRAW)) {
-		Aeloria_Debug_Log("VIRTUAL_COMBAT_ANIM_EXPORT this=%p type=%d asset=%s shapenum=%d frame=%u",
+		Aeloria_Debug_Log("EPHEMERAL_ANIM_EXPORT this=%p type=%d asset=%s shapenum=%d frame=%u",
 		                  (void*)object, (int)animType, asset, shapenum, Frame);
 	}
 	return true;
@@ -5183,8 +5186,10 @@ void DLLExportClass::DLL_Draw_Intercept(int shape_number, int x, int y, int widt
 		    && !Aeloria_HasValidMainDrawCache(object)) {
 			uintptr_t at8 = *(uintptr_t*)((const char*)object + 8);
 			if (Is_Plausible_Class_Pointer(at8)) {
-				// E.2.1: restore 5z-m7 defer — pre-cache Mig intercept crashed InstanceServer; blink fixed in AIRCRAFT lite-seed emit.
-				if (!Aeloria_IsProducedRotorAircraft(object)) {
+				// E.2.1: defer Techno/CC_Draw_Shape intercept until MAIN cache (InstanceServer safety).
+				// E.2.2: never defer explicit client emit (shape_file_name set) — that caused Mig blink.
+				const bool explicitClientEmit = (shape_file_name != nullptr && shape_file_name[0] != '\0');
+				if (!explicitClientEmit && !Aeloria_IsProducedRotorAircraft(object)) {
 					Aeloria_Debug_Log("PRODUCED_AIRCRAFT_INTERCEPT_DEFER this=%p owner=%d frame=%u (defer to bulk after MAIN cache)",
 					                  (void*)object, (int)object->Owner(), Frame);
 					return;
@@ -5454,9 +5459,25 @@ void DLLExportClass::DLL_Draw_Intercept(int shape_number, int x, int y, int widt
 			new_object.RemapColor = -1;
 			new_object.VisibleFlags = anim_object->Get_Visible_Flags();
 
-			const AnimTypeClass& anim_type = static_cast<const AnimTypeClass&>(anim_object->Class_Of());
-			if (anim_type.VirtualName != NULL) {
-				strncpy(new_object.AssetName, anim_type.VirtualName, CNC_OBJECT_ASSET_NAME_LENGTH);
+			AnimType animKind = (AnimType)(*anim_object);
+			const char* animAsset = nullptr;
+			switch (animKind) {
+				case ANIM_FBALL1:
+					animAsset = "FBALL1";
+					break;
+				case ANIM_FBALL_FADE:
+					animAsset = "FB2";
+					break;
+				default:
+					break;
+			}
+			if (animAsset != nullptr) {
+				strncpy(new_object.AssetName, animAsset, CNC_OBJECT_ASSET_NAME_LENGTH);
+			} else if (Is_Drawable(anim_object)) {
+				const AnimTypeClass& anim_type = static_cast<const AnimTypeClass&>(anim_object->Class_Of());
+				if (anim_type.VirtualName != NULL) {
+					strncpy(new_object.AssetName, anim_type.VirtualName, CNC_OBJECT_ASSET_NAME_LENGTH);
+				}
 			}
 		}
 		break;

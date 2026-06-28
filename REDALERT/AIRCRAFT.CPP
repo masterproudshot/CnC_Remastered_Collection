@@ -561,8 +561,8 @@ static bool Aeloria_DrawProducedRotorVirtualLayers(const AircraftClass* aircraft
 	}
 	AircraftClass* mut_aircraft = const_cast<AircraftClass*>(aircraft);
 	if (pathTag && Aeloria_ShouldLogOncePerObject(aircraft, AEL_LOG_PLAYER_CREATION)) {
-		Aeloria_Debug_Log("PRODUCED_ROTOR_VIRTUAL_PATH this=%p owner=%d frame=%u path=%s bad_plus_8=%d",
-		                  (void*)aircraft, (int)aircraft->Owner(), Frame, pathTag, bad_plus_8 ? 1 : 0);
+		Aeloria_Debug_Log("PRODUCED_HELI_DRAW_PATH this=%p owner=%d frame=%u path=layers tag=%s bad_plus_8=%d shape=%d",
+		                  (void*)aircraft, (int)aircraft->Owner(), Frame, pathTag, bad_plus_8 ? 1 : 0, shapenum);
 	}
 	mut_aircraft->Techno_Draw_Object(shapefile, shapenum, x, y + jitter, window, rotation);
 	if (aircraft->Visual_Character() <= VISUAL_DARKEN) {
@@ -600,8 +600,26 @@ static void Aeloria_ProducedAircraftEmitClientDraw(const AircraftClass* aircraft
 	if (bodyShape <= 0) {
 		bodyShape = 16;
 	}
+	// E.2.2: fixed-wing VIRTUAL must track guarded facing (same as MAIN cache) to stop Mig blink.
+	if (aircraft_type->IsFixedWing) {
+		int facingShape = Aeloria_GuardedAircraftShapeNumber(aircraft);
+		if (facingShape > 0) {
+			bodyShape = facingShape;
+		}
+	}
 	DirType rotation = Aeloria_ProducedAircraftInterceptRotation(aircraft, aircraft_type);
 	const char* graphicName = Aeloria_ProducedAircraftGraphicName(aircraft_type);
+
+	if (rotorEquipped && Aeloria_ShouldLogOncePerObject(aircraft, AEL_LOG_PLAYER_CREATION)) {
+		Aeloria_Debug_Log("PRODUCED_HELI_DRAW_PATH this=%p owner=%d frame=%u path=emit shape=%d asset=%s",
+		                  (void*)aircraft, (int)aircraft->Owner(), Frame, bodyShape,
+		                  graphicName ? graphicName : "(null)");
+	}
+	if (aircraft_type->IsFixedWing && Aeloria_ShouldLogOncePerObject(aircraft, AEL_LOG_PLAYER_CREATION)) {
+		Aeloria_Debug_Log("MIG_VIRTUAL_FRAME this=%p owner=%d frame=%u shape=%d rot=%d asset=%s",
+		                  (void*)aircraft, (int)aircraft->Owner(), Frame, bodyShape, (int)rotation,
+		                  graphicName ? graphicName : "(null)");
+	}
 
 	DLL_Draw_Intercept(bodyShape, x, y, drawW, drawH, AELORIA_CLIENT_DRAW_FLAGS_CENTER,
 	                   const_cast<AircraftClass*>(aircraft), rotation, 0x100, graphicName, (char)aircraft->Owner());
@@ -717,6 +735,13 @@ void AircraftClass::Draw_It(int x, int y, WindowNumberType window) const
 		useGuardedIntercept = false;
 	}
 	const int guardedFlag = useGuardedIntercept ? 1 : 0;
+
+	// Phase E.2.2: corrupt +8 rotors cannot use Techno/rotor layers — emit body + accessory rotors.
+	if (window == WINDOW_VIRTUAL && rotorProducedAircraft && bad_plus_8) {
+		Aeloria_LogProducedAircraftFirstDrawIfNeeded(this, window, guardedFlag, 1);
+		Aeloria_ProducedAircraftEmitClientDraw(this, x, y, window, drawW, drawH, aircraft_type);
+		return;
+	}
 
 	// Phase E.2: produced rotor — prefer full LAYERS chain before guarded/emit fallbacks.
 	if (window == WINDOW_VIRTUAL && rotorProducedAircraft) {

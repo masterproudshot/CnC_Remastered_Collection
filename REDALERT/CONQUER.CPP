@@ -3642,6 +3642,14 @@ void CC_Draw_Shape(const ObjectClass *object, void const * shapefile, int shapen
 		if (width == 0) width = Get_Build_Frame_Width(shapefile);
 		if (height == 0) height = Get_Build_Frame_Height(shapefile);
 
+		// E.2.2: combat stream anims (flame tower FBALL) export every LAYERS frame without hasCreation.
+		if (object && object->What_Am_I() == RTTI_ANIM) {
+			if (Aeloria_TryVirtualCombatAnimExport(object, window, shapenum, x, y, width, height, flags,
+			                                       rotation, virtualscale, shapefile)) {
+				return;
+			}
+		}
+
 		// Placeholder only when virtual dims are still bad. Creation-record objects with valid
 		// w/h must use the normal DLL_Draw_Intercept path so real shape params cache and the
 		// sim does not spend ~18000 frames on double-intercept placeholders per unit.
