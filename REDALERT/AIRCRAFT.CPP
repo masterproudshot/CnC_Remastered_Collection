@@ -653,16 +653,19 @@ void AircraftClass::Draw_It(int x, int y, WindowNumberType window) const
 
 	Aeloria_Repair_Early_Class_Pointer(const_cast<AircraftClass*>(this));
 
+	const ObjectClass* selfObj = static_cast<const ObjectClass*>(this);
+	const bool producedAircraftSeeded = Aeloria_IsProducedUnitUnlimboSeeded(selfObj);
+
 	/*
 	**	Early-out if the Class pointer is not yet valid (can happen very early
 	**	during scenario load before TypeClasses are fully constructed).
+	**	E.2.3: produced helis/Migs must still VIRTUAL-emit when legacy Is_Drawable fails
+	**	(Class_Is_Valid / Get_Image_Data) — otherwise UNLIMBO_LITE_SEED with zero FIRST_DRAW.
 	*/
-	if (!Is_Drawable(this)) return;
+	if (!Is_Drawable(this) && !producedAircraftSeeded) return;
 
 	AircraftTypeClass const* aircraft_type = static_cast<AircraftTypeClass const*>(Aeloria_Safe_Techno_Type(this));
 	if (aircraft_type == nullptr) return;
-
-	const ObjectClass* selfObj = static_cast<const ObjectClass*>(this);
 	bool scenarioStart = g_EarlyLoadGraceActive || (Frame < 10);
 	if (!scenarioStart && !Aeloria_IsProducedUnitUnlimboSeeded(selfObj)) {
 		Aeloria_SeedProducedAircraftOnUnlimbo(const_cast<AircraftClass*>(this));
@@ -862,11 +865,24 @@ void AircraftClass::Draw_It(int x, int y, WindowNumberType window) const
 	if (g_AeloriaEnableVerboseDrawLogs && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_GET_IMAGE_DATA)) {
 		Aeloria_Debug_Log("Aircraft about to call Get_Image_Data this=%p Class.Raw=%ld", (void*)this, Class.Raw());
 	}
+
+	// E.2.3: produced aircraft that fail legacy shape lookup still need client export on LAYERS.
+	if (producedTracked && window == WINDOW_VIRTUAL && !Is_Drawable(this)) {
+		Aeloria_LogProducedAircraftFirstDrawIfNeeded(this, window, 0, bad_plus_8 ? 1 : 0);
+		Aeloria_ProducedAircraftEmitClientDraw(this, x, y, window, drawW, drawH, aircraft_type);
+		return;
+	}
+
 	/*
 	**	Verify the legality of the unit class.
 	*/
 	void const * shapefile = Get_Image_Data();
-	if (!shapefile) return;
+	if (!shapefile) {
+		if (producedTracked) {
+			return;
+		}
+		return;
+	}
 
 	int shapenum = Shape_Number();
 

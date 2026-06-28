@@ -6423,7 +6423,17 @@ static bool Aeloria_ForceLayerExport(const ObjectClass* object)
 		return true;
 	}
 	uintptr_t key = reinterpret_cast<uintptr_t>(object);
-	return g_AeloriaObjectCreationFrame.find(key) != g_AeloriaObjectCreationFrame.end();
+	if (g_AeloriaObjectCreationFrame.find(key) != g_AeloriaObjectCreationFrame.end()) {
+		return true;
+	}
+	// E.2.3: flying produced aircraft often have IsDown==false; keep exporting until sustain handoff.
+	auto stabIt = g_AeloriaObjectStability.find(key);
+	if (stabIt != g_AeloriaObjectStability.end()
+	    && stabIt->second.producedUnitUnlimboSeeded
+	    && !stabIt->second.sustainRetired) {
+		return true;
+	}
+	return false;
 }
 
 /**************************************************************************************************
