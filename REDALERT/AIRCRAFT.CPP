@@ -753,11 +753,11 @@ void AircraftClass::Draw_It(int x, int y, WindowNumberType window) const
 			// exists (premature clear left Hind/Longbow on defer+early-return with no LAYERS export).
 			if (!bad_plus_8 && stabIt->second.producedUnitBadPlus8) {
 				const bool rotorProduced = !aircraft_type->IsFixedWing;
-				// E.2.5: rotor pin clears only after sustain, sane MAIN cache, and healthy Class.
-				if (!rotorProduced
-				    || (stabIt->second.sustainRetired
-				        && Aeloria_HasSaneMainDrawCache(selfObj)
-				        && Aeloria_TechnoClassRawIsHealthy(this))) {
+				// E.2.6: U2 spy plane (type_enum=2 fixed-wing) + rotors — never clear bad+8 pin
+				// until sane MAIN cache and healthy Class (fdde15f0 lite-seed crash after fast clear).
+				if (Aeloria_HasSaneMainDrawCache(selfObj)
+				    && Aeloria_TechnoClassRawIsHealthy(this)
+				    && (!rotorProduced || stabIt->second.sustainRetired)) {
 					stabIt->second.producedUnitBadPlus8 = false;
 					Aeloria_Debug_Log("PRODUCED_AIRCRAFT_BAD_PLUS8_CLEARED this=%p owner=%d frame=%u type_enum=%d (runtime +8 ok)",
 					                  (void*)this, (int)Owner(), Frame, (int)stabIt->second.cachedTypeEnum);
@@ -885,13 +885,17 @@ void AircraftClass::Draw_It(int x, int y, WindowNumberType window) const
 			if (liteShape <= 0) {
 				liteShape = 16;
 			}
-			Aeloria_Debug_Log("PRODUCED_AIRCRAFT_LITE_MAIN_SEED this=%p owner=%d frame=%u shape=%d (defer legacy MAIN draw)",
-			                  (void*)this, (int)Owner(), Frame, liteShape);
+			if (Aeloria_ShouldLogOncePerObject(this, AEL_LOG_PLAYER_CREATION)) {
+				Aeloria_Debug_Log("PRODUCED_AIRCRAFT_LITE_MAIN_SEED this=%p owner=%d frame=%u shape=%d (defer legacy MAIN draw)",
+				                  (void*)this, (int)Owner(), Frame, liteShape);
+			}
 			if (drawW > 0 && drawH > 0) {
 				int bulkX = x;
 				int bulkY = y;
 				Aeloria_ProducedAircraftBulkDrawCoords(this, x, y, bulkX, bulkY);
-				Aeloria_TryNotifyProducedUnitMainDrawCache(selfObj, liteShape, drawW, drawH, bulkX, bulkY, bad_plus_8);
+				if (Aeloria_IsValidBulkPixelPos(bulkX, bulkY)) {
+					Aeloria_TryNotifyProducedUnitMainDrawCache(selfObj, liteShape, drawW, drawH, bulkX, bulkY, bad_plus_8);
+				}
 			}
 		} else {
 			// Phase E.2: never leave VIRTUAL without a client draw (Mig blink + invisible helis).
