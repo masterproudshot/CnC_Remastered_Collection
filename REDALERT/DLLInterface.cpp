@@ -5761,10 +5761,13 @@ bool Aeloria_TryNotifyProducedUnitMainDrawCache(const ObjectClass* obj, int shap
 	int cacheY = draw_y;
 	if (!Aeloria_IsValidBulkPixelPos(cacheX, cacheY)) {
 		const TechnoClass* techno = reinterpret_cast<const TechnoClass*>(obj);
-		if (techno && Map.Coord_To_Pixel(techno->Render_Coord(), cacheX, cacheY)
+		// E.2.12b: Map/Render_Coord unsafe before match load (main menu AV).
+		if (techno && techno->IsActive && !techno->IsInLimbo && Frame > 0
+		    && Map.Coord_To_Pixel(techno->Render_Coord(), cacheX, cacheY)
 		    && Aeloria_IsValidBulkPixelPos(cacheX, cacheY)) {
-			// E.2.12: Draw_It tactical coords can fail bulk check; map pixel fallback unblocks MAIN cache.
-		} else if (techno && Map.Coord_To_Pixel(techno->Center_Coord(), cacheX, cacheY)
+			// Draw_It tactical coords can fail bulk check; map pixel fallback unblocks MAIN cache.
+		} else if (techno && techno->IsActive && !techno->IsInLimbo && Frame > 0
+		           && Map.Coord_To_Pixel(techno->Center_Coord(), cacheX, cacheY)
 		           && Aeloria_IsValidBulkPixelPos(cacheX, cacheY)) {
 		} else {
 			if (Aeloria_ShouldLogOncePerObject(obj, AEL_LOG_PLAYER_CREATION)) {

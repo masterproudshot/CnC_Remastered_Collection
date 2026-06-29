@@ -482,18 +482,18 @@ void VesselClass::Draw_It(int x, int y, WindowNumberType window) const
 	const ObjectClass* selfObj = static_cast<const ObjectClass*>(this);
 	const bool producedTracked = Aeloria_IsProducedUnitUnlimboSeeded(selfObj);
 	const bool eternalProduced = Aeloria_IsEternalSafeProducedUnit(selfObj);
-	const bool classHealthy = Aeloria_TechnoClassRawIsHealthy(this);
-	const bool graduatedLegacy = Aeloria_ProducedUnitMayUseLegacyDraw(selfObj, this);
+	const bool graduatedLegacy = producedTracked && Aeloria_ProducedUnitMayUseLegacyDraw(selfObj, this);
+	const bool useLegacyDraw = graduatedLegacy && !bad_plus_8;
 	const bool producedBadPlus8 = eternalProduced
 	                              || Aeloria_IsProducedBadPlus8Unit(selfObj)
-	                              || (bad_plus_8 && producedTracked && !classHealthy && !graduatedLegacy);
+	                              || (bad_plus_8 && producedTracked);
 	const bool needsMainGuard = Aeloria_IsEarlyStartingUnitMainGuarded(selfObj);
 	const int guardedFlag = (needsMainGuard || producedBadPlus8) ? 1 : 0;
 
 	if (window == WINDOW_VIRTUAL) {
-		Aeloria_LogProducedVesselFirstDrawIfNeeded(this, window, graduatedLegacy ? 0 : guardedFlag, bad_plus_8 ? 1 : 0);
+		Aeloria_LogProducedVesselFirstDrawIfNeeded(this, window, useLegacyDraw ? 0 : guardedFlag, bad_plus_8 ? 1 : 0);
 		int virtualShape = 0;
-		if (graduatedLegacy) {
+		if (useLegacyDraw) {
 			uintptr_t stabKey = reinterpret_cast<uintptr_t>(this);
 			auto stabIt = g_AeloriaObjectStability.find(stabKey);
 			if (stabIt != g_AeloriaObjectStability.end() && stabIt->second.cachedShapeNumber > 0) {
@@ -517,7 +517,7 @@ void VesselClass::Draw_It(int x, int y, WindowNumberType window) const
 		Aeloria_Debug_Log("PRODUCED_VESSEL_MAIN_GUARD this=%p owner=%d frame=%u (safe MAIN draw; corrupt +8 guard)",
 		                  (void*)this, (int)Owner(), Frame);
 	}
-	if (!graduatedLegacy && (bad_plus_8 || producedBadPlus8 || needsMainGuard)) {
+	if (!useLegacyDraw && (bad_plus_8 || producedBadPlus8 || needsMainGuard)) {
 		Aeloria_LogProducedVesselFirstDrawIfNeeded(this, window, guardedFlag, bad_plus_8 ? 1 : 0);
 		int shapenum = Aeloria_GuardedVesselShapeNumber(this);
 		if (drawW > 0 && drawH > 0 && producedTracked) {
@@ -530,7 +530,7 @@ void VesselClass::Draw_It(int x, int y, WindowNumberType window) const
 		return;
 	}
 
-	if (graduatedLegacy && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_PRODUCED_UNIT_GRADUATED)) {
+	if (useLegacyDraw && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_PRODUCED_UNIT_GRADUATED)) {
 		Aeloria_Debug_Log("PRODUCED_UNIT_GRADUATED_LEGACY_DRAW this=%p owner=%d frame=%u rtti=%d",
 		                  (void*)this, (int)Owner(), Frame, (int)What_Am_I());
 	}

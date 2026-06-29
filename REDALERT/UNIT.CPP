@@ -2220,24 +2220,24 @@ void UnitClass::Draw_It(int x, int y, WindowNumberType window) const
 	const bool producedTracked = Aeloria_IsProducedUnitUnlimboSeeded(selfObj);
 	const bool eternalProduced = Aeloria_IsEternalSafeProducedUnit(selfObj);
 	const bool producedHarvester = Aeloria_IsProducedBadPlus8Harvester(selfObj);
-	const bool classHealthy = Aeloria_TechnoClassRawIsHealthy(this);
-	const bool graduatedLegacy = Aeloria_ProducedUnitMayUseLegacyDraw(selfObj, this);
+	const bool graduatedLegacy = producedTracked && Aeloria_ProducedUnitMayUseLegacyDraw(selfObj, this);
+	const bool useLegacyDraw = graduatedLegacy && !bad_plus_8;
 	const bool producedBadPlus8 = eternalProduced
 	                              || Aeloria_IsProducedBadPlus8Unit(selfObj)
-	                              || (bad_plus_8 && producedTracked && !classHealthy && !graduatedLegacy);
+	                              || (bad_plus_8 && producedTracked);
 	const bool needsMainGuard = Aeloria_IsEarlyStartingUnitMainGuarded(selfObj);
 	const int guardedFlag = (needsMainGuard || repurposedHarvester || producedBadPlus8) ? 1 : 0;
 
 	// LAYERS export uses WINDOW_VIRTUAL. Never call Get_Image_Data / Techno_Draw_Object here —
 	// produced war-factory units can pass plausible +8 while Class is still corrupt.
 	if (window == WINDOW_VIRTUAL) {
-		Aeloria_LogProducedUnitFirstDrawIfNeeded(this, window, graduatedLegacy ? 0 : guardedFlag, bad_plus_8 ? 1 : 0);
+		Aeloria_LogProducedUnitFirstDrawIfNeeded(this, window, useLegacyDraw ? 0 : guardedFlag, bad_plus_8 ? 1 : 0);
 		if (needsMainGuard && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_PLAYER_CREATION)) {
 			Aeloria_Debug_Log("UNIT_VIRTUAL_GUARD this=%p owner=%d frame=%u (safe VIRTUAL draw)",
 			                  (void*)this, (int)Owner(), Frame);
 		}
 		int virtualShape = 0;
-		if (graduatedLegacy) {
+		if (useLegacyDraw) {
 			uintptr_t stabKey = reinterpret_cast<uintptr_t>(this);
 			auto stabIt = g_AeloriaObjectStability.find(stabKey);
 			if (stabIt != g_AeloriaObjectStability.end() && stabIt->second.cachedShapeNumber > 0) {
@@ -2264,7 +2264,7 @@ void UnitClass::Draw_It(int x, int y, WindowNumberType window) const
 		Aeloria_Debug_Log("%s this=%p owner=%d frame=%u (safe MAIN draw; corrupt +8 guard)",
 		                  guardTag, (void*)this, (int)Owner(), Frame);
 	}
-	if (!graduatedLegacy && (bad_plus_8 || repurposedHarvester || producedBadPlus8 || needsMainGuard)) {
+	if (!useLegacyDraw && (bad_plus_8 || repurposedHarvester || producedBadPlus8 || needsMainGuard)) {
 		Aeloria_LogProducedUnitFirstDrawIfNeeded(this, window, guardedFlag, bad_plus_8 ? 1 : 0);
 		int shapenum = Aeloria_GuardedUnitShapeNumber(this);
 		// WF-produced: cache MAIN before intercept; use shape 0 intercept (matches unlimbo seed — 5z-n8).
@@ -2282,7 +2282,7 @@ void UnitClass::Draw_It(int x, int y, WindowNumberType window) const
 
 	Aeloria_LogProducedUnitFirstDrawIfNeeded(this, window, 0, bad_plus_8 ? 1 : 0);
 
-	if (graduatedLegacy && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_PRODUCED_UNIT_GRADUATED)) {
+	if (useLegacyDraw && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_PRODUCED_UNIT_GRADUATED)) {
 		Aeloria_Debug_Log("PRODUCED_UNIT_GRADUATED_LEGACY_DRAW this=%p owner=%d frame=%u rtti=%d",
 		                  (void*)this, (int)Owner(), Frame, (int)What_Am_I());
 	}
