@@ -595,7 +595,8 @@ inline bool Aeloria_IsEternalSafeProducedUnit(const ObjectClass* obj)
 	return it->second.producedUnitBadPlus8;
 }
 
-// E.2.11: produced ground/sea units may use legacy Techno_Draw after sustain handoff.
+// E.2.12: produced ground/sea units may use legacy Techno_Draw when Class.Raw is healthy.
+// +8 peek is often garbage while TypeClass resolves; sustainRetired never sets on eternal guarded intercept.
 // Aircraft use aircraft-specific graduation (E.2.9) — never call for RTTI_AIRCRAFT.
 inline bool Aeloria_ProducedUnitMayUseLegacyDraw(const ObjectClass* obj, TechnoClass const* techno)
 {
@@ -603,9 +604,7 @@ inline bool Aeloria_ProducedUnitMayUseLegacyDraw(const ObjectClass* obj, TechnoC
 	RTTIType rtti = obj->What_Am_I();
 	if (rtti == RTTI_AIRCRAFT) return false;
 	if (rtti != RTTI_UNIT && rtti != RTTI_VESSEL) return false;
-
-	uintptr_t at_plus_8 = *(uintptr_t*)((const char*)techno + 8);
-	if (!Is_Plausible_Class_Pointer(at_plus_8)) return false;
+	if (Aeloria_IsRepurposedHarvester(obj)) return false;
 	if (!Aeloria_TechnoClassRawIsHealthy(techno)) return false;
 
 	uintptr_t key = reinterpret_cast<uintptr_t>(obj);
@@ -613,9 +612,19 @@ inline bool Aeloria_ProducedUnitMayUseLegacyDraw(const ObjectClass* obj, TechnoC
 	if (it == g_AeloriaObjectStability.end()) return false;
 	const AeloriaObjectStability& stab = it->second;
 	if (!stab.producedUnitUnlimboSeeded || stab.producedUnitBadPlus8) return false;
-	if (!stab.sustainRetired) return false;
-	if (!Aeloria_HasValidMainDrawCache(obj)) return false;
-	return true;
+
+	if (Aeloria_HasValidMainDrawCache(obj)) {
+		return true;
+	}
+
+	// Brief guarded warmup after first MAIN draw, then trust Class.Raw health over +8 peek.
+	uint32_t seedFrame = Frame;
+	auto cfIt = g_AeloriaObjectCreationFrame.find(key);
+	if (cfIt != g_AeloriaObjectCreationFrame.end()) {
+		seedFrame = cfIt->second;
+	}
+	const bool hadMainDraw = (stab.producedUnitFirstDrawMask & 0x02u) != 0;
+	return hadMainDraw && Frame >= seedFrame + 120;
 }
 
 // Human MCV/sidebar-placed buildings: type cached at Unlimbo, corrupt +8 persists for the whole match.

@@ -5757,20 +5757,30 @@ bool Aeloria_TryNotifyProducedUnitMainDrawCache(const ObjectClass* obj, int shap
 		return false;
 	}
 	// E.2.5: reject garbage bulk coords while +8 corrupt (soak 971d8e51 pos=(1908,-12)).
-	if (!Aeloria_IsValidBulkPixelPos(draw_x, draw_y)) {
-		if (Aeloria_ShouldLogOncePerObject(obj, AEL_LOG_PLAYER_CREATION)) {
-			Aeloria_Debug_Log("MAIN_CACHE_REJECT_POS this=%p pos=(%d,%d) frame=%u",
-			                  (void*)obj, draw_x, draw_y, Frame);
+	int cacheX = draw_x;
+	int cacheY = draw_y;
+	if (!Aeloria_IsValidBulkPixelPos(cacheX, cacheY)) {
+		const TechnoClass* techno = reinterpret_cast<const TechnoClass*>(obj);
+		if (techno && Map.Coord_To_Pixel(techno->Render_Coord(), cacheX, cacheY)
+		    && Aeloria_IsValidBulkPixelPos(cacheX, cacheY)) {
+			// E.2.12: Draw_It tactical coords can fail bulk check; map pixel fallback unblocks MAIN cache.
+		} else if (techno && Map.Coord_To_Pixel(techno->Center_Coord(), cacheX, cacheY)
+		           && Aeloria_IsValidBulkPixelPos(cacheX, cacheY)) {
+		} else {
+			if (Aeloria_ShouldLogOncePerObject(obj, AEL_LOG_PLAYER_CREATION)) {
+				Aeloria_Debug_Log("MAIN_CACHE_REJECT_POS this=%p pos=(%d,%d) frame=%u",
+				                  (void*)obj, draw_x, draw_y, Frame);
+			}
+			return false;
 		}
-		return false;
 	}
-	if (runtime_bad_plus_8) {
+	if (runtime_bad_plus_8 && !Aeloria_TechnoClassRawIsHealthy(reinterpret_cast<TechnoClass const*>(obj))) {
 		it->second.producedUnitBadPlus8 = true;
 	}
 	// E.2.9: do not clear producedUnitBadPlus8 on MAIN cache notify (was rotor-only unpin).
 	int cacheShape = (shape_number > 0) ? shape_number : 16;
 	bool firstCache = !it->second.hasCachedMainDraw;
-	Aeloria_NotifyMainDrawCache(obj, cacheShape, width, height, draw_x, draw_y);
+	Aeloria_NotifyMainDrawCache(obj, cacheShape, width, height, cacheX, cacheY);
 	if (firstCache) {
 		const char* tag = (obj->What_Am_I() == RTTI_AIRCRAFT) ? "PRODUCED_AIRCRAFT_MAIN_CACHE" : "PRODUCED_UNIT_MAIN_CACHE";
 		Aeloria_Debug_Log("%s this=%p owner=%d shape=%d pos=(%d,%d) frame=%u",

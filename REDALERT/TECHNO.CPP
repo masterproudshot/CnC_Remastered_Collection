@@ -1429,10 +1429,10 @@ bool TechnoClass::Unlimbo(COORDINATE coord, DirType dir)
 				stab.producedUnitUnlimboSeeded = true;
 				stab.producedUnitFirstDrawMask = 0;
 				uintptr_t at_plus_8 = *(uintptr_t*)((const char*)this + 8);
-				// WF pool-reuse: +8 often plausible at Unlimbo then corrupt on MAIN (5z-n8 jeep@7214 / AV@7296).
-				stab.producedUnitBadPlus8 = true;
-				if (Is_Plausible_Class_Pointer(at_plus_8)) {
-					Aeloria_Debug_Log("PRODUCED_UNIT_PLAUSIBLE_PLUS8 this=%p owner=%d type_enum=%d frame=%u (eternal safe draw anyway)",
+				// E.2.12: pin only when +8 is bad at Unlimbo; plausible +8 may graduate after warmup (E.2.11 missed this).
+				stab.producedUnitBadPlus8 = !Is_Plausible_Class_Pointer(at_plus_8);
+				if (!stab.producedUnitBadPlus8) {
+					Aeloria_Debug_Log("PRODUCED_UNIT_PLAUSIBLE_PLUS8 this=%p owner=%d type_enum=%d frame=%u (graduation eligible)",
 					                  (void*)this, (int)Owner(), (int)stab.cachedTypeEnum, Frame);
 				}
 				if (stab.cachedTypeEnum == (int16_t)UNIT_HARVESTER) {
@@ -1473,10 +1473,10 @@ bool TechnoClass::Unlimbo(COORDINATE coord, DirType dir)
 				auto& stab = g_AeloriaObjectStability[key];
 				stab.producedUnitUnlimboSeeded = true;
 				stab.producedUnitFirstDrawMask = 0;
-				stab.producedUnitBadPlus8 = true;
 				uintptr_t at_plus_8 = *(uintptr_t*)((const char*)this + 8);
-				if (Is_Plausible_Class_Pointer(at_plus_8)) {
-					Aeloria_Debug_Log("PRODUCED_VESSEL_PLAUSIBLE_PLUS8 this=%p owner=%d type_enum=%d frame=%u (eternal safe draw anyway)",
+				stab.producedUnitBadPlus8 = !Is_Plausible_Class_Pointer(at_plus_8);
+				if (!stab.producedUnitBadPlus8) {
+					Aeloria_Debug_Log("PRODUCED_VESSEL_PLAUSIBLE_PLUS8 this=%p owner=%d type_enum=%d frame=%u (graduation eligible)",
 					                  (void*)this, (int)Owner(), (int)stab.cachedTypeEnum, Frame);
 				}
 				if (!stab.earlySafeClientRegistered) {

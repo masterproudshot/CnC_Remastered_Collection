@@ -482,10 +482,11 @@ void VesselClass::Draw_It(int x, int y, WindowNumberType window) const
 	const ObjectClass* selfObj = static_cast<const ObjectClass*>(this);
 	const bool producedTracked = Aeloria_IsProducedUnitUnlimboSeeded(selfObj);
 	const bool eternalProduced = Aeloria_IsEternalSafeProducedUnit(selfObj);
+	const bool classHealthy = Aeloria_TechnoClassRawIsHealthy(this);
+	const bool graduatedLegacy = Aeloria_ProducedUnitMayUseLegacyDraw(selfObj, this);
 	const bool producedBadPlus8 = eternalProduced
 	                              || Aeloria_IsProducedBadPlus8Unit(selfObj)
-	                              || (bad_plus_8 && producedTracked);
-	const bool graduatedLegacy = Aeloria_ProducedUnitMayUseLegacyDraw(selfObj, this);
+	                              || (bad_plus_8 && producedTracked && !classHealthy && !graduatedLegacy);
 	const bool needsMainGuard = Aeloria_IsEarlyStartingUnitMainGuarded(selfObj);
 	const int guardedFlag = (needsMainGuard || producedBadPlus8) ? 1 : 0;
 
