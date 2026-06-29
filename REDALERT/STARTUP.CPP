@@ -97,6 +97,37 @@ extern "C"{
 extern void Free_Heaps(void);
 extern void DLL_Shutdown(void);
 
+// E.2.13e: earliest correlation artifact — fires on DLL load, before CNC_Init (menu vs skirmish).
+static void Aeloria_LogDllProcessAttach(void)
+{
+	char userPath[MAX_PATH];
+	SYSTEMTIME st;
+	GetLocalTime(&st);
+
+	FILE* log = NULL;
+	if (GetEnvironmentVariableA("USERPROFILE", userPath, sizeof(userPath)) > 0) {
+		char logPath[MAX_PATH];
+		_snprintf(logPath, sizeof(logPath),
+		          "%s\\Aeloria-DllAttach-%04d%02d%02d.log",
+		          userPath, st.wYear, st.wMonth, st.wDay);
+		log = fopen(logPath, "a");
+	}
+
+	if (!log) {
+		log = fopen("Aeloria-DllAttach.log", "a");
+	}
+
+	if (log) {
+		fprintf(log,
+		        "[%04d-%02d-%02d %02d:%02d:%02d.%03d] DLL_PROCESS_ATTACH pid=%lu\n",
+		        st.wYear, st.wMonth, st.wDay,
+		        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+		        (unsigned long)GetCurrentProcessId());
+		fflush(log);
+		fclose(log);
+	}
+}
+
 BOOL WINAPI DllMain(HINSTANCE instance, unsigned int fdwReason, void *lpvReserved)
 {
 	lpvReserved;
@@ -105,6 +136,7 @@ BOOL WINAPI DllMain(HINSTANCE instance, unsigned int fdwReason, void *lpvReserve
 
 	case DLL_PROCESS_ATTACH:
 		ProgramInstance = instance;
+		Aeloria_LogDllProcessAttach();
 		break;
 
 	case DLL_PROCESS_DETACH:
