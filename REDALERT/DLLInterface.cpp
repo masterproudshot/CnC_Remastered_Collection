@@ -5688,7 +5688,11 @@ void Aeloria_GraduateTrackedObject(const ObjectClass* obj)
 	                                 && !Aeloria_IsProducedBadPlus8Unit(obj));
 
 	stab.stabilityLevel = 2;
-	if (!aircraftBulkRetain) {
+	// E.2.13b: MAIN cache on bad+8 WF units must not retire sustain while eternal-safe guarded
+	// draw is still required — E.2.13 map-coord cache made this fire on first harvester draw (0089580e AV).
+	const bool pinnedProducedSafeDraw = Aeloria_IsEternalSafeProducedUnit(obj)
+	                                    || Aeloria_IsRepurposedHarvester(obj);
+	if (!aircraftBulkRetain && !pinnedProducedSafeDraw) {
 		stab.sustainRetired = true;
 	}
 
