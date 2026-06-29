@@ -2214,22 +2214,12 @@ void UnitClass::Draw_It(int x, int y, WindowNumberType window) const
 	if (drawH <= 0) drawH = 48;
 
 	uintptr_t at_plus_8 = *(uintptr_t*)((const char*)this + 8);
-	const bool bad_plus_8 = !Is_Plausible_Class_Pointer(at_plus_8);
+	bool bad_plus_8 = !Is_Plausible_Class_Pointer(at_plus_8);
 	const ObjectClass* selfObj = static_cast<const ObjectClass*>(this);
 	const bool producedTracked = Aeloria_IsProducedUnitUnlimboSeeded(selfObj);
-	if (producedTracked && Aeloria_TryClearProducedUnitRuntimeBadPlus8(selfObj, this)
-	    && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_PLAYER_CREATION)) {
-		uintptr_t stabKey = reinterpret_cast<uintptr_t>(this);
-		auto stabIt = g_AeloriaObjectStability.find(stabKey);
-		int typeEnum = (stabIt != g_AeloriaObjectStability.end()) ? (int)stabIt->second.cachedTypeEnum : -1;
-		Aeloria_Debug_Log("PRODUCED_UNIT_RUNTIME_PLUS8_CLEARED this=%p owner=%d frame=%u type_enum=%d (runtime +8 ok)",
-		                  (void*)this, (int)Owner(), Frame, typeEnum);
-	}
 	const bool repurposedHarvester = Aeloria_IsRepurposedHarvester(selfObj);
 	const bool eternalProduced = Aeloria_IsEternalSafeProducedUnit(selfObj);
 	const bool producedHarvester = Aeloria_IsProducedBadPlus8Harvester(selfObj);
-	const bool graduatedLegacy = producedTracked && Aeloria_ProducedUnitMayUseLegacyDraw(selfObj, this);
-	const bool useLegacyDraw = graduatedLegacy && !bad_plus_8;
 	const bool producedBadPlus8 = eternalProduced
 	                              || Aeloria_IsProducedBadPlus8Unit(selfObj)
 	                              || (bad_plus_8 && producedTracked);
@@ -2238,7 +2228,10 @@ void UnitClass::Draw_It(int x, int y, WindowNumberType window) const
 
 	// LAYERS export uses WINDOW_VIRTUAL. Never call Get_Image_Data / Techno_Draw_Object here —
 	// produced war-factory units can pass plausible +8 while Class is still corrupt.
+	// E.2.13d: never unpin bad+8 on VIRTUAL — +8 flickers plausible there (0df20819 frame 4650).
 	if (window == WINDOW_VIRTUAL) {
+		const bool graduatedLegacy = producedTracked && Aeloria_ProducedUnitMayUseLegacyDraw(selfObj, this);
+		const bool useLegacyDraw = graduatedLegacy && !bad_plus_8;
 		Aeloria_LogProducedUnitFirstDrawIfNeeded(this, window, useLegacyDraw ? 0 : guardedFlag, bad_plus_8 ? 1 : 0);
 		if (needsMainGuard && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_PLAYER_CREATION)) {
 			Aeloria_Debug_Log("UNIT_VIRTUAL_GUARD this=%p owner=%d frame=%u (safe VIRTUAL draw)",
@@ -2266,15 +2259,34 @@ void UnitClass::Draw_It(int x, int y, WindowNumberType window) const
 		return;
 	}
 
-	if ((repurposedHarvester || producedBadPlus8 || needsMainGuard)
+	// E.2.13d: runtime unpin only on MAIN — VIRTUAL +8 is not trustworthy for graduation.
+	if (producedTracked && Aeloria_TryClearProducedUnitRuntimeBadPlus8(selfObj, this)
+	    && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_PLAYER_CREATION)) {
+		uintptr_t stabKey = reinterpret_cast<uintptr_t>(this);
+		auto stabIt = g_AeloriaObjectStability.find(stabKey);
+		int typeEnum = (stabIt != g_AeloriaObjectStability.end()) ? (int)stabIt->second.cachedTypeEnum : -1;
+		Aeloria_Debug_Log("PRODUCED_UNIT_RUNTIME_PLUS8_CLEARED this=%p owner=%d frame=%u type_enum=%d (runtime +8 ok)",
+		                  (void*)this, (int)Owner(), Frame, typeEnum);
+	}
+	at_plus_8 = *(uintptr_t*)((const char*)this + 8);
+	bad_plus_8 = !Is_Plausible_Class_Pointer(at_plus_8);
+	const bool eternalProducedMain = Aeloria_IsEternalSafeProducedUnit(selfObj);
+	const bool producedBadPlus8Main = eternalProducedMain
+	                                  || Aeloria_IsProducedBadPlus8Unit(selfObj)
+	                                  || (bad_plus_8 && producedTracked);
+	const bool graduatedLegacy = producedTracked && Aeloria_ProducedUnitMayUseLegacyDraw(selfObj, this);
+	const bool useLegacyDraw = graduatedLegacy && !bad_plus_8;
+	const int guardedFlagMain = (needsMainGuard || repurposedHarvester || producedBadPlus8Main) ? 1 : 0;
+
+	if ((repurposedHarvester || producedBadPlus8Main || needsMainGuard)
 	    && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_PLAYER_CREATION)) {
 		const char* guardTag = (repurposedHarvester || producedHarvester) ? "HARVESTER_MAIN_GUARD"
-		                     : (producedBadPlus8 ? "PRODUCED_UNIT_MAIN_GUARD" : "UNIT_MAIN_GUARD");
+		                     : (producedBadPlus8Main ? "PRODUCED_UNIT_MAIN_GUARD" : "UNIT_MAIN_GUARD");
 		Aeloria_Debug_Log("%s this=%p owner=%d frame=%u (safe MAIN draw; corrupt +8 guard)",
 		                  guardTag, (void*)this, (int)Owner(), Frame);
 	}
-	if (!useLegacyDraw && (bad_plus_8 || repurposedHarvester || producedBadPlus8 || needsMainGuard)) {
-		Aeloria_LogProducedUnitFirstDrawIfNeeded(this, window, guardedFlag, bad_plus_8 ? 1 : 0);
+	if (!useLegacyDraw && (bad_plus_8 || repurposedHarvester || producedBadPlus8Main || needsMainGuard)) {
+		Aeloria_LogProducedUnitFirstDrawIfNeeded(this, window, guardedFlagMain, bad_plus_8 ? 1 : 0);
 		int shapenum = Aeloria_GuardedUnitShapeNumber(this);
 		// WF-produced: cache MAIN before intercept; use shape 0 intercept (matches unlimbo seed — 5z-n8).
 		// Starting-unit MAIN notify still forbidden (5z-n4b).

@@ -481,24 +481,17 @@ void VesselClass::Draw_It(int x, int y, WindowNumberType window) const
 	bool bad_plus_8 = !Is_Plausible_Class_Pointer(at_plus_8);
 	const ObjectClass* selfObj = static_cast<const ObjectClass*>(this);
 	const bool producedTracked = Aeloria_IsProducedUnitUnlimboSeeded(selfObj);
-	if (producedTracked && Aeloria_TryClearProducedUnitRuntimeBadPlus8(selfObj, this)
-	    && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_PLAYER_CREATION)) {
-		uintptr_t stabKey = reinterpret_cast<uintptr_t>(this);
-		auto stabIt = g_AeloriaObjectStability.find(stabKey);
-		int typeEnum = (stabIt != g_AeloriaObjectStability.end()) ? (int)stabIt->second.cachedTypeEnum : -1;
-		Aeloria_Debug_Log("PRODUCED_UNIT_RUNTIME_PLUS8_CLEARED this=%p owner=%d frame=%u type_enum=%d (runtime +8 ok)",
-		                  (void*)this, (int)Owner(), Frame, typeEnum);
-	}
 	const bool eternalProduced = Aeloria_IsEternalSafeProducedUnit(selfObj);
-	const bool graduatedLegacy = producedTracked && Aeloria_ProducedUnitMayUseLegacyDraw(selfObj, this);
-	const bool useLegacyDraw = graduatedLegacy && !bad_plus_8;
 	const bool producedBadPlus8 = eternalProduced
 	                              || Aeloria_IsProducedBadPlus8Unit(selfObj)
 	                              || (bad_plus_8 && producedTracked);
 	const bool needsMainGuard = Aeloria_IsEarlyStartingUnitMainGuarded(selfObj);
 	const int guardedFlag = (needsMainGuard || producedBadPlus8) ? 1 : 0;
 
+	// E.2.13d: never unpin bad+8 on VIRTUAL — +8 flickers plausible on layer export.
 	if (window == WINDOW_VIRTUAL) {
+		const bool graduatedLegacy = producedTracked && Aeloria_ProducedUnitMayUseLegacyDraw(selfObj, this);
+		const bool useLegacyDraw = graduatedLegacy && !bad_plus_8;
 		Aeloria_LogProducedVesselFirstDrawIfNeeded(this, window, useLegacyDraw ? 0 : guardedFlag, bad_plus_8 ? 1 : 0);
 		int virtualShape = 0;
 		if (useLegacyDraw) {
@@ -521,13 +514,31 @@ void VesselClass::Draw_It(int x, int y, WindowNumberType window) const
 		return;
 	}
 
-	if ((producedBadPlus8 || needsMainGuard)
+	if (producedTracked && Aeloria_TryClearProducedUnitRuntimeBadPlus8(selfObj, this)
+	    && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_PLAYER_CREATION)) {
+		uintptr_t stabKey = reinterpret_cast<uintptr_t>(this);
+		auto stabIt = g_AeloriaObjectStability.find(stabKey);
+		int typeEnum = (stabIt != g_AeloriaObjectStability.end()) ? (int)stabIt->second.cachedTypeEnum : -1;
+		Aeloria_Debug_Log("PRODUCED_UNIT_RUNTIME_PLUS8_CLEARED this=%p owner=%d frame=%u type_enum=%d (runtime +8 ok)",
+		                  (void*)this, (int)Owner(), Frame, typeEnum);
+	}
+	at_plus_8 = *(uintptr_t*)((const char*)this + 8);
+	bad_plus_8 = !Is_Plausible_Class_Pointer(at_plus_8);
+	const bool eternalProducedMain = Aeloria_IsEternalSafeProducedUnit(selfObj);
+	const bool producedBadPlus8Main = eternalProducedMain
+	                                  || Aeloria_IsProducedBadPlus8Unit(selfObj)
+	                                  || (bad_plus_8 && producedTracked);
+	const bool graduatedLegacy = producedTracked && Aeloria_ProducedUnitMayUseLegacyDraw(selfObj, this);
+	const bool useLegacyDraw = graduatedLegacy && !bad_plus_8;
+	const int guardedFlagMain = (needsMainGuard || producedBadPlus8Main) ? 1 : 0;
+
+	if ((producedBadPlus8Main || needsMainGuard)
 	    && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_PLAYER_CREATION)) {
 		Aeloria_Debug_Log("PRODUCED_VESSEL_MAIN_GUARD this=%p owner=%d frame=%u (safe MAIN draw; corrupt +8 guard)",
 		                  (void*)this, (int)Owner(), Frame);
 	}
-	if (!useLegacyDraw && (bad_plus_8 || producedBadPlus8 || needsMainGuard)) {
-		Aeloria_LogProducedVesselFirstDrawIfNeeded(this, window, guardedFlag, bad_plus_8 ? 1 : 0);
+	if (!useLegacyDraw && (bad_plus_8 || producedBadPlus8Main || needsMainGuard)) {
+		Aeloria_LogProducedVesselFirstDrawIfNeeded(this, window, guardedFlagMain, bad_plus_8 ? 1 : 0);
 		int shapenum = Aeloria_GuardedVesselShapeNumber(this);
 		if (drawW > 0 && drawH > 0 && producedTracked) {
 			Aeloria_TryNotifyProducedUnitMainDrawCache(selfObj, shapenum, drawW, drawH, x, y, bad_plus_8);

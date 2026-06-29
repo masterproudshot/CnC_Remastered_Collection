@@ -595,7 +595,7 @@ inline bool Aeloria_IsEternalSafeProducedUnit(const ObjectClass* obj)
 	return it->second.producedUnitBadPlus8;
 }
 
-// E.2.13: clear stale Unlimbo bad+8 pin for WF ground/sea once runtime +8 and draw cache recover.
+// E.2.13: clear stale Unlimbo bad+8 pin for WF ground/sea once runtime +8 and MAIN cache recover.
 // Aircraft pins are slot-lifetime (E.2.9) — never call for RTTI_AIRCRAFT.
 inline bool Aeloria_TryClearProducedUnitRuntimeBadPlus8(const ObjectClass* obj, TechnoClass const* techno)
 {
@@ -624,8 +624,8 @@ inline bool Aeloria_TryClearProducedUnitRuntimeBadPlus8(const ObjectClass* obj, 
 	return true;
 }
 
-// E.2.13: legacy Techno_Draw after runtime unpin AND draw cache ready (MAIN or sustained intercept).
-// E.2.12 warmup-on-healthy-Class.Raw alone AV'd menu — cache gate prevents premature Get_Image_Data.
+// E.2.13d: legacy Techno_Draw only after MAIN-window runtime unpin AND valid MAIN cache.
+// Virtual-only intercept cache is not enough (0df20819: harvester +8 flicker on VIRTUAL).
 inline bool Aeloria_ProducedUnitMayUseLegacyDraw(const ObjectClass* obj, TechnoClass const* techno)
 {
 	if (obj == nullptr || techno == nullptr || !obj->IsActive) return false;
@@ -633,6 +633,7 @@ inline bool Aeloria_ProducedUnitMayUseLegacyDraw(const ObjectClass* obj, TechnoC
 	if (rtti == RTTI_AIRCRAFT) return false;
 	if (rtti != RTTI_UNIT && rtti != RTTI_VESSEL) return false;
 	if (Aeloria_IsRepurposedHarvester(obj)) return false;
+	if (Aeloria_IsProducedBadPlus8Harvester(obj)) return false;
 
 	uintptr_t at_plus_8 = *(uintptr_t*)((const char*)techno + 8);
 	if (!Is_Plausible_Class_Pointer(at_plus_8)) return false;
@@ -644,11 +645,7 @@ inline bool Aeloria_ProducedUnitMayUseLegacyDraw(const ObjectClass* obj, TechnoC
 	const AeloriaObjectStability& stab = it->second;
 	if (!stab.producedUnitUnlimboSeeded || stab.producedUnitBadPlus8) return false;
 
-	if (Aeloria_HasValidMainDrawCache(obj)) return true;
-	return stab.hasCachedDraw && stab.cachedShapeNumber > 0
-	    && stab.cachedWidth > 0 && stab.cachedHeight > 0
-	    && stab.cachedDrawFlags != 0
-	    && Aeloria_IsValidBulkPixelPos(stab.cachedDrawX, stab.cachedDrawY);
+	return Aeloria_HasValidMainDrawCache(obj);
 }
 
 // Human MCV/sidebar-placed buildings: type cached at Unlimbo, corrupt +8 persists for the whole match.
