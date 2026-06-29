@@ -419,6 +419,8 @@ enum AeloriaLogTag {
 	AEL_LOG_ACCESSORY_DRAW  = 18,     // Phase 5z-l: once per accessory sub-draw (WEAP2, turrets)
 	AEL_LOG_PLACEHOLDER_ENTER = 19,   // Phase 5z-n9 PR4: once per DrawSafePlaceholder entry
 	AEL_LOG_PLACEHOLDER_MARKER = 20,  // Phase 5z-n9 PR4: once per yellow visibility marker log
+	AEL_LOG_BUILDING_STAB_REFRESH = 21, // E.2.11: once per building stab refresh (was 2k+ critical writes)
+	AEL_LOG_PRODUCED_UNIT_GRADUATED = 22, // E.2.11: once per produced unit legacy draw graduation
 	// Room for more
 	AEL_LOG_MAX = 31
 };
@@ -509,6 +511,7 @@ inline bool Aeloria_HasSaneMainDrawCache(const ObjectClass* obj)
 // but Coord_To_Pixel and Draw_It always supply center pixel coordinates.
 #define AELORIA_CLIENT_DRAW_FLAGS_CENTER 0x0030
 
+bool Aeloria_TechnoClassRawIsHealthy(TechnoClass const* techno);
 void Aeloria_NotifyMainDrawCache(const ObjectClass* obj, int shape_number, int width, int height, int draw_x, int draw_y);
 bool Aeloria_TryNotifyProducedUnitMainDrawCache(const ObjectClass* obj, int shape_number, int width, int height,
                                                 int draw_x, int draw_y, bool runtime_bad_plus_8);
@@ -576,8 +579,8 @@ inline bool Aeloria_IsProducedBadPlus8Harvester(const ObjectClass* obj)
 	    && it->second.cachedTypeEnum == (int16_t)UNIT_HARVESTER;
 }
 
-// WF/shipyard-produced vehicles and vessels: eternal safe draw (5z-n8/n10).
-// Aircraft (5z-m10): safe intercept until sustainRetired; bad+8 eternal; legacy MAIN only after handoff.
+// Repurposed harvesters + produced bad+8 pins: eternal safe draw.
+// E.2.11: healthy WF/shipyard units graduate; aircraft bad+8 eternal pin unchanged (E.2.9).
 inline bool Aeloria_IsEternalSafeProducedUnit(const ObjectClass* obj)
 {
 	if (obj == nullptr) return false;
@@ -589,9 +592,29 @@ inline bool Aeloria_IsEternalSafeProducedUnit(const ObjectClass* obj)
 	if (it == g_AeloriaObjectStability.end() || !it->second.producedUnitUnlimboSeeded) {
 		return false;
 	}
-	if (rtti == RTTI_AIRCRAFT) {
-		return it->second.producedUnitBadPlus8;
-	}
+	return it->second.producedUnitBadPlus8;
+}
+
+// E.2.11: produced ground/sea units may use legacy Techno_Draw after sustain handoff.
+// Aircraft use aircraft-specific graduation (E.2.9) — never call for RTTI_AIRCRAFT.
+inline bool Aeloria_ProducedUnitMayUseLegacyDraw(const ObjectClass* obj, TechnoClass const* techno)
+{
+	if (obj == nullptr || techno == nullptr) return false;
+	RTTIType rtti = obj->What_Am_I();
+	if (rtti == RTTI_AIRCRAFT) return false;
+	if (rtti != RTTI_UNIT && rtti != RTTI_VESSEL) return false;
+
+	uintptr_t at_plus_8 = *(uintptr_t*)((const char*)techno + 8);
+	if (!Is_Plausible_Class_Pointer(at_plus_8)) return false;
+	if (!Aeloria_TechnoClassRawIsHealthy(techno)) return false;
+
+	uintptr_t key = reinterpret_cast<uintptr_t>(obj);
+	auto it = g_AeloriaObjectStability.find(key);
+	if (it == g_AeloriaObjectStability.end()) return false;
+	const AeloriaObjectStability& stab = it->second;
+	if (!stab.producedUnitUnlimboSeeded || stab.producedUnitBadPlus8) return false;
+	if (!stab.sustainRetired) return false;
+	if (!Aeloria_HasValidMainDrawCache(obj)) return false;
 	return true;
 }
 

@@ -736,7 +736,7 @@ static bool Aeloria_IsCriticalLogMessage(const char *fmt)
 		"INFANTRY_DEATH_DRAW",
 		"PRODUCED_INFANTRY_CORRUPT_TRACK",
 		"CONSTRUCTION_SEED",
-		"BUILDING_STAB_REFRESH",
+		"PRODUCED_UNIT_GRADUATED_LEGACY_DRAW",
 		"GRAND_OPENING",
 		"HARVESTER_",
 		"TRACKING_CLEARED",
@@ -1142,9 +1142,12 @@ void Aeloria_RefreshBuildingStabilityOnSeed(BuildingClass* building, bool humanD
 	}
 	stab.cachedTypeEnum = typeEnum;
 
-	Aeloria_Debug_Log("BUILDING_STAB_REFRESH this=%p owner=%d type_enum=%d human=%d frame=%u",
-	                  (void*)building, (int)building->Owner(), (int)stab.cachedTypeEnum,
-	                  humanDeployed ? 1 : 0, Frame);
+	if (g_AeloriaEnableVerboseDrawLogs
+	    || Aeloria_ShouldLogOncePerObject(building, AEL_LOG_BUILDING_STAB_REFRESH)) {
+		Aeloria_Debug_Log("BUILDING_STAB_REFRESH this=%p owner=%d type_enum=%d human=%d frame=%u",
+		                  (void*)building, (int)building->Owner(), (int)stab.cachedTypeEnum,
+		                  humanDeployed ? 1 : 0, Frame);
+	}
 }
 
 void Aeloria_Seed_Building_Creation(BuildingClass* building)

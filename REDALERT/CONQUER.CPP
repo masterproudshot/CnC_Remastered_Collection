@@ -3608,8 +3608,7 @@ void CC_Draw_Shape(const ObjectClass *object, void const * shapefile, int shapen
 				return;
 			}
 			if (object && (Is_Player_Exempt(object) || Aeloria_NeedsSafeMainDrawGuard(object)
-			               || Aeloria_IsHumanDeployedBuilding(object)
-			               || (g_HumanPlayerHouse != HOUSE_NONE && object->Owner() == g_HumanPlayerHouse))) {
+			               || Aeloria_IsHumanDeployedBuilding(object))) {
 				DrawSafePlayerPlaceholder(object, x, y, (int)flags, rotation, virtualscale);
 				return;
 			}
@@ -3917,8 +3916,7 @@ void CC_Draw_Shape(const ObjectClass *object, const char *shape_file_name, void 
 				return;
 			}
 			if (object && (Is_Player_Exempt(object) || Aeloria_NeedsSafeMainDrawGuard(object)
-			               || Aeloria_IsHumanDeployedBuilding(object)
-			               || (g_HumanPlayerHouse != HOUSE_NONE && object->Owner() == g_HumanPlayerHouse))) {
+			               || Aeloria_IsHumanDeployedBuilding(object))) {
 				DrawSafePlayerPlaceholder(object, x, y, (int)flags, rotation, virtualscale, shape_file_name, override_owner);
 				return;
 			}
@@ -4173,7 +4171,17 @@ static void DrawSafePlaceholder(const ObjectClass* object,
 	// can see and click on. This makes units "visible" as markers so you can locate and
 	// command them even if the normal sprite is missing.
 	// Size is larger than the DLL placeholder to create an obvious selection box/halo.
-	if (LogicPage != nullptr && !g_EarlyLoadGraceActive) {
+	bool skipMarker = false;
+	{
+		uintptr_t key = reinterpret_cast<uintptr_t>(object);
+		auto stabIt = g_AeloriaObjectStability.find(key);
+		if (stabIt != g_AeloriaObjectStability.end()
+		    && stabIt->second.stabilityLevel >= 2
+		    && Aeloria_HasValidMainDrawCache(object)) {
+			skipMarker = true;
+		}
+	}
+	if (LogicPage != nullptr && !g_EarlyLoadGraceActive && !skipMarker) {
 		int marker = 48; // prominent yellow marker box
 		LogicPage->Fill_Rect(x-4, y-4, x + marker, y + marker, 14); // bright yellow
 		if (g_AeloriaEnableVerboseDrawLogs

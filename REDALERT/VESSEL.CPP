@@ -484,15 +484,23 @@ void VesselClass::Draw_It(int x, int y, WindowNumberType window) const
 	const bool eternalProduced = Aeloria_IsEternalSafeProducedUnit(selfObj);
 	const bool producedBadPlus8 = eternalProduced
 	                              || Aeloria_IsProducedBadPlus8Unit(selfObj)
-	                              || producedTracked
 	                              || (bad_plus_8 && producedTracked);
+	const bool graduatedLegacy = Aeloria_ProducedUnitMayUseLegacyDraw(selfObj, this);
 	const bool needsMainGuard = Aeloria_IsEarlyStartingUnitMainGuarded(selfObj);
 	const int guardedFlag = (needsMainGuard || producedBadPlus8) ? 1 : 0;
 
 	if (window == WINDOW_VIRTUAL) {
-		Aeloria_LogProducedVesselFirstDrawIfNeeded(this, window, guardedFlag, bad_plus_8 ? 1 : 0);
+		Aeloria_LogProducedVesselFirstDrawIfNeeded(this, window, graduatedLegacy ? 0 : guardedFlag, bad_plus_8 ? 1 : 0);
 		int virtualShape = 0;
-		if (producedTracked) {
+		if (graduatedLegacy) {
+			uintptr_t stabKey = reinterpret_cast<uintptr_t>(this);
+			auto stabIt = g_AeloriaObjectStability.find(stabKey);
+			if (stabIt != g_AeloriaObjectStability.end() && stabIt->second.cachedShapeNumber > 0) {
+				virtualShape = stabIt->second.cachedShapeNumber;
+			} else {
+				virtualShape = Aeloria_GuardedVesselShapeNumber(this);
+			}
+		} else if (producedTracked) {
 			virtualShape = 0;
 		} else if (producedBadPlus8 || needsMainGuard) {
 			virtualShape = Aeloria_GuardedVesselShapeNumber(this);
@@ -508,7 +516,7 @@ void VesselClass::Draw_It(int x, int y, WindowNumberType window) const
 		Aeloria_Debug_Log("PRODUCED_VESSEL_MAIN_GUARD this=%p owner=%d frame=%u (safe MAIN draw; corrupt +8 guard)",
 		                  (void*)this, (int)Owner(), Frame);
 	}
-	if (bad_plus_8 || producedBadPlus8 || needsMainGuard) {
+	if (!graduatedLegacy && (bad_plus_8 || producedBadPlus8 || needsMainGuard)) {
 		Aeloria_LogProducedVesselFirstDrawIfNeeded(this, window, guardedFlag, bad_plus_8 ? 1 : 0);
 		int shapenum = Aeloria_GuardedVesselShapeNumber(this);
 		if (drawW > 0 && drawH > 0 && producedTracked) {
@@ -519,6 +527,11 @@ void VesselClass::Draw_It(int x, int y, WindowNumberType window) const
 		                   const_cast<VesselClass*>(this), DIR_N, 0x100, nullptr, (char)Owner());
 		Aeloria_DrawGuardedVesselTurret(this, vessel_type, PrimaryFacing, SecondaryFacing, x, y, drawW, drawH);
 		return;
+	}
+
+	if (graduatedLegacy && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_PRODUCED_UNIT_GRADUATED)) {
+		Aeloria_Debug_Log("PRODUCED_UNIT_GRADUATED_LEGACY_DRAW this=%p owner=%d frame=%u rtti=%d",
+		                  (void*)this, (int)Owner(), Frame, (int)What_Am_I());
 	}
 
 	if (g_AeloriaEnableVerboseDrawLogs && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_GUARD_PASSED)) {
