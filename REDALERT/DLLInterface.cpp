@@ -711,6 +711,7 @@ static bool Aeloria_IsCriticalLogMessage(const char *fmt)
 		"PRODUCED_INFANTRY_GRADUATE_DEFER",
 		"PRODUCED_TECHNO_GRADUATE_DEFER",
 		"PRODUCED_UNIT_UNLIMBO_SEED",
+		"PRODUCED_STARTING_SLOT_RESET",
 		"PRODUCED_UNIT_PLAUSIBLE_PLUS8",
 		"UNIT_MAIN_GUARD",
 		"UNIT_VIRTUAL_GUARD",
@@ -1249,7 +1250,18 @@ int Aeloria_PeekTechnoTypeEnum(TechnoClass const* techno)
 	switch (techno->What_Am_I()) {
 	case RTTI_UNIT: {
 		UnitClass const* unit = static_cast<UnitClass const*>(techno);
-		if (unit->Class.Raw() >= 0) return unit->Class.Raw();
+		if (unit->Class.Is_Valid()) {
+			UnitTypeClass const* t = unit->Class;
+			if (t && t->RTTI == RTTI_UNITTYPE) {
+				return (int)t->Type;
+			}
+		}
+		if (unit->Class.Raw() >= 0) {
+			UnitTypeClass const* viaRaw = UnitTypes.Ptr(unit->Class.Raw());
+			if (viaRaw && viaRaw->RTTI == RTTI_UNITTYPE) {
+				return (int)viaRaw->Type;
+			}
+		}
 		break;
 	}
 	case RTTI_INFANTRY: {
@@ -1492,9 +1504,14 @@ void Aeloria_ResetProducedTechnoTracking(TechnoClass* techno)
 
 	RTTIType currentRtti = techno->What_Am_I();
 	int currentType = Aeloria_PeekTechnoTypeEnum(techno);
+	// E.2.13g: scenario-start pool slot repurposed for WF/barracks production (19e09418 0D92134E).
+	bool startingSlotReuse = hadCreation && priorCreationFrame <= 10 && Frame > 10;
+	bool staleCreationReuse = hadCreation && priorCreationFrame > 0
+		&& priorCreationFrame < Frame && (Frame - priorCreationFrame) > 60;
 	bool poolReuse = hadPriorStab
 		&& ((priorRtti != 0 && priorRtti != (uint8_t)currentRtti)
-		    || (priorType >= 0 && currentType >= 0 && priorType != currentType));
+		    || (priorType >= 0 && currentType >= 0 && priorType != currentType)
+		    || startingSlotReuse || staleCreationReuse);
 
 	if (!poolReuse) {
 		// Same-type slot recycle (e.g. dead E1 -> new E1): refresh lifetime without full erase.
@@ -1537,6 +1554,10 @@ void Aeloria_ResetProducedTechnoTracking(TechnoClass* techno)
 	g_AeloriaObjectLogMask.erase(key);
 	g_AeloriaObjectCreationFrame.erase(key);
 
+	if (startingSlotReuse) {
+		Aeloria_Debug_Log("PRODUCED_STARTING_SLOT_RESET this=%p prior_type=%d new_type=%d owner=%d prior_creation=%u frame=%u",
+		                  (void*)techno, priorType, currentType, (int)techno->Owner(), priorCreationFrame, Frame);
+	}
 	Aeloria_Debug_Log("PRODUCED_POOL_REUSE_RESET this=%p prior_rtti=%u prior_type=%d new_rtti=%d new_type=%d owner=%d prior_creation=%u frame=%u",
 	                  (void*)techno, (unsigned)priorRtti, priorType, (int)currentRtti, currentType,
 	                  (int)techno->Owner(), priorCreationFrame, Frame);
@@ -1616,6 +1637,30 @@ void Aeloria_SeedProducedAircraftOnUnlimbo(TechnoClass* techno)
 		Aeloria_Debug_Log("PLAYER_OBJECT_CREATED this=%p RTTI=%d owner=%d type_enum=%d frame=%u early=0",
 		                  (void*)techno, (int)RTTI_AIRCRAFT, (int)techno->Owner(), (int)stab.cachedTypeEnum, Frame);
 	}
+}
+
+// E.2.15: cache-only unlimbo for WF/shipyard ground units — aircraft lite-seed pattern.
+// E.2.14 map-coord intercept still AV'd post-UNLIMBO_SEED (1b3dda6a 0xceedf frame 5207); defer intercept to Draw_It/bulk.
+bool Aeloria_SeedProducedGroundUnitOnUnlimbo(TechnoClass* techno, int shapenum, int drawW, int drawH,
+                                             bool runtime_bad_plus_8)
+{
+	if (!techno || drawW <= 0 || drawH <= 0) {
+		return false;
+	}
+	RTTIType rtti = techno->What_Am_I();
+	if (rtti != RTTI_UNIT && rtti != RTTI_VESSEL) {
+		return false;
+	}
+	if (techno->Owner() == HOUSE_NONE) {
+		return false;
+	}
+	if (shapenum <= 0) {
+		shapenum = 16;
+	}
+	int drawX = 0;
+	int drawY = 0;
+	Map.Coord_To_Pixel(techno->Center_Coord(), drawX, drawY);
+	return Aeloria_TryNotifyProducedUnitMainDrawCache(techno, shapenum, drawW, drawH, drawX, drawY, runtime_bad_plus_8);
 }
 
 bool Aeloria_IsStatelessUntrackedTechno(const ObjectClass* obj)
@@ -1999,6 +2044,8 @@ extern "C" __declspec(dllexport) unsigned int __cdecl CNC_Version(unsigned int v
 **************************************************************************************************/
 extern "C" __declspec(dllexport) void __cdecl CNC_Init(const char *command_line, CNC_Event_Callback_Type event_callback)
 {
+	Aeloria_AppendLifecycleLog("CNC_INIT_ENTER");
+
 	// Project Aeloria (May 2026): Respect the launcher -DebugMode flag.
 	// When the launcher sees -DebugMode (or the user answers yes to the prompt),
 	// it sets the environment variable AELORIA_ENABLE_VERBOSE_DRAW_LOGS=1 before
@@ -5683,6 +5730,10 @@ void Aeloria_GraduateTrackedObject(const ObjectClass* obj)
 
 	bool scenarioStart = (creationFrame <= 10);
 	RTTIType rtti = obj->What_Am_I();
+	// E.2.13g: repurposed starting-unit slots must not take scenario-start graduate path.
+	if (stab.producedUnitUnlimboSeeded && Frame > 10) {
+		scenarioStart = false;
+	}
 	// 5z-m bulk: produced aircraft graduate to normal MAIN draw but retain stab until sustain handoff.
 	const bool aircraftBulkRetain = (!scenarioStart && rtti == RTTI_AIRCRAFT
 	                                 && !Aeloria_IsProducedBadPlus8Unit(obj));
@@ -6356,6 +6407,10 @@ static bool Aeloria_IsFootLayerSustainCandidate(const ObjectClass* obj)
 	    && !Aeloria_HasValidMainDrawCache(obj)) {
 		return false;
 	}
+	// E.2.13i: refinery-spawned harvesters need MAIN cache before foot sustain (90bf63a9).
+	if (Aeloria_IsRepurposedHarvester(obj) && !Aeloria_HasValidMainDrawCache(obj)) {
+		return false;
+	}
 	if (g_AeloriaStatelessInfantryHotList.find(key) != g_AeloriaStatelessInfantryHotList.end()) {
 		return true;
 	}
@@ -6670,6 +6725,10 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 			    && !Aeloria_ProducedRotorMayBulkWithoutMainCache(obj, stab)) {
 				continue;
 			}
+			// E.2.13i: refinery harvesters defer bulk until MAIN cache seeded at grand opening.
+			if (Aeloria_IsRepurposedHarvester(obj) && !Aeloria_HasValidMainDrawCache(obj)) {
+				continue;
+			}
 
 			int listCountSoFar = normalTotal + bulkAdded;
 			if (Aeloria_ObjectAlreadyInExportList(ObjectList, listCountSoFar, obj)) continue;
@@ -6723,6 +6782,9 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 			// Produced war-factory units: defer sustain until MAIN draw caches coords (5z-n5).
 			if (stab.producedUnitUnlimboSeeded && !Aeloria_HasValidMainDrawCache(obj)
 			    && !Aeloria_ProducedRotorMayBulkWithoutMainCache(obj, stab)) {
+				continue;
+			}
+			if (Aeloria_IsRepurposedHarvester(obj) && !Aeloria_HasValidMainDrawCache(obj)) {
 				continue;
 			}
 

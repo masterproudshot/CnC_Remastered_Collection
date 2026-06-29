@@ -1262,6 +1262,21 @@ bool TechnoClass::Unlimbo(COORDINATE coord, DirType dir)
 {
 	assert(IsActive);
 
+	// E.2.13f: repair human sidebar ghost Class before ObjectClass::Unlimbo uses Class_Of()
+	// (802f58fa kennel LEGACY_PLACE bad_at8=1 — +8 stays corrupt through type_enum switches).
+	RTTIType rtti = What_Am_I();
+	bool humanPlayerBuilding = (rtti == RTTI_BUILDING && g_HumanPlayerHouse != HOUSE_NONE && Owner() == g_HumanPlayerHouse);
+	if (humanPlayerBuilding) {
+		BuildingClass* b = static_cast<BuildingClass*>(this);
+		Aeloria_Seed_Human_Building_Stability(b);
+		Aeloria_Repair_Early_Class_Pointer(this);
+		uintptr_t key = reinterpret_cast<uintptr_t>(this);
+		auto stabIt = g_AeloriaObjectStability.find(key);
+		if (stabIt != g_AeloriaObjectStability.end() && stabIt->second.cachedTypeEnum >= 0) {
+			b->Class = BuildingTypes.Ptr((int)stabIt->second.cachedTypeEnum);
+		}
+	}
+
 	if (RadioClass::Unlimbo(coord, dir)) {
 		PrimaryFacing = dir;
 		Enter_Idle_Mode(true);
@@ -1274,7 +1289,6 @@ bool TechnoClass::Unlimbo(COORDINATE coord, DirType dir)
 		// (those were mis-tagged as starting units, sustain-fed with PROC/shape=0, and crashed
 		// mid power-plant build in the 1823 session).
 		bool scenarioStart = g_EarlyLoadGraceActive || (Frame < 10);
-		RTTIType rtti = What_Am_I();
 		bool trackableTechno = (rtti == RTTI_INFANTRY || rtti == RTTI_UNIT || rtti == RTTI_AIRCRAFT || rtti == RTTI_VESSEL);
 		// Barracks/factory infantry for the human player can unlimbo far after frame 10; they still
 		// need creation tracking + SAFE_CLIENT_REG (1844 session: rifleman invisible with has_creation=0).
@@ -1288,9 +1302,6 @@ bool TechnoClass::Unlimbo(COORDINATE coord, DirType dir)
 		bool producedAircraft = (rtti == RTTI_AIRCRAFT && !scenarioStart);
 		// Shipyard vessels (human + AI) need the same pool-reuse eternal-safe draw path (5z-n10).
 		bool producedVessel = (rtti == RTTI_VESSEL && !scenarioStart);
-		// Human MCV-deployed buildings (power, barracks, refinery) unlimbo after frame 10; cache type
-		// for safe client export without adding them to sustain bulk (mid-game slowdown root cause).
-		bool humanPlayerBuilding = (rtti == RTTI_BUILDING && g_HumanPlayerHouse != HOUSE_NONE && Owner() == g_HumanPlayerHouse);
 		bool preSeededHarvester = false;
 		if (rtti == RTTI_UNIT) {
 			uintptr_t key = reinterpret_cast<uintptr_t>(this);
@@ -1426,6 +1437,12 @@ bool TechnoClass::Unlimbo(COORDINATE coord, DirType dir)
 			} else if (producedUnit) {
 				uintptr_t key = reinterpret_cast<uintptr_t>(this);
 				auto& stab = g_AeloriaObjectStability[key];
+				Aeloria_Repair_Early_Class_Pointer(this);
+				TechnoTypeClass const* safe = Aeloria_Safe_Techno_Type(this);
+				if (safe && What_Am_I() == RTTI_UNIT) {
+					stab.cachedTypeEnum = (int16_t)static_cast<UnitTypeClass const*>(safe)->Type;
+				}
+				stab.rtti = (uint8_t)RTTI_UNIT;
 				stab.producedUnitUnlimboSeeded = true;
 				stab.producedUnitFirstDrawMask = 0;
 				uintptr_t at_plus_8 = *(uintptr_t*)((const char*)this + 8);
@@ -1458,12 +1475,24 @@ bool TechnoClass::Unlimbo(COORDINATE coord, DirType dir)
 						}
 						if (drawW <= 0) drawW = 48;
 						if (drawH <= 0) drawH = 48;
-						DLL_Draw_Intercept(0, 0, 0, drawW, drawH, 0, this, DIR_N, 0x100, nullptr, overrideOwner);
-						stab.earlySafeClientRegistered = true;
+						UnitClass* unit = static_cast<UnitClass*>(this);
+						int seedShape = UnitClass::BodyShape[Dir_To_32(unit->PrimaryFacing)];
+						if (seedShape <= 0) {
+							seedShape = UnitClass::BodyShape[16];
+						}
+						if (seedShape <= 0) {
+							seedShape = 16;
+						}
+						int seedX = 0;
+						int seedY = 0;
+						Map.Coord_To_Pixel(unit->Center_Coord(), seedX, seedY);
+						// E.2.15: cache-only lite seed — defer intercept to guarded Draw_It/bulk (1b3dda6a).
+						Aeloria_SeedProducedGroundUnitOnUnlimbo(this, seedShape, drawW, drawH, stab.producedUnitBadPlus8);
+						stab.earlySafeClientRegistered = stab.producedUnitBadPlus8;
 						stab.clientListInserted = false;
 						stab.sustainRetired = false;
-						Aeloria_Debug_Log("PRODUCED_UNIT_UNLIMBO_SEED this=%p owner=%d type_enum=%d w=%d h=%d frame=%u",
-						                  (void*)this, (int)Owner(), (int)stab.cachedTypeEnum, drawW, drawH, Frame);
+						Aeloria_Debug_Log("PRODUCED_UNIT_UNLIMBO_LITE_SEED this=%p owner=%d type_enum=%d w=%d h=%d shape=%d pos=(%d,%d) frame=%u (defer intercept to draw/bulk)",
+						                  (void*)this, (int)Owner(), (int)stab.cachedTypeEnum, drawW, drawH, seedShape, seedX, seedY, Frame);
 					}
 				}
 			} else if (producedAircraft) {
@@ -1490,12 +1519,24 @@ bool TechnoClass::Unlimbo(COORDINATE coord, DirType dir)
 						}
 						if (drawW <= 0) drawW = 48;
 						if (drawH <= 0) drawH = 48;
-						DLL_Draw_Intercept(0, 0, 0, drawW, drawH, 0, this, DIR_N, 0x100, nullptr, overrideOwner);
-						stab.earlySafeClientRegistered = true;
+						VesselClass* vessel = static_cast<VesselClass*>(this);
+						int seedShape = UnitClass::BodyShape[Dir_To_32(vessel->PrimaryFacing)];
+						if (seedShape <= 0) {
+							seedShape = UnitClass::BodyShape[16];
+						}
+						if (seedShape <= 0) {
+							seedShape = 16;
+						}
+						int seedX = 0;
+						int seedY = 0;
+						Map.Coord_To_Pixel(vessel->Center_Coord(), seedX, seedY);
+						// E.2.15: cache-only lite seed — same policy as WF vehicles.
+						Aeloria_SeedProducedGroundUnitOnUnlimbo(this, seedShape, drawW, drawH, stab.producedUnitBadPlus8);
+						stab.earlySafeClientRegistered = stab.producedUnitBadPlus8;
 						stab.clientListInserted = false;
 						stab.sustainRetired = false;
-						Aeloria_Debug_Log("PRODUCED_VESSEL_UNLIMBO_SEED this=%p owner=%d type_enum=%d w=%d h=%d frame=%u",
-						                  (void*)this, (int)Owner(), (int)stab.cachedTypeEnum, drawW, drawH, Frame);
+						Aeloria_Debug_Log("PRODUCED_VESSEL_UNLIMBO_LITE_SEED this=%p owner=%d type_enum=%d w=%d h=%d shape=%d pos=(%d,%d) frame=%u (defer intercept to draw/bulk)",
+						                  (void*)this, (int)Owner(), (int)stab.cachedTypeEnum, drawW, drawH, seedShape, seedX, seedY, Frame);
 					}
 				}
 			}
@@ -1525,6 +1566,26 @@ bool TechnoClass::Unlimbo(COORDINATE coord, DirType dir)
 			// (*this == STRUCT_REFINERY, Class->Drain, etc.) AVs on completion without this.
 			if (stab.cachedTypeEnum >= 0) {
 				b->Class = BuildingTypes.Ptr((int)stab.cachedTypeEnum);
+			}
+			// E.2.13f: seed client export before first post-place legacy draw (kennel place crash).
+			if (badAt8 && !stab.earlySafeClientRegistered) {
+				char overrideOwner = (char)Owner();
+				if (overrideOwner != HOUSE_NONE) {
+					int drawW = 48;
+					int drawH = 48;
+					BuildingTypeClass const* btype = static_cast<BuildingTypeClass const*>(Aeloria_Safe_Techno_Type(this));
+					if (btype) {
+						btype->Dimensions(drawW, drawH);
+					}
+					if (drawW <= 0) drawW = 48;
+					if (drawH <= 0) drawH = 48;
+					DLL_Draw_Intercept(0, 0, 0, drawW, drawH, 0, this, DIR_N, 0x100, nullptr, overrideOwner);
+					stab.earlySafeClientRegistered = true;
+					stab.clientListInserted = false;
+					stab.sustainRetired = false;
+					Aeloria_Debug_Log("HUMAN_BUILDING_UNLIMBO_SEED this=%p owner=%d type_enum=%d w=%d h=%d frame=%u",
+					                  (void*)this, (int)Owner(), (int)stab.cachedTypeEnum, drawW, drawH, Frame);
+				}
 			}
 			if (Aeloria_ShouldLogOncePerObject(this, AEL_LOG_PLAYER_CREATION)) {
 				Aeloria_Debug_Log("HUMAN_BUILDING_UNLIMBO this=%p raw=%d type_enum=%d bad_at8=%d frame=%u",

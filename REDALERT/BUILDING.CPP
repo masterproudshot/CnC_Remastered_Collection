@@ -636,13 +636,19 @@ void BuildingClass::Draw_It(int x, int y, WindowNumberType window) const
 	if (HasRallyPoint() && Is_Selected_By_Player() && Is_Owned_By_Player())
 	{
 		int startX, startY, endX, endY;
-		Map.Coord_To_Pixel(Coord_Add(Coord, Class->ExitCoordinate), startX, startY);
-		Map.Coord_To_Pixel(As_Coord(RallyPoint), endX, endY);
+		BuildingTypeClass const* rallySafe = Aeloria_Building_Safe_Type(this);
+		if (rallySafe) {
+			Map.Coord_To_Pixel(Coord_Add(Coord, rallySafe->ExitCoordinate), startX, startY);
+			Map.Coord_To_Pixel(As_Coord(RallyPoint), endX, endY);
 
-		CC_Draw_Line(startX, startY, endX, endY, LTGREEN, 1, window);
+			CC_Draw_Line(startX, startY, endX, endY, LTGREEN, 1, window);
+		}
 	}
 
-	TechnoClass::Draw_It(x, y, window);
+	// E.2.13f: safe building path already exported — skip TechnoClass tail (Class_Of on bad +8).
+	if (!forceSafeClientDraw) {
+		TechnoClass::Draw_It(x, y, window);
+	}
 
 	/*
 	** If this is a factory that we're spying on, show what it's producing
@@ -2768,6 +2774,9 @@ void BuildingClass::Grand_Opening(bool captured)
 					int shapenum = UnitClass::BodyShape[Dir_To_32(unit->PrimaryFacing)];
 					DLL_Draw_Intercept(shapenum, drawX, drawY, drawW, drawH, AELORIA_CLIENT_DRAW_FLAGS_CENTER,
 					                   unit, DIR_N, 0x100, nullptr, (char)unit->Owner());
+					// E.2.13i: bulk/foot-sustain defer until MAIN cache — grand-opening harvester AV at frame 5117 (90bf63a9).
+					if (shapenum <= 0) shapenum = 16;
+					Aeloria_NotifyMainDrawCache(unit, shapenum, drawW, drawH, drawX, drawY);
 					Aeloria_Debug_Log("GRAND_OPENING_HARVESTER_OK refinery=%p harvester=%p cell=%d frame=%u",
 					                  (void*)this, (void*)unit, (int)cell, Frame);
 				} else {
@@ -6189,13 +6198,17 @@ int BuildingClass::How_Many_Survivors(void) const
  *=============================================================================================*/
 void const * BuildingClass::Get_Image_Data(void) const
 {
+	Aeloria_Repair_Early_Class_Pointer(const_cast<BuildingClass*>(this));
+	BuildingTypeClass const* safe = Aeloria_Building_Safe_Type(this);
 	if (BState == BSTATE_CONSTRUCTION) {
-		Aeloria_Repair_Early_Class_Pointer(const_cast<BuildingClass*>(this));
-		BuildingTypeClass const* safe = Aeloria_Building_Safe_Type(this);
 		if (safe) {
 			return safe->Get_Buildup_Data();
 		}
-		return Class->Get_Buildup_Data();
+		return nullptr;
+	}
+	// E.2.13f: human sidebar ghosts keep bad +8 — never dereference Class_Of() for image data.
+	if (Aeloria_IsHumanDeployedBuilding(this) && safe) {
+		return safe->Get_Image_Data();
 	}
 	return(TechnoClass::Get_Image_Data());
 }

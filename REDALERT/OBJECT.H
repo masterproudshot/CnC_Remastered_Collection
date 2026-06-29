@@ -674,6 +674,16 @@ inline bool Aeloria_HasTrustedHumanBuildingMainCache(const ObjectClass* obj)
 	return cachedType == currentType;
 }
 
+// E.2.13f: human sidebar ghosts must use placeholder until MAIN draw cache is trusted.
+// Kennel preview (802f58fa) bypassed E.2.13c when +8 flickered plausible during type_enum switch.
+inline bool Aeloria_HumanBuildingNeedsPlaceholderDraw(const ObjectClass* obj)
+{
+	if (!Aeloria_IsHumanDeployedBuilding(obj)) return false;
+	if (!Aeloria_HasTrustedHumanBuildingMainCache(obj)) return true;
+	uintptr_t at8 = *(uintptr_t*)((const char*)obj + 8);
+	return !Is_Plausible_Class_Pointer(at8);
+}
+
 // Starting units seeded at Unlimbo must not hit the legacy MAIN blitter until a confirmed-safe
 // MAIN-window draw (shape>0) has been cached. Virtual cache alone is not enough.
 // Also covers earlySafeClientRegistered units that were prematurely graduated off the creation
@@ -690,13 +700,16 @@ inline bool Aeloria_IsEarlyStartingUnitMainGuarded(const ObjectClass* obj)
 	if (Aeloria_IsRepurposedHarvester(obj) || Aeloria_IsEternalSafeProducedUnit(obj)) return false;
 	uintptr_t key = reinterpret_cast<uintptr_t>(obj);
 	if (g_AeloriaObjectCreationFrame.find(key) != g_AeloriaObjectCreationFrame.end()) {
-		// 5z-m7: mid-game airfield/helipad aircraft with plausible +8 use normal draw + bulk, not intercept guard.
 		auto it = g_AeloriaObjectStability.find(key);
-		if (it != g_AeloriaObjectStability.end()
-		    && it->second.producedUnitUnlimboSeeded
-		    && obj->What_Am_I() == RTTI_AIRCRAFT
-		    && !it->second.producedUnitBadPlus8) {
-			return false;
+		if (it != g_AeloriaObjectStability.end() && it->second.producedUnitUnlimboSeeded) {
+			// 5z-m7: mid-game airfield/helipad aircraft with plausible +8 use normal draw + bulk.
+			if (obj->What_Am_I() == RTTI_AIRCRAFT && !it->second.producedUnitBadPlus8) {
+				return false;
+			}
+			// E.2.13g: WF/shipyard units use produced safe path, not starting-unit MAIN guard.
+			if (obj->What_Am_I() == RTTI_UNIT || obj->What_Am_I() == RTTI_VESSEL) {
+				return false;
+			}
 		}
 		return true;
 	}

@@ -2246,11 +2246,12 @@ void UnitClass::Draw_It(int x, int y, WindowNumberType window) const
 			} else {
 				virtualShape = Aeloria_GuardedUnitShapeNumber(this);
 			}
-		} else if (producedTracked) {
-			virtualShape = (!bad_plus_8 && Aeloria_TechnoClassRawIsHealthy(this))
-			               ? Aeloria_GuardedUnitShapeNumber(this) : 0;
-		} else if (repurposedHarvester || producedBadPlus8 || needsMainGuard) {
+		} else if (producedTracked || repurposedHarvester || producedBadPlus8 || needsMainGuard) {
+			// E.2.13h: never shape 0 on VIRTUAL — LAYERS export can precede MAIN cache (cfd9624e 0D92D012).
 			virtualShape = Aeloria_GuardedUnitShapeNumber(this);
+			if (producedTracked && drawW > 0 && drawH > 0 && !Aeloria_HasValidMainDrawCache(selfObj)) {
+				Aeloria_TryNotifyProducedUnitMainDrawCache(selfObj, virtualShape, drawW, drawH, x, y, bad_plus_8);
+			}
 		}
 		DLL_Draw_Intercept(virtualShape, x, y, drawW, drawH, AELORIA_CLIENT_DRAW_FLAGS_CENTER,
 		                   const_cast<UnitClass*>(this), DIR_N, 0x100, nullptr, (char)Owner());
@@ -2288,16 +2289,11 @@ void UnitClass::Draw_It(int x, int y, WindowNumberType window) const
 	if (!useLegacyDraw && (bad_plus_8 || repurposedHarvester || producedBadPlus8Main || needsMainGuard)) {
 		Aeloria_LogProducedUnitFirstDrawIfNeeded(this, window, guardedFlagMain, bad_plus_8 ? 1 : 0);
 		int shapenum = Aeloria_GuardedUnitShapeNumber(this);
-		// WF-produced: cache MAIN before intercept; use shape 0 intercept (matches unlimbo seed — 5z-n8).
-		// Starting-unit MAIN notify still forbidden (5z-n4b).
+		// WF-produced: cache MAIN before intercept; never shape 0 on guarded MAIN (E.2.15).
 		if (drawW > 0 && drawH > 0 && producedTracked) {
 			Aeloria_TryNotifyProducedUnitMainDrawCache(selfObj, shapenum, drawW, drawH, x, y, bad_plus_8);
 		}
-		int interceptShape = shapenum;
-		if (producedTracked && (bad_plus_8 || !Aeloria_TechnoClassRawIsHealthy(this))) {
-			interceptShape = 0;
-		}
-		DLL_Draw_Intercept(interceptShape, x, y, drawW, drawH, AELORIA_CLIENT_DRAW_FLAGS_CENTER,
+		DLL_Draw_Intercept(shapenum, x, y, drawW, drawH, AELORIA_CLIENT_DRAW_FLAGS_CENTER,
 		                   const_cast<UnitClass*>(this), DIR_N, 0x100, nullptr, (char)Owner());
 		Aeloria_DrawGuardedUnitTurret(this, unit_type, PrimaryFacing, SecondaryFacing, IsInRecoilState, x, y, drawW, drawH);
 		// Phase 5i: skip DriveClass::Draw_It on guarded MAIN — matches infantry (no FootClass on safe path).

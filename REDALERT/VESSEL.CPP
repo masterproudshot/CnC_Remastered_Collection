@@ -502,11 +502,12 @@ void VesselClass::Draw_It(int x, int y, WindowNumberType window) const
 			} else {
 				virtualShape = Aeloria_GuardedVesselShapeNumber(this);
 			}
-		} else if (producedTracked) {
-			virtualShape = (!bad_plus_8 && Aeloria_TechnoClassRawIsHealthy(this))
-			               ? Aeloria_GuardedVesselShapeNumber(this) : 0;
-		} else if (producedBadPlus8 || needsMainGuard) {
+		} else if (producedTracked || producedBadPlus8 || needsMainGuard) {
+			// E.2.13h: never shape 0 on VIRTUAL — LAYERS export can precede MAIN cache (cfd9624e).
 			virtualShape = Aeloria_GuardedVesselShapeNumber(this);
+			if (producedTracked && drawW > 0 && drawH > 0 && !Aeloria_HasValidMainDrawCache(selfObj)) {
+				Aeloria_TryNotifyProducedUnitMainDrawCache(selfObj, virtualShape, drawW, drawH, x, y, bad_plus_8);
+			}
 		}
 		DLL_Draw_Intercept(virtualShape, x, y, drawW, drawH, AELORIA_CLIENT_DRAW_FLAGS_CENTER,
 		                   const_cast<VesselClass*>(this), DIR_N, 0x100, nullptr, (char)Owner());
@@ -543,11 +544,7 @@ void VesselClass::Draw_It(int x, int y, WindowNumberType window) const
 		if (drawW > 0 && drawH > 0 && producedTracked) {
 			Aeloria_TryNotifyProducedUnitMainDrawCache(selfObj, shapenum, drawW, drawH, x, y, bad_plus_8);
 		}
-		int interceptShape = shapenum;
-		if (producedTracked && (bad_plus_8 || !Aeloria_TechnoClassRawIsHealthy(this))) {
-			interceptShape = 0;
-		}
-		DLL_Draw_Intercept(interceptShape, x, y, drawW, drawH, AELORIA_CLIENT_DRAW_FLAGS_CENTER,
+		DLL_Draw_Intercept(shapenum, x, y, drawW, drawH, AELORIA_CLIENT_DRAW_FLAGS_CENTER,
 		                   const_cast<VesselClass*>(this), DIR_N, 0x100, nullptr, (char)Owner());
 		Aeloria_DrawGuardedVesselTurret(this, vessel_type, PrimaryFacing, SecondaryFacing, x, y, drawW, drawH);
 		return;

@@ -1109,10 +1109,12 @@ void GlyphX_Debug_Print(const char *debug_text);
 ** Also forwards to GlyphX + OutputDebugStringA.
 */
 void Aeloria_Debug_Log(const char *fmt, ...);
+void Aeloria_AppendLifecycleLog(const char* tag);
 void Aeloria_ClearObjectTracking(ObjectClass* obj);
 void Aeloria_RelocateHarvesterStability(UnitClass* unit);
 void Aeloria_ResetProducedTechnoTracking(TechnoClass* techno);
 void Aeloria_SeedProducedAircraftOnUnlimbo(TechnoClass* techno);
+bool Aeloria_SeedProducedGroundUnitOnUnlimbo(TechnoClass* techno, int shapenum, int drawW, int drawH, bool runtime_bad_plus_8);
 bool Aeloria_InfantryClassRawIsHealthy(InfantryClass const* infantry);
 bool Aeloria_ShouldZeroMapProducedInfantry(InfantryClass const* infantry);
 bool Aeloria_TechnoClassRawIsHealthy(TechnoClass const* techno);

@@ -3496,6 +3496,12 @@ void CC_Draw_Shape(const ObjectClass *object, void const * shapefile, int shapen
 			                  (void*)object, object->What_Am_I(), (unsigned long)at_plus_8);
 		}
 
+		// E.2.13f: human building ghost/preview — placeholder even when +8 is briefly plausible.
+		if (Aeloria_HumanBuildingNeedsPlaceholderDraw(object)) {
+			DrawSafePlayerPlaceholder(object, x, y, (int)flags, rotation, virtualscale);
+			return;
+		}
+
 		// === PHASE 1 PROVING LOG (approved plan) ===
 		// Loud, direct log for *every* exempt draw during the long window.
 		// This will finally show us:
@@ -3833,6 +3839,12 @@ void CC_Draw_Shape(const ObjectClass *object, const char *shape_file_name, void 
 		if (logGot) {
 			Aeloria_Debug_Log("CC_Draw_Shape got Object this=%p RTTI=%d at+8=0x%08lx (name overload)",
 			                  (void*)object, object->What_Am_I(), (unsigned long)at_plus_8);
+		}
+
+		// E.2.13f: human building ghost/preview — placeholder even when +8 is briefly plausible.
+		if (Aeloria_HumanBuildingNeedsPlaceholderDraw(object)) {
+			DrawSafePlayerPlaceholder(object, x, y, (int)flags, rotation, virtualscale, shape_file_name, override_owner);
+			return;
 		}
 
 		// === PHASE 1 PROVING LOG (approved plan) ===
