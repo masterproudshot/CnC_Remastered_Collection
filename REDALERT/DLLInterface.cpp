@@ -737,6 +737,7 @@ static bool Aeloria_IsCriticalLogMessage(const char *fmt)
 		"PRODUCED_INFANTRY_CORRUPT_TRACK",
 		"CONSTRUCTION_SEED",
 		"PRODUCED_UNIT_GRADUATED_LEGACY_DRAW",
+		"PRODUCED_UNIT_RUNTIME_PLUS8_CLEARED",
 		"GRAND_OPENING",
 		"HARVESTER_",
 		"TRACKING_CLEARED",
@@ -5756,26 +5757,26 @@ bool Aeloria_TryNotifyProducedUnitMainDrawCache(const ObjectClass* obj, int shap
 	if (it == g_AeloriaObjectStability.end() || !it->second.producedUnitUnlimboSeeded) {
 		return false;
 	}
-	// E.2.5: reject garbage bulk coords while +8 corrupt (soak 971d8e51 pos=(1908,-12)).
+	// E.2.13: produced units prefer map pixel coords — Draw_It tactical x/y often fail bulk bounds.
 	int cacheX = draw_x;
 	int cacheY = draw_y;
-	if (!Aeloria_IsValidBulkPixelPos(cacheX, cacheY)) {
-		const TechnoClass* techno = reinterpret_cast<const TechnoClass*>(obj);
-		// E.2.12b: Map/Render_Coord unsafe before match load (main menu AV).
-		if (techno && techno->IsActive && !techno->IsInLimbo && Frame > 0
-		    && Map.Coord_To_Pixel(techno->Render_Coord(), cacheX, cacheY)
+	const TechnoClass* techno = reinterpret_cast<const TechnoClass*>(obj);
+	bool mapPosOk = false;
+	if (techno && techno->IsActive && !techno->IsInLimbo && Frame > 0) {
+		if (Map.Coord_To_Pixel(techno->Render_Coord(), cacheX, cacheY)
 		    && Aeloria_IsValidBulkPixelPos(cacheX, cacheY)) {
-			// Draw_It tactical coords can fail bulk check; map pixel fallback unblocks MAIN cache.
-		} else if (techno && techno->IsActive && !techno->IsInLimbo && Frame > 0
-		           && Map.Coord_To_Pixel(techno->Center_Coord(), cacheX, cacheY)
+			mapPosOk = true;
+		} else if (Map.Coord_To_Pixel(techno->Center_Coord(), cacheX, cacheY)
 		           && Aeloria_IsValidBulkPixelPos(cacheX, cacheY)) {
-		} else {
-			if (Aeloria_ShouldLogOncePerObject(obj, AEL_LOG_PLAYER_CREATION)) {
-				Aeloria_Debug_Log("MAIN_CACHE_REJECT_POS this=%p pos=(%d,%d) frame=%u",
-				                  (void*)obj, draw_x, draw_y, Frame);
-			}
-			return false;
+			mapPosOk = true;
 		}
+	}
+	if (!mapPosOk && !Aeloria_IsValidBulkPixelPos(cacheX, cacheY)) {
+		if (Aeloria_ShouldLogOncePerObject(obj, AEL_LOG_PLAYER_CREATION)) {
+			Aeloria_Debug_Log("MAIN_CACHE_REJECT_POS this=%p draw=(%d,%d) map=(%d,%d) frame=%u",
+			                  (void*)obj, draw_x, draw_y, cacheX, cacheY, Frame);
+		}
+		return false;
 	}
 	if (runtime_bad_plus_8 && !Aeloria_TechnoClassRawIsHealthy(reinterpret_cast<TechnoClass const*>(obj))) {
 		it->second.producedUnitBadPlus8 = true;
@@ -5787,7 +5788,7 @@ bool Aeloria_TryNotifyProducedUnitMainDrawCache(const ObjectClass* obj, int shap
 	if (firstCache) {
 		const char* tag = (obj->What_Am_I() == RTTI_AIRCRAFT) ? "PRODUCED_AIRCRAFT_MAIN_CACHE" : "PRODUCED_UNIT_MAIN_CACHE";
 		Aeloria_Debug_Log("%s this=%p owner=%d shape=%d pos=(%d,%d) frame=%u",
-		                  tag, (void*)obj, (int)obj->Owner(), cacheShape, draw_x, draw_y, Frame);
+		                  tag, (void*)obj, (int)obj->Owner(), cacheShape, cacheX, cacheY, Frame);
 	}
 	return true;
 }

@@ -481,6 +481,14 @@ void VesselClass::Draw_It(int x, int y, WindowNumberType window) const
 	bool bad_plus_8 = !Is_Plausible_Class_Pointer(at_plus_8);
 	const ObjectClass* selfObj = static_cast<const ObjectClass*>(this);
 	const bool producedTracked = Aeloria_IsProducedUnitUnlimboSeeded(selfObj);
+	if (producedTracked && Aeloria_TryClearProducedUnitRuntimeBadPlus8(selfObj, this)
+	    && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_PLAYER_CREATION)) {
+		uintptr_t stabKey = reinterpret_cast<uintptr_t>(this);
+		auto stabIt = g_AeloriaObjectStability.find(stabKey);
+		int typeEnum = (stabIt != g_AeloriaObjectStability.end()) ? (int)stabIt->second.cachedTypeEnum : -1;
+		Aeloria_Debug_Log("PRODUCED_UNIT_RUNTIME_PLUS8_CLEARED this=%p owner=%d frame=%u type_enum=%d (runtime +8 ok)",
+		                  (void*)this, (int)Owner(), Frame, typeEnum);
+	}
 	const bool eternalProduced = Aeloria_IsEternalSafeProducedUnit(selfObj);
 	const bool graduatedLegacy = producedTracked && Aeloria_ProducedUnitMayUseLegacyDraw(selfObj, this);
 	const bool useLegacyDraw = graduatedLegacy && !bad_plus_8;
@@ -502,7 +510,8 @@ void VesselClass::Draw_It(int x, int y, WindowNumberType window) const
 				virtualShape = Aeloria_GuardedVesselShapeNumber(this);
 			}
 		} else if (producedTracked) {
-			virtualShape = 0;
+			virtualShape = (!bad_plus_8 && Aeloria_TechnoClassRawIsHealthy(this))
+			               ? Aeloria_GuardedVesselShapeNumber(this) : 0;
 		} else if (producedBadPlus8 || needsMainGuard) {
 			virtualShape = Aeloria_GuardedVesselShapeNumber(this);
 		}
@@ -523,7 +532,10 @@ void VesselClass::Draw_It(int x, int y, WindowNumberType window) const
 		if (drawW > 0 && drawH > 0 && producedTracked) {
 			Aeloria_TryNotifyProducedUnitMainDrawCache(selfObj, shapenum, drawW, drawH, x, y, bad_plus_8);
 		}
-		int interceptShape = producedTracked ? 0 : shapenum;
+		int interceptShape = shapenum;
+		if (producedTracked && (bad_plus_8 || !Aeloria_TechnoClassRawIsHealthy(this))) {
+			interceptShape = 0;
+		}
 		DLL_Draw_Intercept(interceptShape, x, y, drawW, drawH, AELORIA_CLIENT_DRAW_FLAGS_CENTER,
 		                   const_cast<VesselClass*>(this), DIR_N, 0x100, nullptr, (char)Owner());
 		Aeloria_DrawGuardedVesselTurret(this, vessel_type, PrimaryFacing, SecondaryFacing, x, y, drawW, drawH);

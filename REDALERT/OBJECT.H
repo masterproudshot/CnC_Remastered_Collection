@@ -595,9 +595,37 @@ inline bool Aeloria_IsEternalSafeProducedUnit(const ObjectClass* obj)
 	return it->second.producedUnitBadPlus8;
 }
 
-// E.2.12b: legacy Techno_Draw only after confirmed MAIN cache AND plausible runtime +8.
-// E.2.12 warmup-on-healthy-Class.Raw AV'd menu/in-match when +8 was still corrupt (Get_Image_Data).
-// Aircraft use aircraft-specific graduation (E.2.9) — never call for RTTI_AIRCRAFT.
+// E.2.13: clear stale Unlimbo bad+8 pin for WF ground/sea once runtime +8 and draw cache recover.
+// Aircraft pins are slot-lifetime (E.2.9) — never call for RTTI_AIRCRAFT.
+inline bool Aeloria_TryClearProducedUnitRuntimeBadPlus8(const ObjectClass* obj, TechnoClass const* techno)
+{
+	if (obj == nullptr || techno == nullptr) return false;
+	RTTIType rtti = obj->What_Am_I();
+	if (rtti != RTTI_UNIT && rtti != RTTI_VESSEL) return false;
+	uintptr_t at_plus_8 = *(uintptr_t*)((const char*)techno + 8);
+	if (!Is_Plausible_Class_Pointer(at_plus_8)) return false;
+	uintptr_t key = reinterpret_cast<uintptr_t>(obj);
+	auto it = g_AeloriaObjectStability.find(key);
+	if (it == g_AeloriaObjectStability.end() || !it->second.producedUnitUnlimboSeeded
+	    || !it->second.producedUnitBadPlus8) {
+		return false;
+	}
+	if (!Aeloria_TechnoClassRawIsHealthy(techno)) return false;
+	const AeloriaObjectStability& stab = it->second;
+	bool cacheReady = Aeloria_HasValidMainDrawCache(obj);
+	if (!cacheReady) {
+		cacheReady = stab.hasCachedDraw && stab.cachedShapeNumber > 0
+		    && stab.cachedWidth > 0 && stab.cachedHeight > 0
+		    && stab.cachedDrawFlags != 0
+		    && Aeloria_IsValidBulkPixelPos(stab.cachedDrawX, stab.cachedDrawY);
+	}
+	if (!cacheReady) return false;
+	it->second.producedUnitBadPlus8 = false;
+	return true;
+}
+
+// E.2.13: legacy Techno_Draw after runtime unpin AND draw cache ready (MAIN or sustained intercept).
+// E.2.12 warmup-on-healthy-Class.Raw alone AV'd menu — cache gate prevents premature Get_Image_Data.
 inline bool Aeloria_ProducedUnitMayUseLegacyDraw(const ObjectClass* obj, TechnoClass const* techno)
 {
 	if (obj == nullptr || techno == nullptr || !obj->IsActive) return false;
@@ -609,13 +637,18 @@ inline bool Aeloria_ProducedUnitMayUseLegacyDraw(const ObjectClass* obj, TechnoC
 	uintptr_t at_plus_8 = *(uintptr_t*)((const char*)techno + 8);
 	if (!Is_Plausible_Class_Pointer(at_plus_8)) return false;
 	if (!Aeloria_TechnoClassRawIsHealthy(techno)) return false;
-	if (!Aeloria_HasValidMainDrawCache(obj)) return false;
 
 	uintptr_t key = reinterpret_cast<uintptr_t>(obj);
 	auto it = g_AeloriaObjectStability.find(key);
 	if (it == g_AeloriaObjectStability.end()) return false;
 	const AeloriaObjectStability& stab = it->second;
-	return stab.producedUnitUnlimboSeeded && !stab.producedUnitBadPlus8;
+	if (!stab.producedUnitUnlimboSeeded || stab.producedUnitBadPlus8) return false;
+
+	if (Aeloria_HasValidMainDrawCache(obj)) return true;
+	return stab.hasCachedDraw && stab.cachedShapeNumber > 0
+	    && stab.cachedWidth > 0 && stab.cachedHeight > 0
+	    && stab.cachedDrawFlags != 0
+	    && Aeloria_IsValidBulkPixelPos(stab.cachedDrawX, stab.cachedDrawY);
 }
 
 // Human MCV/sidebar-placed buildings: type cached at Unlimbo, corrupt +8 persists for the whole match.
