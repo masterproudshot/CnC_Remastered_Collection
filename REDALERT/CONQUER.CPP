@@ -3589,6 +3589,13 @@ void CC_Draw_Shape(const ObjectClass *object, void const * shapefile, int shapen
 		**	Now also exempts player House objects (via timeout) so they reach the blitter.
 		*/
 		if (!Is_Plausible_Class_Pointer(at_plus_8)) {
+			// E.2.13c: human sidebar/MCV buildings must not hit LAYERS intercept before placeholder.
+			// TryVirtualLayers ran first and AV'd power-plant preview (7a1e8653 frame 5251) while WF
+			// ghost had been luckier on the same path — route all human-deployed buildings to placeholder.
+			if (object && Aeloria_IsHumanDeployedBuilding(object)) {
+				DrawSafePlayerPlaceholder(object, x, y, (int)flags, rotation, virtualscale);
+				return;
+			}
 			if (Aeloria_TryVirtualLayersExportDespiteBadPlus8(object, window, shapenum, x, y, width, height, flags,
 			                                                rotation, virtualscale, shapefile)) {
 				return;
@@ -3897,6 +3904,10 @@ void CC_Draw_Shape(const ObjectClass *object, const char *shape_file_name, void 
 		**	Player exemption also applied here.
 		*/
 		if (!Is_Plausible_Class_Pointer(at_plus_8)) {
+			if (object && Aeloria_IsHumanDeployedBuilding(object)) {
+				DrawSafePlayerPlaceholder(object, x, y, (int)flags, rotation, virtualscale, shape_file_name, override_owner);
+				return;
+			}
 			if (Aeloria_TryVirtualLayersExportDespiteBadPlus8(object, window, shapenum, x, y, 0, 0, flags,
 			                                                rotation, virtualscale, shapefile)) {
 				return;
