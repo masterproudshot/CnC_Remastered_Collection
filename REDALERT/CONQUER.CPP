@@ -4114,9 +4114,12 @@ static void DrawSafePlaceholder(const ObjectClass* object,
 
 	int size = 32; // larger and more visible placeholder during long exemption for corrupted early objects
 
-	// B: Deep breadcrumb inside placeholder
-	Aeloria_Debug_Log("PLACEHOLDER_ENTER this=%p size=%d has_creation=%d", (void*)object, size,
-	                  g_AeloriaObjectCreationFrame.find(reinterpret_cast<uintptr_t>(object)) != g_AeloriaObjectCreationFrame.end() ? 1 : 0);
+	// E.2.10: once-per-object under verbose — was 80k+ lines/match (77c18c92).
+	if (g_AeloriaEnableVerboseDrawLogs
+	    && Aeloria_ShouldLogOncePerObject(object, AEL_LOG_PLACEHOLDER_ENTER)) {
+		Aeloria_Debug_Log("PLACEHOLDER_ENTER this=%p size=%d has_creation=%d", (void*)object, size,
+		                  g_AeloriaObjectCreationFrame.find(reinterpret_cast<uintptr_t>(object)) != g_AeloriaObjectCreationFrame.end() ? 1 : 0);
+	}
 
 	// Guard: during the absolute first Map.Render() (g_EarlyLoadGraceActive is only true for
 	// that one call, set/cleared in the CNC_Start_* arming blocks). The DLL client path can AV
@@ -4159,7 +4162,8 @@ static void DrawSafePlaceholder(const ObjectClass* object,
 	DLL_Draw_Intercept(0, x, y, size, size, flags, const_cast<ObjectClass*>(object),
 	                   rotation, virtualscale, shape_file_name, override_owner);
 
-	if (g_AeloriaEnableVerboseDrawLogs) {
+	if (g_AeloriaEnableVerboseDrawLogs
+	    && Aeloria_ShouldLogOncePerObject(object, AEL_LOG_PLACEHOLDER_ENTER)) {
 		Aeloria_Debug_Log("PLACEHOLDER_DLL_CALLED this=%p", (void*)object);
 	}
 
@@ -4172,7 +4176,8 @@ static void DrawSafePlaceholder(const ObjectClass* object,
 	if (LogicPage != nullptr && !g_EarlyLoadGraceActive) {
 		int marker = 48; // prominent yellow marker box
 		LogicPage->Fill_Rect(x-4, y-4, x + marker, y + marker, 14); // bright yellow
-		if (g_AeloriaEnableVerboseDrawLogs) {
+		if (g_AeloriaEnableVerboseDrawLogs
+		    && Aeloria_ShouldLogOncePerObject(object, AEL_LOG_PLACEHOLDER_MARKER)) {
 			Aeloria_Debug_Log("PLACEHOLDER_VISIBILITY_MARKER_YELLOW_BOX this=%p size=%d", (void*)object, marker);
 		}
 	}

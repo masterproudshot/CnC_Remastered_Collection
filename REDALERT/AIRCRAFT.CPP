@@ -547,6 +547,10 @@ static bool Aeloria_ProducedRotorUseGuardedShapeOnly(const AircraftClass* aircra
 	if (it == g_AeloriaObjectStability.end() || !it->second.producedUnitUnlimboSeeded) {
 		return false;
 	}
+	// E.2.9: bad+8 pin is slot-lifetime — never graduate to legacy Shape_Number (e8c9e63e Hind@64760).
+	if (it->second.producedUnitBadPlus8) {
+		return true;
+	}
 	if (!it->second.sustainRetired) {
 		return true;
 	}
@@ -591,8 +595,9 @@ static bool Aeloria_DrawProducedRotorVirtualLayers(const AircraftClass* aircraft
 	if (window != WINDOW_VIRTUAL || aircraft == nullptr || aircraft_type == nullptr || aircraft_type->IsFixedWing) {
 		return false;
 	}
-	// E.2.1/E.2.5: legacy Techno/rotors touch Class — unsafe when +8 corrupt or Class unhealthy.
-	if (bad_plus_8 || Aeloria_ProducedRotorUseGuardedShapeOnly(aircraft, aircraft_type)) {
+	// E.2.1/E.2.5/E.2.9: legacy Techno/rotors touch Class — unsafe when +8 corrupt, pin held, or Class unhealthy.
+	if (bad_plus_8 || Aeloria_ProducedRotorUseGuardedShapeOnly(aircraft, aircraft_type)
+	    || Aeloria_IsProducedBadPlus8Unit(selfObj)) {
 		return false;
 	}
 	void const* shapefile = aircraft->Get_Image_Data();
@@ -749,20 +754,7 @@ void AircraftClass::Draw_It(int x, int y, WindowNumberType window) const
 			if (!stabIt->second.sustainRetired) {
 				producedAircraftBulkHandoff = true;
 			}
-			// Phase E: do not clear stale Unlimbo BAD_PLUS8 for rotor aircraft until MAIN draw cache
-			// exists (premature clear left Hind/Longbow on defer+early-return with no LAYERS export).
-			if (!bad_plus_8 && stabIt->second.producedUnitBadPlus8) {
-				const bool rotorProduced = !aircraft_type->IsFixedWing;
-				// E.2.6: U2 spy plane (type_enum=2 fixed-wing) + rotors — never clear bad+8 pin
-				// until sane MAIN cache and healthy Class (fdde15f0 lite-seed crash after fast clear).
-				if (Aeloria_HasSaneMainDrawCache(selfObj)
-				    && Aeloria_TechnoClassRawIsHealthy(this)
-				    && (!rotorProduced || stabIt->second.sustainRetired)) {
-					stabIt->second.producedUnitBadPlus8 = false;
-					Aeloria_Debug_Log("PRODUCED_AIRCRAFT_BAD_PLUS8_CLEARED this=%p owner=%d frame=%u type_enum=%d (runtime +8 ok)",
-					                  (void*)this, (int)Owner(), Frame, (int)stabIt->second.cachedTypeEnum);
-				}
-			}
+			// E.2.9: producedUnitBadPlus8 is slot-lifetime for all aircraft — never clear in Draw_It.
 		}
 	}
 	const bool rotorProducedAircraft = producedTracked && !aircraft_type->IsFixedWing;
@@ -796,9 +788,9 @@ void AircraftClass::Draw_It(int x, int y, WindowNumberType window) const
 	}
 	const int guardedFlag = useGuardedIntercept ? 1 : 0;
 
-	// Phase E.2.2/E.2.4: produced rotors use guarded emit until sustain handoff (and when +8 corrupt).
+	// Phase E.2.2/E.2.4/E.2.9: produced rotors use guarded emit until sustain handoff (and when +8 corrupt/pinned).
 	if (window == WINDOW_VIRTUAL && rotorProducedAircraft) {
-		const bool safeEmit = bad_plus_8 || Aeloria_ProducedRotorPrefersSafeEmit(this);
+		const bool safeEmit = bad_plus_8 || producedBadPlus8 || Aeloria_ProducedRotorPrefersSafeEmit(this);
 		Aeloria_LogProducedAircraftFirstDrawIfNeeded(this, window, safeEmit ? guardedFlag : 0,
 		                                             bad_plus_8 ? 1 : 0);
 		if (safeEmit) {

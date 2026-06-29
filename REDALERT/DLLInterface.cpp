@@ -1826,6 +1826,26 @@ static void Aeloria_PruneStaleTracking()
 		}
 	}
 
+	// E.2.10: late-game map was ~519 entries (77c18c92) — prune graduated slots faster when over cap.
+	if (g_AeloriaObjectStability.size() > 400) {
+		for (auto it = g_AeloriaObjectStability.begin(); it != g_AeloriaObjectStability.end(); ) {
+			ObjectClass* obj = reinterpret_cast<ObjectClass*>(it->first);
+			bool inactive = (!obj || !obj->IsActive);
+			bool aggressive = (it->second.sustainRetired
+			                   && !it->second.producedUnitBadPlus8
+			                   && it->second.stabilityLevel >= 2
+			                   && (inactive || it->second.clientListInserted));
+			if (aggressive) {
+				g_AeloriaObjectCreationFrame.erase(it->first);
+				g_AeloriaObjectLogMask.erase(it->first);
+				it = g_AeloriaObjectStability.erase(it);
+				prunedStab++;
+			} else {
+				++it;
+			}
+		}
+	}
+
 	for (auto it = g_AeloriaObjectCreationFrame.begin(); it != g_AeloriaObjectCreationFrame.end(); ) {
 		ObjectClass* obj = reinterpret_cast<ObjectClass*>(it->first);
 		if (!obj || !obj->IsActive) {
@@ -5743,9 +5763,8 @@ bool Aeloria_TryNotifyProducedUnitMainDrawCache(const ObjectClass* obj, int shap
 	}
 	if (runtime_bad_plus_8) {
 		it->second.producedUnitBadPlus8 = true;
-	} else if (Aeloria_IsProducedRotorAircraft(obj)) {
-		it->second.producedUnitBadPlus8 = false;
 	}
+	// E.2.9: do not clear producedUnitBadPlus8 on MAIN cache notify (was rotor-only unpin).
 	int cacheShape = (shape_number > 0) ? shape_number : 16;
 	bool firstCache = !it->second.hasCachedMainDraw;
 	Aeloria_NotifyMainDrawCache(obj, cacheShape, width, height, draw_x, draw_y);
@@ -6797,9 +6816,16 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 	if (ObjectList != nullptr
 	    && (TotalObjectCount != s_lastBulkPostLogCount
 	        || Frame >= s_lastBulkPostLogFrame + 600)) {
-		Aeloria_Debug_Log("BULK_POST_COUNT total=%d cur_from_bulk=%d finalCount=%d human_house_at_this_export=%d remain_stab=%zu remain_creation=%zu frame=%u",
+		size_t remain_bad_plus8 = 0;
+		for (const auto& kv : g_AeloriaObjectStability) {
+			if (kv.second.producedUnitBadPlus8) {
+				remain_bad_plus8++;
+			}
+		}
+		Aeloria_Debug_Log("BULK_POST_COUNT total=%d cur_from_bulk=%d finalCount=%d human_house_at_this_export=%d remain_stab=%zu remain_bad_plus8=%zu remain_creation=%zu frame=%u",
 		                  TotalObjectCount, 0, (int)ObjectList->Count, (int)g_HumanPlayerHouse,
-		                  g_AeloriaObjectStability.size(), g_AeloriaObjectCreationFrame.size(), Frame);
+		                  g_AeloriaObjectStability.size(), remain_bad_plus8,
+		                  g_AeloriaObjectCreationFrame.size(), Frame);
 		s_lastBulkPostLogCount = TotalObjectCount;
 		s_lastBulkPostLogFrame = Frame;
 	}
