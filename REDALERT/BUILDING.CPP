@@ -3850,6 +3850,8 @@ int BuildingClass::Mission_Construction(void)
 				// Repair Class before Begin_Mode/Grand_Opening — Fetch_Anim_Control and
 				// Grand_Opening AV when +8 is corrupt on human MCV buildings.
 				Aeloria_Repair_Early_Class_Pointer(this);
+				// E.2.16: sidebar-placed buildings never hit Unlimbo seed (ba1ecbe8 WF complete).
+				Aeloria_TrySeedHumanBuildingClientExport(this, true);
 				Begin_Mode(BSTATE_IDLE);
 				Grand_Opening();
 				Assign_Mission(MISSION_GUARD);

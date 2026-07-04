@@ -1339,6 +1339,9 @@ bool TechnoClass::Unlimbo(COORDINATE coord, DirType dir)
 
 				// Seed stability entry with RTTI for summaries
 				auto& stab = g_AeloriaObjectStability[key];
+				if (scenarioStart && trackableTechno) {
+					stab.scenarioStartUnlimbo = true;
+				}
 				if (stab.rtti == 0) stab.rtti = (uint8_t)What_Am_I();
 				if (stab.cachedTypeEnum < 0) {
 					Aeloria_Repair_Early_Class_Pointer(this);
@@ -1487,8 +1490,10 @@ bool TechnoClass::Unlimbo(COORDINATE coord, DirType dir)
 						int seedY = 0;
 						Map.Coord_To_Pixel(unit->Center_Coord(), seedX, seedY);
 						// E.2.15: cache-only lite seed — defer intercept to guarded Draw_It/bulk (1b3dda6a).
-						Aeloria_SeedProducedGroundUnitOnUnlimbo(this, seedShape, drawW, drawH, stab.producedUnitBadPlus8);
-						stab.earlySafeClientRegistered = stab.producedUnitBadPlus8;
+						const bool seededMain = Aeloria_SeedProducedGroundUnitOnUnlimbo(this, seedShape, drawW, drawH, stab.producedUnitBadPlus8);
+						const bool isHumanWf = (g_HumanPlayerHouse != HOUSE_NONE && Owner() == g_HumanPlayerHouse);
+						// E.2.21: plausible +8 lite-seed left earlySafeClientRegistered=false → no bulk/sustain.
+						stab.earlySafeClientRegistered = stab.producedUnitBadPlus8 || isHumanWf || seededMain;
 						stab.clientListInserted = false;
 						stab.sustainRetired = false;
 						Aeloria_Debug_Log("PRODUCED_UNIT_UNLIMBO_LITE_SEED this=%p owner=%d type_enum=%d w=%d h=%d shape=%d pos=(%d,%d) frame=%u (defer intercept to draw/bulk)",
@@ -1531,8 +1536,9 @@ bool TechnoClass::Unlimbo(COORDINATE coord, DirType dir)
 						int seedY = 0;
 						Map.Coord_To_Pixel(vessel->Center_Coord(), seedX, seedY);
 						// E.2.15: cache-only lite seed — same policy as WF vehicles.
-						Aeloria_SeedProducedGroundUnitOnUnlimbo(this, seedShape, drawW, drawH, stab.producedUnitBadPlus8);
-						stab.earlySafeClientRegistered = stab.producedUnitBadPlus8;
+						const bool seededMainV = Aeloria_SeedProducedGroundUnitOnUnlimbo(this, seedShape, drawW, drawH, stab.producedUnitBadPlus8);
+						const bool isHumanShip = (g_HumanPlayerHouse != HOUSE_NONE && Owner() == g_HumanPlayerHouse);
+						stab.earlySafeClientRegistered = stab.producedUnitBadPlus8 || isHumanShip || seededMainV;
 						stab.clientListInserted = false;
 						stab.sustainRetired = false;
 						Aeloria_Debug_Log("PRODUCED_VESSEL_UNLIMBO_LITE_SEED this=%p owner=%d type_enum=%d w=%d h=%d shape=%d pos=(%d,%d) frame=%u (defer intercept to draw/bulk)",
@@ -1567,26 +1573,8 @@ bool TechnoClass::Unlimbo(COORDINATE coord, DirType dir)
 			if (stab.cachedTypeEnum >= 0) {
 				b->Class = BuildingTypes.Ptr((int)stab.cachedTypeEnum);
 			}
-			// E.2.13f: seed client export before first post-place legacy draw (kennel place crash).
-			if (badAt8 && !stab.earlySafeClientRegistered) {
-				char overrideOwner = (char)Owner();
-				if (overrideOwner != HOUSE_NONE) {
-					int drawW = 48;
-					int drawH = 48;
-					BuildingTypeClass const* btype = static_cast<BuildingTypeClass const*>(Aeloria_Safe_Techno_Type(this));
-					if (btype) {
-						btype->Dimensions(drawW, drawH);
-					}
-					if (drawW <= 0) drawW = 48;
-					if (drawH <= 0) drawH = 48;
-					DLL_Draw_Intercept(0, 0, 0, drawW, drawH, 0, this, DIR_N, 0x100, nullptr, overrideOwner);
-					stab.earlySafeClientRegistered = true;
-					stab.clientListInserted = false;
-					stab.sustainRetired = false;
-					Aeloria_Debug_Log("HUMAN_BUILDING_UNLIMBO_SEED this=%p owner=%d type_enum=%d w=%d h=%d frame=%u",
-					                  (void*)this, (int)Owner(), (int)stab.cachedTypeEnum, drawW, drawH, Frame);
-				}
-			}
+			// E.2.13f / E.2.16: shared human building client seed (unlimbo path).
+			Aeloria_TrySeedHumanBuildingClientExport(b, false);
 			if (Aeloria_ShouldLogOncePerObject(this, AEL_LOG_PLAYER_CREATION)) {
 				Aeloria_Debug_Log("HUMAN_BUILDING_UNLIMBO this=%p raw=%d type_enum=%d bad_at8=%d frame=%u",
 				                  (void*)this, b->Class.Raw(), (int)stab.cachedTypeEnum, badAt8 ? 1 : 0, Frame);

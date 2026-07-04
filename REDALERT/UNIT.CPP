@@ -2198,11 +2198,16 @@ void UnitClass::Draw_It(int x, int y, WindowNumberType window) const
 
 	Aeloria_Repair_Early_Class_Pointer(const_cast<UnitClass*>(this));
 
+	const ObjectClass* selfObj = static_cast<const ObjectClass*>(this);
+	const bool producedUnitSeeded = Aeloria_IsProducedUnitUnlimboSeeded(selfObj);
+
 	/*
 	**	Early-out if the Class pointer is not yet valid (can happen very early
 	**	during scenario load before TypeClasses are fully constructed).
+	**	E.2.21: WF vehicles (e.g. Mammoth) must still VIRTUAL/MAIN emit when pool-reused
+	**	Class fails Is_Drawable — same pattern as produced aircraft (E.2.3).
 	*/
-	if (!Is_Drawable(this)) return;
+	if (!Is_Drawable(this) && !producedUnitSeeded) return;
 
 	const UnitTypeClass* unit_type = static_cast<const UnitTypeClass*>(Aeloria_Safe_Techno_Type(this));
 	if (unit_type == nullptr) return;
@@ -2215,8 +2220,7 @@ void UnitClass::Draw_It(int x, int y, WindowNumberType window) const
 
 	uintptr_t at_plus_8 = *(uintptr_t*)((const char*)this + 8);
 	bool bad_plus_8 = !Is_Plausible_Class_Pointer(at_plus_8);
-	const ObjectClass* selfObj = static_cast<const ObjectClass*>(this);
-	const bool producedTracked = Aeloria_IsProducedUnitUnlimboSeeded(selfObj);
+	const bool producedTracked = producedUnitSeeded;
 	const bool repurposedHarvester = Aeloria_IsRepurposedHarvester(selfObj);
 	const bool eternalProduced = Aeloria_IsEternalSafeProducedUnit(selfObj);
 	const bool producedHarvester = Aeloria_IsProducedBadPlus8Harvester(selfObj);
@@ -2260,15 +2264,8 @@ void UnitClass::Draw_It(int x, int y, WindowNumberType window) const
 		return;
 	}
 
-	// E.2.13d: runtime unpin only on MAIN — VIRTUAL +8 is not trustworthy for graduation.
-	if (producedTracked && Aeloria_TryClearProducedUnitRuntimeBadPlus8(selfObj, this)
-	    && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_PLAYER_CREATION)) {
-		uintptr_t stabKey = reinterpret_cast<uintptr_t>(this);
-		auto stabIt = g_AeloriaObjectStability.find(stabKey);
-		int typeEnum = (stabIt != g_AeloriaObjectStability.end()) ? (int)stabIt->second.cachedTypeEnum : -1;
-		Aeloria_Debug_Log("PRODUCED_UNIT_RUNTIME_PLUS8_CLEARED this=%p owner=%d frame=%u type_enum=%d (runtime +8 ok)",
-		                  (void*)this, (int)Owner(), Frame, typeEnum);
-	}
+	// E.2.17: do not runtime-unpin producedUnitBadPlus8 on MAIN (07f79f8e / 0xcf606).
+	// +8 flickers plausible while Class is still corrupt → legacy Techno_Draw AV ~60 frames after FIRST_DRAW.
 	at_plus_8 = *(uintptr_t*)((const char*)this + 8);
 	bad_plus_8 = !Is_Plausible_Class_Pointer(at_plus_8);
 	const bool eternalProducedMain = Aeloria_IsEternalSafeProducedUnit(selfObj);
@@ -2307,6 +2304,23 @@ void UnitClass::Draw_It(int x, int y, WindowNumberType window) const
 		                  (void*)this, (int)Owner(), Frame, (int)What_Am_I());
 	}
 
+	// E.2.43/E.2.44: scenario-start units stay guarded until live arm; then need sane cache + healthy Class/+8.
+	if (Aeloria_StartingUnitLegacyMainBlocked(selfObj)
+	    || (Aeloria_IsScenarioStartUnlimboUnit(selfObj) && Aeloria_IsExplicitLiveSkirmishMatch())) {
+		at_plus_8 = *(uintptr_t*)((const char*)this + 8);
+		bad_plus_8 = !Is_Plausible_Class_Pointer(at_plus_8);
+		if (Aeloria_StartingUnitLegacyMainBlocked(selfObj)
+		    || !Aeloria_HasSaneMainDrawCache(selfObj)
+		    || !Aeloria_TechnoClassRawIsHealthy(this)
+		    || bad_plus_8) {
+			int shapenum = Aeloria_GuardedUnitShapeNumber(this);
+			DLL_Draw_Intercept(shapenum, x, y, drawW, drawH, AELORIA_CLIENT_DRAW_FLAGS_CENTER,
+			                   const_cast<UnitClass*>(this), DIR_N, 0x100, nullptr, (char)Owner());
+			Aeloria_DrawGuardedUnitTurret(this, unit_type, PrimaryFacing, SecondaryFacing, IsInRecoilState, x, y, drawW, drawH);
+			return;
+		}
+	}
+
 	if (Aeloria_ShouldLogVerbose(this) && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_GUARD_PASSED)) {
 		Aeloria_Debug_Log("Unit guard passed this=%p Class.Raw=%ld - proceeding to draw", (void*)this, Class.Raw());
 	}
@@ -2325,7 +2339,20 @@ void UnitClass::Draw_It(int x, int y, WindowNumberType window) const
 		Aeloria_Debug_Log("Unit about to call Get_Image_Data() this=%p Class.Raw=%ld", (void*)this, Class.Raw());
 	}
 	shapefile = Get_Image_Data();
-	if (shapefile == NULL) return;
+	if (shapefile == NULL) {
+		// E.2.21: graduated legacy path can fail on pool-reused WF slots — emit guarded sprite.
+		if (producedTracked) {
+			int shapenum = Aeloria_GuardedUnitShapeNumber(this);
+			if (drawW > 0 && drawH > 0) {
+				Aeloria_TryNotifyProducedUnitMainDrawCache(selfObj, shapenum, drawW, drawH, x, y, bad_plus_8);
+			}
+			DLL_Draw_Intercept(shapenum, x, y, drawW, drawH, AELORIA_CLIENT_DRAW_FLAGS_CENTER,
+			                   const_cast<UnitClass*>(this), DIR_N, 0x100, nullptr, (char)Owner());
+			Aeloria_DrawGuardedUnitTurret(this, unit_type, PrimaryFacing, SecondaryFacing, IsInRecoilState, x, y, drawW, drawH);
+			Aeloria_SyncVirtualSelectionHud(this);
+		}
+		return;
+	}
 
 	/*
 	**	If drawing of this unit is not explicitly prohibited, then proceed

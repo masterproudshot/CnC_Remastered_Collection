@@ -50,6 +50,9 @@
 extern int DLL_Startup(const char * command_line);
 extern void Reallocate_Big_Shape_Buffer(void);
 extern bool ProgEndCalled;
+static void Aeloria_ClearScenarioTracking(const char* reason);
+static void Aeloria_SetSkirmishMatchActive(bool active, const char* reason);
+static bool Aeloria_MatchLayerExportAllowed();
 extern int Write_PCX_File(char* name, GraphicViewPortClass& pic, unsigned char* palette);
 extern void Color_Cycle(void);
 
@@ -291,6 +294,7 @@ public:
 	static bool Get_Game_Over() { return GameOver; }
 
 	friend void Aeloria_SyncVirtualSelectionHud(const TechnoClass* tc);
+	friend class AeloriaLayerExportScope;
 
 private:
 	static void Calculate_Single_Player_Score(EventCallbackStruct&);
@@ -608,6 +612,8 @@ bool g_EarlyLoadGraceActive = false;
 // Non-player objects continue to be filtered normally by the strict shape sanity guard.
 HousesType g_HumanPlayerHouse = HOUSE_NONE;
 int g_PlayerExemptionFrames = 0;
+// E.2.37: exemption countdown runs only after live skirmish start (not during map preview/lobby sim).
+static bool g_AeloriaPlayerExemptionCountdownActive = false;
 
 // Phase B instrumentation (May 2026): measure the real cost of the safety net on the human player.
 // These are incremented in the two CC_Draw_Shape overloads in CONQUER.CPP.
@@ -638,11 +644,28 @@ std::map<uintptr_t, uint32_t> g_AeloriaObjectCreationFrame;
 // AELORIA_ENABLE_VERBOSE_DRAW_LOGS=1 environment variable to force this to true at runtime
 // (via the read in CNC_Init below). This is what makes "the debugmode flag flips the loggins switch on".
 bool g_AeloriaEnableVerboseDrawLogs = false;
+int g_AeloriaVerboseDrawSampleDenom = 1;
 
 // infantry-scale Phase 2: healthy barracks infantry skip per-object tracking maps.
 bool g_AeloriaZeroMapProducedInfantry = true;
+// E.2.20c: healthy AI war-factory ground vehicles skip per-object tracking maps (env opt-in).
+bool g_AeloriaZeroMapProducedVehicles = false;
 // infantry-scale Phase 3b: stateless DLL_Draw_Intercept for untracked techno (all RTTI) on corrupt +8.
 bool g_AeloriaStatelessUntrackedTechno = true;
+bool g_AeloriaLayerExportActive = false;
+// E.2.33: Aeloria bulk/repair/creation intercept paths — only during live match LAYERS export.
+static bool g_AeloriaLiveLayerEnhancements = false;
+// E.2.23/24: true only during live match Advance (not main menu / not CNC_Start preview).
+static bool g_AeloriaSkirmishMatchActive = false;
+static bool g_AeloriaInstanceAdvanceBegun = false;
+static bool g_AeloriaCncStartCompleted = false;
+// E.2.26: set only when client starts live sim (mission timer after map load). Was_Started() stays true after Stop() — must not gate match on it.
+static bool g_AeloriaExplicitLiveMatch = false;
+// E.2.39: Unity may call CNC_Start_Mission_Timer before GameActive (vanilla no-op); apply on next Advance.
+static bool g_AeloriaPendingMissionTimerArm = false;
+static int g_AeloriaPendingMissionTimerValue = 0;
+// E.2.41: set when CNC_Start_Mission_Timer runs (incl. pending queue) — real skirmish Start, not lobby preview.
+static bool g_AeloriaUserRequestedLiveStart = false;
 
 // infantry-scale Phase 5: per-frame LAYERS sustain for zero-map produced infantry (flicker fix).
 static std::set<uintptr_t> g_AeloriaStatelessInfantryHotList;
@@ -707,10 +730,14 @@ static bool Aeloria_IsCriticalLogMessage(const char *fmt)
 		"BULK_SLOT_STOMP_GUARD",
 		"BULK_SKIP_INVALID_POS",
 		"PRODUCED_INFANTRY_ZERO_MAP_SEED",
+		"PRODUCED_VEHICLE_ZERO_MAP_SKIP",
+		"PRODUCED_VEHICLE_ZERO_MAP_SEED",
 		"PRODUCED_INFANTRY_UNLIMBO_SEED",
 		"PRODUCED_INFANTRY_GRADUATE_DEFER",
 		"PRODUCED_TECHNO_GRADUATE_DEFER",
 		"PRODUCED_UNIT_UNLIMBO_SEED",
+		"HUMAN_BUILDING_UNLIMBO_SEED",
+		"HUMAN_BUILDING_COMPLETE_SEED",
 		"PRODUCED_STARTING_SLOT_RESET",
 		"PRODUCED_UNIT_PLAUSIBLE_PLUS8",
 		"UNIT_MAIN_GUARD",
@@ -757,13 +784,30 @@ static bool Aeloria_IsCriticalLogMessage(const char *fmt)
 	return false;
 }
 
+// E.2.20a: when verbose sampling is enabled (denom>1), emit non-critical verbose logs only every Nth frame.
+static bool Aeloria_ShouldEmitVerboseDrawLog(const char *fmt)
+{
+	if (Aeloria_IsCriticalLogMessage(fmt)) {
+		return true;
+	}
+	if (g_AeloriaVerboseDrawSampleDenom <= 1) {
+		return true;
+	}
+	return (Frame % (unsigned)g_AeloriaVerboseDrawSampleDenom) == 0;
+}
+
 void Aeloria_Debug_Log(const char *fmt, ...)
 {
 	if (!fmt) return;
 
 	// When verbose is off, drop the per-frame hot-path spam before touching the log file.
-	if (!g_AeloriaEnableVerboseDrawLogs && !Aeloria_IsCriticalLogMessage(fmt)) {
-		return;
+	if (!Aeloria_IsCriticalLogMessage(fmt)) {
+		if (!g_AeloriaEnableVerboseDrawLogs) {
+			return;
+		}
+		if (!Aeloria_ShouldEmitVerboseDrawLog(fmt)) {
+			return;
+		}
 	}
 
 	// Lazy open on first use — now with unique per-run filename (timestamp + short nanoid)
@@ -1192,6 +1236,75 @@ void Aeloria_Seed_Human_Building_Stability(BuildingClass* building)
 	Aeloria_Seed_Building_Creation(building);
 }
 
+// E.2.13f / E.2.16: human sidebar buildings skip TechnoClass::Unlimbo — seed at unlimbo (MCV) or
+// CONSTRUCTION_COMPLETE before Grand_Opening (ba1ecbe8 WF type_enum=13).
+void Aeloria_TrySeedHumanBuildingClientExport(BuildingClass* building, bool at_construction_complete)
+{
+	if (!GameActive || !building || g_HumanPlayerHouse == HOUSE_NONE || building->Owner() != g_HumanPlayerHouse) {
+		return;
+	}
+
+	Aeloria_Repair_Early_Class_Pointer(building);
+	uintptr_t key = reinterpret_cast<uintptr_t>(building);
+	auto& stab = g_AeloriaObjectStability[key];
+	uintptr_t at8 = *(uintptr_t*)((const char*)building + 8);
+	bool badAt8 = !Is_Plausible_Class_Pointer(at8);
+
+	if (stab.cachedTypeEnum < 0) {
+		if (building->Class.Raw() >= 0) {
+			BuildingTypeClass const* t = BuildingTypes.Ptr(building->Class.Raw());
+			if (t && t->RTTI == RTTI_BUILDINGTYPE) {
+				stab.cachedTypeEnum = (int16_t)t->Type;
+			}
+		}
+		if (stab.cachedTypeEnum < 0 && !badAt8 && building->Class.Is_Valid()) {
+			BuildingTypeClass const* t = building->Class;
+			if (t && t->RTTI == RTTI_BUILDINGTYPE) {
+				stab.cachedTypeEnum = (int16_t)t->Type;
+			}
+		}
+	}
+	if (stab.cachedTypeEnum >= 0) {
+		building->Class = BuildingTypes.Ptr((int)stab.cachedTypeEnum);
+	}
+
+	// E.2.18: sidebar WF/kennel complete — always lite-seed before Grand_Opening when not yet registered.
+	// +8 can look plausible at CONSTRUCTION_COMPLETE while Grand_Opening still AVs (ba1ecbe8 frame 5100).
+	if (!at_construction_complete && (!badAt8 || stab.earlySafeClientRegistered)) {
+		return;
+	}
+	if (at_construction_complete && stab.earlySafeClientRegistered) {
+		return;
+	}
+
+	char overrideOwner = (char)building->Owner();
+	if (overrideOwner == HOUSE_NONE) {
+		return;
+	}
+
+	int drawW = 48;
+	int drawH = 48;
+	BuildingTypeClass const* btype = static_cast<BuildingTypeClass const*>(Aeloria_Safe_Techno_Type(building));
+	if (btype) {
+		btype->Dimensions(drawW, drawH);
+	}
+	if (drawW <= 0) drawW = 48;
+	if (drawH <= 0) drawH = 48;
+	// E.2.16b: cache-only lite seed (E.2.15 pattern) — zero-map DLL_Draw_Intercept AV'd in menu/LAYERS export.
+	int cacheX = 0;
+	int cacheY = 0;
+	if (building->IsActive && !building->IsInLimbo && Frame > 0) {
+		Map.Coord_To_Pixel(building->Center_Coord(), cacheX, cacheY);
+	}
+	Aeloria_NotifyMainDrawCache(building, 16, drawW, drawH, cacheX, cacheY);
+	stab.earlySafeClientRegistered = true;
+	stab.clientListInserted = false;
+	stab.sustainRetired = false;
+	const char* tag = at_construction_complete ? "HUMAN_BUILDING_COMPLETE_SEED" : "HUMAN_BUILDING_UNLIMBO_SEED";
+	Aeloria_Debug_Log("%s this=%p owner=%d type_enum=%d w=%d h=%d frame=%u",
+	                  tag, (void*)building, (int)building->Owner(), (int)stab.cachedTypeEnum, drawW, drawH, Frame);
+}
+
 void Aeloria_RelocateHarvesterStability(UnitClass* unit)
 {
 	if (!unit) return;
@@ -1213,6 +1326,15 @@ void Aeloria_RelocateHarvesterStability(UnitClass* unit)
 	if (oldCreation != g_AeloriaObjectCreationFrame.end()) {
 		hadCreation = true;
 		priorCreationFrame = oldCreation->second;
+	}
+
+	// E.2.31: starting-slot / infantry pool → harvester must drop stale client export metadata (b25ab038 ~2min AV).
+	if (hadPriorStab
+	    && ((priorRtti != 0 && priorRtti != (uint8_t)RTTI_UNIT)
+	        || (priorType >= 0 && priorType != (int)UNIT_HARVESTER))) {
+		Aeloria_ResetProducedTechnoTracking(unit);
+		hadPriorStab = false;
+		hadCreation = (g_AeloriaObjectCreationFrame.find(key) != g_AeloriaObjectCreationFrame.end());
 	}
 
 	g_AeloriaObjectStability.erase(key);
@@ -1374,6 +1496,41 @@ bool Aeloria_TechnoClassRawIsHealthy(TechnoClass const* techno)
 	}
 }
 
+// E.2.20c: healthy AI war-factory units only — never bad+8, harvester, or human-player vehicles.
+bool Aeloria_MayZeroMapProducedVehicle(UnitClass const* unit)
+{
+	if (!unit || !g_AeloriaZeroMapProducedVehicles) {
+		return false;
+	}
+	if (unit->Owner() == HOUSE_NONE) {
+		return false;
+	}
+	if (g_HumanPlayerHouse != HOUSE_NONE && unit->Owner() == g_HumanPlayerHouse) {
+		return false;
+	}
+	if (!Aeloria_TechnoClassRawIsHealthy(unit)) {
+		return false;
+	}
+	uintptr_t at_plus_8 = *(uintptr_t*)((const char*)unit + 8);
+	if (!Is_Plausible_Class_Pointer(at_plus_8)) {
+		return false;
+	}
+	UnitTypeClass const* utype = static_cast<UnitTypeClass const*>(
+		Aeloria_Safe_Techno_Type(const_cast<UnitClass*>(unit)));
+	if (!utype || utype->Type == UNIT_HARVESTER) {
+		return false;
+	}
+	return true;
+}
+
+bool Aeloria_MayZeroMapProducedVehicle(ObjectClass const* obj)
+{
+	if (!obj || obj->What_Am_I() != RTTI_UNIT) {
+		return false;
+	}
+	return Aeloria_MayZeroMapProducedVehicle(static_cast<UnitClass const*>(obj));
+}
+
 static bool Aeloria_TechnoTypeDimensions(TechnoTypeClass const* ttype, RTTIType rtti, int& outW, int& outH)
 {
 	if (!ttype) return false;
@@ -1436,6 +1593,50 @@ void Aeloria_OneShotProducedInfantryClientSeed(TechnoClass* techno)
 
 	Aeloria_Debug_Log("PRODUCED_INFANTRY_ZERO_MAP_SEED this=%p owner=%d type_enum=%d w=%d h=%d frame=%u",
 	                  (void*)techno, (int)overrideOwner, typeEnum, drawW, drawH, Frame);
+}
+
+// E.2.20c: one-shot client seed for zero-map AI war-factory vehicles (stateless draw path).
+void Aeloria_OneShotProducedVehicleClientSeed(TechnoClass* techno)
+{
+	if (!techno || techno->What_Am_I() != RTTI_UNIT) {
+		return;
+	}
+
+	UnitClass* unit = static_cast<UnitClass*>(techno);
+	Aeloria_Repair_Early_Class_Pointer(techno);
+	char overrideOwner = (char)techno->Owner();
+	if (overrideOwner == HOUSE_NONE) {
+		return;
+	}
+
+	int drawW = 48;
+	int drawH = 48;
+	UnitTypeClass const* utype = static_cast<UnitTypeClass const*>(Aeloria_Safe_Techno_Type(techno));
+	if (utype) {
+		utype->Dimensions(drawW, drawH);
+	}
+	if (drawW <= 0) drawW = 48;
+	if (drawH <= 0) drawH = 48;
+
+	int seedShape = UnitClass::BodyShape[Dir_To_32(unit->PrimaryFacing)];
+	if (seedShape <= 0) {
+		seedShape = UnitClass::BodyShape[16];
+	}
+	if (seedShape <= 0) {
+		seedShape = 16;
+	}
+
+	DLLExportClass::DLL_Draw_Intercept(seedShape, 0, 0, drawW, drawH, 0, techno, DIR_N, 0x100, nullptr, overrideOwner);
+
+	int typeEnum = utype ? (int)utype->Type : -1;
+	uintptr_t key = reinterpret_cast<uintptr_t>(techno);
+	if (g_AeloriaStatelessInfantryHotList.size() >= AELORIA_STATELESS_HOTLIST_MAX) {
+		g_AeloriaStatelessInfantryHotList.erase(g_AeloriaStatelessInfantryHotList.begin());
+	}
+	g_AeloriaStatelessInfantryHotList.insert(key);
+
+	Aeloria_Debug_Log("PRODUCED_VEHICLE_ZERO_MAP_SEED this=%p owner=%d type_enum=%d w=%d h=%d shape=%d frame=%u",
+	                  (void*)techno, (int)overrideOwner, typeEnum, drawW, drawH, seedShape, Frame);
 }
 
 // Phase 5k-5: drop all per-object tracking when a pool slot is freed so the next occupant
@@ -1654,6 +1855,23 @@ bool Aeloria_SeedProducedGroundUnitOnUnlimbo(TechnoClass* techno, int shapenum, 
 	if (techno->Owner() == HOUSE_NONE) {
 		return false;
 	}
+
+	// E.2.20c: drop stab/creation tracking for qualifying AI WF vehicles; stateless client seed only.
+	if (rtti == RTTI_UNIT && !runtime_bad_plus_8
+	    && Aeloria_MayZeroMapProducedVehicle(static_cast<UnitClass const*>(techno))) {
+		uintptr_t key = reinterpret_cast<uintptr_t>(techno);
+		g_AeloriaObjectStability.erase(key);
+		g_AeloriaObjectCreationFrame.erase(key);
+		g_AeloriaObjectLogMask.erase(key);
+		Aeloria_OneShotProducedVehicleClientSeed(techno);
+		static bool s_loggedVehicleZeroMapSkip = false;
+		if (!s_loggedVehicleZeroMapSkip) {
+			Aeloria_Debug_Log("PRODUCED_VEHICLE_ZERO_MAP_SKIP enabled=1 strategy=unlimbo_seed_erase (AI healthy WF units skip g_AeloriaObjectStability)");
+			s_loggedVehicleZeroMapSkip = true;
+		}
+		return true;
+	}
+
 	if (shapenum <= 0) {
 		shapenum = 16;
 	}
@@ -1737,7 +1955,7 @@ bool Aeloria_TryVirtualCombatAnimExport(const ObjectClass* object, WindowNumberT
 bool Aeloria_TryStatelessTechnoDraw(const ObjectClass* object, int shapenum, int x, int y, DirType rotation, long virtualscale,
                                    const char* shape_file_name, char override_owner)
 {
-	if (!Aeloria_IsStatelessUntrackedTechno(object)) {
+	if (!g_AeloriaLayerExportActive || !Aeloria_IsStatelessUntrackedTechno(object)) {
 		return false;
 	}
 
@@ -1773,7 +1991,7 @@ bool Aeloria_TryStatelessInfantryVirtualDraw(const ObjectClass* object, int shap
 bool Aeloria_TrySafeVirtualDrawIntercept(const ObjectClass* object, int shapenum, int x, int y, DirType rotation, long virtualscale,
                                          const char* shape_file_name, char override_owner)
 {
-	if (!object || !object->Is_Techno()) {
+	if (!g_AeloriaLayerExportActive || !object || !object->Is_Techno()) {
 		return false;
 	}
 	// Human-deployed buildings must use placeholder on MAIN/tactical (ObjectList is null there).
@@ -1843,8 +2061,372 @@ void Aeloria_DrawAccessoryIntercept(const ObjectClass* obj, int shapenum, int x,
 	                                   const_cast<ObjectClass*>(obj), DIR_N, 0x100, shape_file_name, owner);
 }
 
+static void Aeloria_ClearScenarioTracking(const char* reason)
+{
+	if (g_AeloriaObjectStability.empty() && g_AeloriaObjectCreationFrame.empty()
+	    && g_AeloriaObjectLogMask.empty() && g_AeloriaStatelessInfantryHotList.empty()) {
+		return;
+	}
+	const size_t stabN = g_AeloriaObjectStability.size();
+	const size_t creationN = g_AeloriaObjectCreationFrame.size();
+	g_AeloriaObjectStability.clear();
+	g_AeloriaObjectCreationFrame.clear();
+	g_AeloriaObjectLogMask.clear();
+	g_AeloriaStatelessInfantryHotList.clear();
+	Aeloria_Debug_Log("SCENARIO_TRACKING_CLEARED reason=%s stab=%zu creation=%zu frame=%u",
+	                  reason ? reason : "?", stabN, creationN, Frame);
+}
+
+static void Aeloria_PruneDeadTrackingKeys(const char* reason);
+static bool Aeloria_PreviewSkirmishTrackingRetain(uintptr_t key);
+
+// E.2.31: preview/disarm in Get_Layer_State must not wipe live creation rows (skirmish ~2min AV).
+static bool Aeloria_DisarmReasonUsesDeadPruneOnly(const char* reason)
+{
+	if (!reason) {
+		return false;
+	}
+	return (strstr(reason, "Get_Layer_State") != nullptr);
+}
+
+static void Aeloria_SetSkirmishMatchActive(bool active, const char* reason)
+{
+	if (g_AeloriaSkirmishMatchActive == active) {
+		return;
+	}
+	g_AeloriaSkirmishMatchActive = active;
+	Aeloria_Debug_Log("SKIRMISH_MATCH_ACTIVE=%d reason=%s frame=%u",
+	                  active ? 1 : 0, reason ? reason : "?", Frame);
+	if (!active) {
+		if (Aeloria_DisarmReasonUsesDeadPruneOnly(reason)) {
+			Aeloria_PruneDeadTrackingKeys(reason);
+		} else {
+			Aeloria_ClearScenarioTracking(reason);
+		}
+	}
+}
+
+static void Aeloria_ResetLiveMatchScope(const char* reason)
+{
+	g_AeloriaExplicitLiveMatch = false;
+	g_AeloriaPendingMissionTimerArm = false;
+	g_AeloriaPendingMissionTimerValue = 0;
+	g_AeloriaUserRequestedLiveStart = false;
+	g_AeloriaInstanceAdvanceBegun = false;
+	g_AeloriaCncStartCompleted = false;
+	g_AeloriaPlayerExemptionCountdownActive = false;
+	Aeloria_SetSkirmishMatchActive(false, reason);
+}
+
+static bool Aeloria_IsObjectTrackingKeyUsable(uintptr_t key)
+{
+	if (!Is_Plausible_Class_Pointer(key)) {
+		return false;
+	}
+	ObjectClass* obj = reinterpret_cast<ObjectClass*>(key);
+	return (obj != nullptr && obj->IsActive);
+}
+
+static void Aeloria_EnsureStabilityForTrackedCreations(const char* reason)
+{
+	size_t ensured = 0;
+
+	for (auto& cp : g_AeloriaObjectCreationFrame) {
+		uintptr_t k = cp.first;
+		if (!Aeloria_IsObjectTrackingKeyUsable(k) && !Aeloria_PreviewSkirmishTrackingRetain(k)) {
+			continue;
+		}
+		if (g_AeloriaObjectStability.find(k) != g_AeloriaObjectStability.end()) {
+			auto& existing = g_AeloriaObjectStability[k];
+			if (cp.second <= 10) {
+				existing.scenarioStartUnlimbo = true;
+			}
+			continue;
+		}
+
+		ObjectClass* obj = reinterpret_cast<ObjectClass*>(k);
+		auto& stab = g_AeloriaObjectStability[k];
+		stab.rtti = (uint8_t)obj->What_Am_I();
+		stab.earlySafeClientRegistered = false;
+		stab.clientListInserted = false;
+		stab.sustainRetired = false;
+
+		if (cp.second <= 10) {
+			stab.scenarioStartUnlimbo = true;
+		}
+		if (obj->Is_Techno()) {
+			TechnoClass* techno = static_cast<TechnoClass*>(obj);
+			Aeloria_Repair_Early_Class_Pointer(techno);
+			TechnoTypeClass const* safe = Aeloria_Safe_Techno_Type(techno);
+			if (safe && stab.cachedTypeEnum < 0) {
+				switch (obj->What_Am_I()) {
+				case RTTI_UNIT:
+					stab.cachedTypeEnum = (int16_t)static_cast<UnitTypeClass const*>(safe)->Type;
+					break;
+				case RTTI_INFANTRY:
+					stab.cachedTypeEnum = (int16_t)static_cast<InfantryTypeClass const*>(safe)->Type;
+					break;
+				case RTTI_AIRCRAFT:
+					stab.cachedTypeEnum = (int16_t)static_cast<AircraftTypeClass const*>(safe)->Type;
+					break;
+				case RTTI_VESSEL:
+					stab.cachedTypeEnum = (int16_t)static_cast<VesselTypeClass const*>(safe)->Type;
+					break;
+				default:
+					break;
+				}
+			}
+		}
+		ensured++;
+	}
+
+	if (ensured > 0) {
+		Aeloria_Debug_Log("STABILITY_RESEED_FROM_CREATION n=%zu reason=%s creation_total=%zu frame=%u",
+		                  ensured, reason ? reason : "?", g_AeloriaObjectCreationFrame.size(), Frame);
+	}
+}
+
+static void Aeloria_TryArmSkirmishMatch(const char* reason)
+{
+	const bool will_arm = g_AeloriaCncStartCompleted && g_AeloriaExplicitLiveMatch && !g_AeloriaSkirmishMatchActive;
+	Aeloria_Debug_Log("LIVE_MATCH_ARM_ATTEMPT reason=%s will_arm=%d explicit=%d skirmish=%d timer_active=%d cnc_start=%d frame=%u",
+	                  reason ? reason : "?", will_arm ? 1 : 0, g_AeloriaExplicitLiveMatch ? 1 : 0,
+	                  g_AeloriaSkirmishMatchActive ? 1 : 0, Scen.MissionTimer.Is_Active() ? 1 : 0,
+	                  g_AeloriaCncStartCompleted ? 1 : 0, Frame);
+	if (!g_AeloriaCncStartCompleted || !g_AeloriaExplicitLiveMatch || g_AeloriaSkirmishMatchActive) {
+		return;
+	}
+	g_AeloriaInstanceAdvanceBegun = true;
+	Aeloria_EnsureStabilityForTrackedCreations(reason);
+	Aeloria_SetSkirmishMatchActive(true, reason);
+}
+
+static void Aeloria_BeginLiveSkirmishMatch(const char* reason)
+{
+	if (!g_AeloriaCncStartCompleted) {
+		return;
+	}
+	g_AeloriaExplicitLiveMatch = true;
+	g_PlayerExemptionFrames = AELORIA_LIVE_MATCH_EXEMPTION_FRAME_COUNT;
+	g_AeloriaPlayerExemptionCountdownActive = true;
+	g_HumanPlayerDrawAttempts = 0;
+	g_HumanPlayerFallbackUses = 0;
+	Aeloria_TryArmSkirmishMatch(reason);
+	if (g_AeloriaSkirmishMatchActive) {
+		g_AeloriaUserRequestedLiveStart = false;
+		Aeloria_Debug_Log("LIVE_SKIRMISH_ARMED via %s frame=%u creation_tracked=%zu exemption_frames=%d",
+		                  reason ? reason : "?", Frame, g_AeloriaObjectCreationFrame.size(), g_PlayerExemptionFrames);
+	}
+}
+
+static bool Aeloria_SafeForFullTechnoLayerFill(const ObjectClass* object, bool hasCreation, uintptr_t key)
+{
+	if (!object || !object->Is_Techno()) {
+		return false;
+	}
+	if (!hasCreation) {
+		return true;
+	}
+	int stab = 0;
+	auto sIt = g_AeloriaObjectStability.find(key);
+	if (sIt != g_AeloriaObjectStability.end()) {
+		stab = sIt->second.stabilityLevel;
+	}
+	if (object->What_Am_I() == RTTI_BUILDING) {
+		const BuildingClass* building = static_cast<const BuildingClass*>(object);
+		if (building->BState == BSTATE_CONSTRUCTION && stab < 1) {
+			return false;
+		}
+	}
+	return stab >= 1;
+}
+
+static void Aeloria_ApplyPendingMissionTimerArm(const char* advanceReason)
+{
+	if (!g_AeloriaPendingMissionTimerArm || !GameActive || !g_AeloriaCncStartCompleted) {
+		return;
+	}
+	g_AeloriaPendingMissionTimerArm = false;
+	Scen.MissionTimer = g_AeloriaPendingMissionTimerValue;
+	if (!Scen.MissionTimer.Is_Active()) {
+		Scen.MissionTimer.Start();
+	}
+	Map.Redraw_Tab();
+	Aeloria_Debug_Log("PENDING_MISSION_TIMER_APPLIED time=%d reason=%s frame=%u",
+	                  g_AeloriaPendingMissionTimerValue, advanceReason ? advanceReason : "?", Frame);
+	Aeloria_BeginLiveSkirmishMatch("Advance_pending_mission_timer");
+}
+
+static bool Aeloria_MatchLayerExportAllowed()
+{
+	// E.2.33/34: live bulk only when explicitly armed (mission timer). Do not gate on Is_Active() —
+	// skirmish can run before countdown ticks; lobby safety is TryArm-only-from-timer + preview disarm.
+	return g_AeloriaSkirmishMatchActive && g_AeloriaExplicitLiveMatch && !ProgEndCalled;
+}
+
+// E.2.40: Remastered visibility requires DLL_Draw_Intercept to fill LAYERS slots during map preview
+// and skirmish (mission timer API often never called). Live-only bulk/repair stays on MatchLayerExportAllowed.
+static bool Aeloria_ClientLayerPopulateAllowed()
+{
+	if (ProgEndCalled) {
+		return false;
+	}
+	if (Aeloria_MatchLayerExportAllowed() || g_EarlyLoadGraceActive) {
+		return true;
+	}
+	return g_AeloriaCncStartCompleted && GameActive && g_AeloriaLayerExportActive;
+}
+
+void Aeloria_OnMainMenuPhase(void)
+{
+	g_EarlyLoadGraceActive = false;
+	g_PlayerExemptionFrames = 0;
+	g_AeloriaPlayerExemptionCountdownActive = false;
+	Scen.MissionTimer = 0;
+	Scen.MissionTimer.Stop();
+	Aeloria_ResetLiveMatchScope("Select_Game_main_menu");
+}
+
+bool Aeloria_IsLiveSkirmishMapLoaded(void)
+{
+	return GameActive && g_AeloriaCncStartCompleted;
+}
+
+bool Aeloria_IsExplicitLiveSkirmishMatch(void)
+{
+	return g_AeloriaSkirmishMatchActive && g_AeloriaExplicitLiveMatch && !ProgEndCalled;
+}
+
+// E.2.45/46: loaded skirmish PREVIEW — keep creation/stab for live starting units.
+// E.2.46: do not require Is_Plausible_Class_Pointer(this) for creation retain — pool slots are
+// often 4-byte misaligned (885446a6 plausible=0 active=1) yet still live @ frame 0.
+static bool Aeloria_PreviewSkirmishTrackingRetain(uintptr_t key)
+{
+	if (!Aeloria_IsLiveSkirmishMapLoaded() || Aeloria_IsExplicitLiveSkirmishMatch()) {
+		return false;
+	}
+	if (key < 0x10000) {
+		return false;
+	}
+	ObjectClass* obj = reinterpret_cast<ObjectClass*>(key);
+	if (!obj || obj->IsInLimbo) {
+		return false;
+	}
+	if (g_AeloriaObjectCreationFrame.find(key) != g_AeloriaObjectCreationFrame.end()) {
+		return true;
+	}
+	if (!Is_Plausible_Class_Pointer(key)) {
+		return false;
+	}
+	auto it = g_AeloriaObjectStability.find(key);
+	return it != g_AeloriaObjectStability.end() && it->second.scenarioStartUnlimbo;
+}
+
+static void Aeloria_LogPreviewPruneDrop(uintptr_t key, const char* pass, bool retain)
+{
+	static unsigned s_previewPruneLogBudget = 20;
+	if (s_previewPruneLogBudget == 0) {
+		return;
+	}
+	ObjectClass* obj = reinterpret_cast<ObjectClass*>(key);
+	int active = (obj && obj->IsActive) ? 1 : 0;
+	int limbo = (obj && obj->IsInLimbo) ? 1 : 0;
+	int plausible = Is_Plausible_Class_Pointer(key) ? 1 : 0;
+	int hasCreation = (g_AeloriaObjectCreationFrame.find(key) != g_AeloriaObjectCreationFrame.end()) ? 1 : 0;
+	int scenarioStart = 0;
+	auto stabIt = g_AeloriaObjectStability.find(key);
+	if (stabIt != g_AeloriaObjectStability.end()) {
+		scenarioStart = stabIt->second.scenarioStartUnlimbo ? 1 : 0;
+	}
+	Aeloria_Debug_Log("PREVIEW_PRUNE_%s pass=%s this=%p active=%d limbo=%d plausible=%d has_creation=%d scenario_start=%d frame=%u",
+	                  retain ? "SKIP" : "DROP", pass ? pass : "?", (void*)key, active, limbo, plausible,
+	                  hasCreation, scenarioStart, Frame);
+	s_previewPruneLogBudget--;
+}
+
+// E.2.30: drop freed pool slots only — never wipe live creation rows (E.2.28 skirmish t=0).
+static void Aeloria_PruneDeadTrackingKeys(const char* reason)
+{
+	size_t prunedStab = 0;
+	size_t prunedCreation = 0;
+	size_t prunedHot = 0;
+	size_t previewRetainedStab = 0;
+	size_t previewRetainedCreation = 0;
+	const bool previewPrunePass = (reason && strstr(reason, "Get_Layer_State") != nullptr);
+
+	for (auto it = g_AeloriaObjectStability.begin(); it != g_AeloriaObjectStability.end(); ) {
+		if (Aeloria_PreviewSkirmishTrackingRetain(it->first)) {
+			if (previewPrunePass) {
+				previewRetainedStab++;
+				Aeloria_LogPreviewPruneDrop(it->first, "stab", true);
+			}
+			++it;
+			continue;
+		}
+		if (!Aeloria_IsObjectTrackingKeyUsable(it->first)) {
+			if (previewPrunePass) {
+				Aeloria_LogPreviewPruneDrop(it->first, "stab", false);
+			}
+			g_AeloriaObjectCreationFrame.erase(it->first);
+			g_AeloriaObjectLogMask.erase(it->first);
+			it = g_AeloriaObjectStability.erase(it);
+			prunedStab++;
+			continue;
+		}
+		++it;
+	}
+
+	for (auto it = g_AeloriaObjectCreationFrame.begin(); it != g_AeloriaObjectCreationFrame.end(); ) {
+		if (Aeloria_PreviewSkirmishTrackingRetain(it->first)) {
+			if (previewPrunePass) {
+				previewRetainedCreation++;
+			}
+			++it;
+			continue;
+		}
+		if (!Aeloria_IsObjectTrackingKeyUsable(it->first)) {
+			if (previewPrunePass) {
+				Aeloria_LogPreviewPruneDrop(it->first, "creation", false);
+			}
+			g_AeloriaObjectLogMask.erase(it->first);
+			g_AeloriaObjectStability.erase(it->first);
+			it = g_AeloriaObjectCreationFrame.erase(it);
+			prunedCreation++;
+			continue;
+		}
+		++it;
+	}
+
+	for (auto it = g_AeloriaStatelessInfantryHotList.begin(); it != g_AeloriaStatelessInfantryHotList.end(); ) {
+		if (!Aeloria_IsObjectTrackingKeyUsable(*it)) {
+			it = g_AeloriaStatelessInfantryHotList.erase(it);
+			prunedHot++;
+			continue;
+		}
+		ObjectClass* obj = reinterpret_cast<ObjectClass*>(*it);
+		if (!obj || !obj->IsActive || obj->IsInLimbo) {
+			it = g_AeloriaStatelessInfantryHotList.erase(it);
+			prunedHot++;
+		} else {
+			++it;
+		}
+	}
+
+	if (previewPrunePass && (previewRetainedStab > 0 || previewRetainedCreation > 0)) {
+		Aeloria_Debug_Log("PREVIEW_PRUNE_RETAINED reason=%s stab=%zu creation=%zu frame=%u",
+		                  reason ? reason : "?", previewRetainedStab, previewRetainedCreation, Frame);
+	}
+	if (prunedStab > 0 || prunedCreation > 0 || prunedHot > 0) {
+		Aeloria_Debug_Log("DEAD_TRACKING_PRUNED reason=%s stab=%zu creation=%zu hot=%zu frame=%u",
+		                  reason ? reason : "?", prunedStab, prunedCreation, prunedHot, Frame);
+	}
+}
+
 static void Aeloria_PruneStaleTracking()
 {
+	if (!g_AeloriaSkirmishMatchActive) {
+		return;
+	}
 	static unsigned lastPruneFrame = 0;
 	if (Frame < lastPruneFrame + 150) {
 		return;
@@ -1855,6 +2437,13 @@ static void Aeloria_PruneStaleTracking()
 	size_t prunedCreation = 0;
 
 	for (auto it = g_AeloriaObjectStability.begin(); it != g_AeloriaObjectStability.end(); ) {
+		if (!Aeloria_IsObjectTrackingKeyUsable(it->first)) {
+			g_AeloriaObjectCreationFrame.erase(it->first);
+			g_AeloriaObjectLogMask.erase(it->first);
+			it = g_AeloriaObjectStability.erase(it);
+			prunedStab++;
+			continue;
+		}
 		ObjectClass* obj = reinterpret_cast<ObjectClass*>(it->first);
 		bool inactive = (!obj || !obj->IsActive);
 		// Phase 4: prune sustain-retired produced units (virtual-draw graduated) as well as
@@ -1865,7 +2454,31 @@ static void Aeloria_PruneStaleTracking()
 		if (!inactive && it->second.producedUnitUnlimboSeeded && it->second.producedUnitBadPlus8) {
 			graduated = false;
 		}
+		// E.2.20b: after ~15s, drop late graduated sustain slots faster (never human has_creation on map).
+		if (Frame > 900 && !inactive && !graduated && obj && obj->IsActive) {
+			const bool humanCreationOnMap = (g_HumanPlayerHouse != HOUSE_NONE
+			                                 && obj->Owner() == g_HumanPlayerHouse
+			                                 && g_AeloriaObjectCreationFrame.find(it->first) != g_AeloriaObjectCreationFrame.end());
+			if (!humanCreationOnMap && !Aeloria_IsHumanDeployedBuilding(obj)
+			    && it->second.sustainRetired
+			    && it->second.stabilityLevel >= 2
+			    && !it->second.producedUnitBadPlus8) {
+				graduated = true;
+			}
+		}
 		if (inactive || graduated) {
+			// E.2.20b: never prune has_creation human-house objects still active on map.
+			if (!inactive && obj && obj->IsActive) {
+				if (g_HumanPlayerHouse != HOUSE_NONE && obj->Owner() == g_HumanPlayerHouse
+				    && g_AeloriaObjectCreationFrame.find(it->first) != g_AeloriaObjectCreationFrame.end()) {
+					++it;
+					continue;
+				}
+				if (Aeloria_IsHumanDeployedBuilding(obj)) {
+					++it;
+					continue;
+				}
+			}
 			g_AeloriaObjectCreationFrame.erase(it->first);
 			g_AeloriaObjectLogMask.erase(it->first);
 			it = g_AeloriaObjectStability.erase(it);
@@ -1878,6 +2491,13 @@ static void Aeloria_PruneStaleTracking()
 	// E.2.10: late-game map was ~519 entries (77c18c92) — prune graduated slots faster when over cap.
 	if (g_AeloriaObjectStability.size() > 400) {
 		for (auto it = g_AeloriaObjectStability.begin(); it != g_AeloriaObjectStability.end(); ) {
+			if (!Aeloria_IsObjectTrackingKeyUsable(it->first)) {
+				g_AeloriaObjectCreationFrame.erase(it->first);
+				g_AeloriaObjectLogMask.erase(it->first);
+				it = g_AeloriaObjectStability.erase(it);
+				prunedStab++;
+				continue;
+			}
 			ObjectClass* obj = reinterpret_cast<ObjectClass*>(it->first);
 			bool inactive = (!obj || !obj->IsActive);
 			bool aggressive = (it->second.sustainRetired
@@ -1885,6 +2505,17 @@ static void Aeloria_PruneStaleTracking()
 			                   && it->second.stabilityLevel >= 2
 			                   && (inactive || it->second.clientListInserted));
 			if (aggressive) {
+				if (obj && obj->IsActive) {
+					if (g_HumanPlayerHouse != HOUSE_NONE && obj->Owner() == g_HumanPlayerHouse
+					    && g_AeloriaObjectCreationFrame.find(it->first) != g_AeloriaObjectCreationFrame.end()) {
+						++it;
+						continue;
+					}
+					if (Aeloria_IsHumanDeployedBuilding(obj)) {
+						++it;
+						continue;
+					}
+				}
 				g_AeloriaObjectCreationFrame.erase(it->first);
 				g_AeloriaObjectLogMask.erase(it->first);
 				it = g_AeloriaObjectStability.erase(it);
@@ -1896,8 +2527,33 @@ static void Aeloria_PruneStaleTracking()
 	}
 
 	for (auto it = g_AeloriaObjectCreationFrame.begin(); it != g_AeloriaObjectCreationFrame.end(); ) {
+		if (!Aeloria_IsObjectTrackingKeyUsable(it->first)) {
+			g_AeloriaObjectLogMask.erase(it->first);
+			g_AeloriaObjectStability.erase(it->first);
+			it = g_AeloriaObjectCreationFrame.erase(it);
+			prunedCreation++;
+			continue;
+		}
 		ObjectClass* obj = reinterpret_cast<ObjectClass*>(it->first);
-		if (!obj || !obj->IsActive) {
+		bool prune = (!obj || !obj->IsActive);
+		if (!prune && Frame > 900) {
+			const bool humanCreationOnMap = (obj && obj->IsActive
+			                                 && g_HumanPlayerHouse != HOUSE_NONE
+			                                 && obj->Owner() == g_HumanPlayerHouse);
+			if (!humanCreationOnMap && !Aeloria_IsHumanDeployedBuilding(obj)) {
+				auto stabIt = g_AeloriaObjectStability.find(it->first);
+				if (stabIt != g_AeloriaObjectStability.end()
+				    && stabIt->second.sustainRetired
+				    && stabIt->second.stabilityLevel >= 2
+				    && !stabIt->second.producedUnitBadPlus8) {
+					prune = true;
+					g_AeloriaObjectStability.erase(it->first);
+					g_AeloriaObjectLogMask.erase(it->first);
+					prunedStab++;
+				}
+			}
+		}
+		if (prune) {
 			g_AeloriaObjectLogMask.erase(it->first);
 			it = g_AeloriaObjectCreationFrame.erase(it);
 			prunedCreation++;
@@ -1957,7 +2613,12 @@ static bool Aeloria_ShouldRetainTrackingAfterWindowExpire(uintptr_t key)
 	}
 
 	auto cfIt = g_AeloriaObjectCreationFrame.find(key);
-	if (cfIt != g_AeloriaObjectCreationFrame.end() && cfIt->second > 10) {
+	if (cfIt != g_AeloriaObjectCreationFrame.end()) {
+		// E.2.34: scenario-start (frame<=10) was pruned at WINDOW_EXPIRED -> ~30s AV (d580f9cd).
+		return true;
+	}
+
+	if (g_HumanPlayerHouse != HOUSE_NONE && obj->Owner() == g_HumanPlayerHouse) {
 		return true;
 	}
 
@@ -2042,16 +2703,34 @@ extern "C" __declspec(dllexport) unsigned int __cdecl CNC_Version(unsigned int v
 *
 * History: 1/3/2019 11:33AM - ST
 **************************************************************************************************/
+static bool Aeloria_VerboseDrawFlagFilePresent(void)
+{
+	char path[MAX_PATH] = {0};
+	HMODULE self = NULL;
+	if (!GetModuleHandleExA(
+	        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+	        reinterpret_cast<LPCSTR>(&Aeloria_VerboseDrawFlagFilePresent),
+	        &self)) {
+		return false;
+	}
+	if (GetModuleFileNameA(self, path, MAX_PATH) == 0) {
+		return false;
+	}
+	char* slash = strrchr(path, '\\');
+	if (slash == NULL) {
+		return false;
+	}
+	strcpy(slash + 1, "AeloriaVerboseDraw.flag");
+	return GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
+}
+
 extern "C" __declspec(dllexport) void __cdecl CNC_Init(const char *command_line, CNC_Event_Callback_Type event_callback)
 {
 	Aeloria_AppendLifecycleLog("CNC_INIT_ENTER");
 
 	// Project Aeloria (May 2026): Respect the launcher -DebugMode flag.
-	// When the launcher sees -DebugMode (or the user answers yes to the prompt),
-	// it sets the environment variable AELORIA_ENABLE_VERBOSE_DRAW_LOGS=1 before
-	// launching Steam. We read it here (very early, before any draw code runs)
-	// and force the verbose logging global on. This makes the DebugMode flag
-	// "flip the loggins switch on" exactly as requested.
+	// Steam -applaunch does not inherit the launcher's env block; also honor
+	// Data\AeloriaVerboseDraw.flag next to this DLL (written by Launch-Aeloria.ps1 -D).
 	{
 		char val[16] = {0};
 		bool envWasSet = GetEnvironmentVariableA("AELORIA_ENABLE_VERBOSE_DRAW_LOGS", val, sizeof(val)) > 0;
@@ -2063,6 +2742,9 @@ extern "C" __declspec(dllexport) void __cdecl CNC_Init(const char *command_line,
 				g_AeloriaEnableVerboseDrawLogs = false;
 			}
 		}
+		if (Aeloria_VerboseDrawFlagFilePresent()) {
+			g_AeloriaEnableVerboseDrawLogs = true;
+		}
 		// Always announce the final state very early (goes to DebugView / debugger even if our log file is quiet)
 		char stateMsg[128];
 		_snprintf(stateMsg, sizeof(stateMsg),
@@ -2071,6 +2753,17 @@ extern "C" __declspec(dllexport) void __cdecl CNC_Init(const char *command_line,
 		          envWasSet ? "present" : "absent",
 		          envWasSet ? val : "");
 		OutputDebugStringA(stateMsg);
+	}
+
+	// E.2.20a: AELORIA_VERBOSE_DRAW_SAMPLE_DENOM=N (optional, N>=1) — sample verbose draw logs every N frames when verbose on; critical logs always emit.
+	{
+		char val[16] = {0};
+		if (GetEnvironmentVariableA("AELORIA_VERBOSE_DRAW_SAMPLE_DENOM", val, sizeof(val)) > 0) {
+			int n = atoi(val);
+			if (n >= 1) {
+				g_AeloriaVerboseDrawSampleDenom = n;
+			}
+		}
 	}
 
 	{
@@ -2087,6 +2780,23 @@ extern "C" __declspec(dllexport) void __cdecl CNC_Init(const char *command_line,
 		          g_AeloriaZeroMapProducedInfantry ? "TRUE" : "FALSE");
 		OutputDebugStringA(zmMsg);
 	}
+
+	{
+		char val[16] = {0};
+		if (GetEnvironmentVariableA("AELORIA_ZERO_MAP_PRODUCED_VEHICLES", val, sizeof(val)) > 0) {
+			if (val[0] == '1' || _stricmp(val, "true") == 0 || _stricmp(val, "yes") == 0 || _stricmp(val, "on") == 0) {
+				g_AeloriaZeroMapProducedVehicles = true;
+			} else {
+				g_AeloriaZeroMapProducedVehicles = false;
+			}
+		}
+		char zvMsg[96];
+		_snprintf(zvMsg, sizeof(zvMsg), "AELORIA: g_AeloriaZeroMapProducedVehicles = %s\n",
+		          g_AeloriaZeroMapProducedVehicles ? "TRUE" : "FALSE");
+		OutputDebugStringA(zvMsg);
+	}
+
+	Aeloria_ResetLiveMatchScope("CNC_Init");
 
 	{
 		char val[16] = {0};
@@ -2112,10 +2822,11 @@ extern "C" __declspec(dllexport) void __cdecl CNC_Init(const char *command_line,
 	DLLExportClass::Init();
 
 	// Eager file log so menu-phase / pre-skirmish exits still leave a correlation artifact.
-	Aeloria_Debug_Log("CNC_INIT command_line=%s verbose_draw=%d zero_map_inf=%d frame=%u",
+	Aeloria_Debug_Log("CNC_INIT command_line=%s verbose_draw=%d zero_map_inf=%d zero_map_veh=%d frame=%u",
 	                  command_line ? command_line : "(null)",
 	                  g_AeloriaEnableVerboseDrawLogs ? 1 : 0,
 	                  g_AeloriaZeroMapProducedInfantry ? 1 : 0,
+	                  g_AeloriaZeroMapProducedVehicles ? 1 : 0,
 	                  Frame);
 }
 
@@ -2742,6 +3453,12 @@ extern "C" __declspec(dllexport) bool __cdecl CNC_Start_Instance_Variation(int s
 	// Ensure creation timestamps start fresh for this scenario (pairs with not clearing
 	// g_AeloriaObjectCreationFrame in the late first-render arming block).
 	g_AeloriaObjectCreationFrame.clear();
+	g_AeloriaExplicitLiveMatch = false;
+	Scen.MissionTimer = 0;
+	Scen.MissionTimer.Stop();
+	g_AeloriaInstanceAdvanceBegun = false;
+	g_AeloriaCncStartCompleted = false;
+	Aeloria_SetSkirmishMatchActive(false, "CNC_Start_Instance_Variation_entry");
 	Aeloria_Debug_Log("CREATION_MAP_CLEARED early (CNC_Start_Instance_Variation entry)");
 
 	ScenarioPlayerType scen_player = SCEN_PLAYER_NONE;
@@ -2906,6 +3623,7 @@ extern "C" __declspec(dllexport) bool __cdecl CNC_Start_Instance_Variation(int s
 	// This gives the human player's early-created units (tanks, MCV, etc.) enough time
 	// under the relaxed guards to be visible and animate when the player starts giving orders.
 	g_PlayerExemptionFrames   = PLAYER_EXEMPTION_FRAME_COUNT;
+	g_AeloriaPlayerExemptionCountdownActive = false;
 	g_HumanPlayerDrawAttempts = 0;
 	g_HumanPlayerFallbackUses = 0;
 	g_AeloriaObjectLogMask.clear();
@@ -2921,10 +3639,12 @@ extern "C" __declspec(dllexport) bool __cdecl CNC_Start_Instance_Variation(int s
 
 	g_EarlyLoadGraceActive = false;
 	Aeloria_Debug_Log("EARLY LOAD GRACE: disabled after first Map.Render()");
-	Aeloria_Debug_Log("PLAYER EXEMPTION (Phase B): 18000-frame window + safe-default-size relaxation active for human house %d", (int)g_HumanPlayerHouse);
+	Aeloria_Debug_Log("PLAYER EXEMPTION (E.2.37): countdown frozen until CNC_Start_Mission_Timer hold_frames=%d human_house=%d",
+	                  PLAYER_EXEMPTION_FRAME_COUNT, (int)g_HumanPlayerHouse);
 
 	Set_Palette(GamePalette.Get_Data());
 
+	g_AeloriaCncStartCompleted = true;
 	return true;
 }
 
@@ -3026,6 +3746,15 @@ extern "C" __declspec(dllexport) bool __cdecl CNC_Start_Custom_Instance(const ch
 	// during subsequent Unlimbo calls during map load). This pairs with the decision
 	// NOT to clear g_AeloriaObjectCreationFrame in the late "first render" arming block.
 	g_AeloriaObjectCreationFrame.clear();
+	g_AeloriaObjectStability.clear();
+	g_AeloriaObjectLogMask.clear();
+	g_AeloriaStatelessInfantryHotList.clear();
+	g_AeloriaExplicitLiveMatch = false;
+	Scen.MissionTimer = 0;
+	Scen.MissionTimer.Stop();
+	g_AeloriaInstanceAdvanceBegun = false;
+	g_AeloriaCncStartCompleted = false;
+	Aeloria_SetSkirmishMatchActive(false, "CNC_Start_Custom_Instance_entry");
 	Aeloria_Debug_Log("CREATION_MAP_CLEARED early (CNC_Start_Custom_Instance entry)");
 
 	char	fullname[_MAX_FNAME + _MAX_EXT];
@@ -3181,6 +3910,7 @@ extern "C" __declspec(dllexport) bool __cdecl CNC_Start_Custom_Instance(const ch
 	}
 
 	g_PlayerExemptionFrames   = PLAYER_EXEMPTION_FRAME_COUNT;
+	g_AeloriaPlayerExemptionCountdownActive = false;
 	g_HumanPlayerDrawAttempts = 0;
 	g_HumanPlayerFallbackUses = 0;
 	g_AeloriaObjectLogMask.clear();
@@ -3206,31 +3936,14 @@ extern "C" __declspec(dllexport) bool __cdecl CNC_Start_Custom_Instance(const ch
 
 	g_EarlyLoadGraceActive = false;
 	Aeloria_Debug_Log("EARLY LOAD GRACE: disabled after first Map.Render() (Custom path)");
-	Aeloria_Debug_Log("PLAYER EXEMPTION (Phase B): 18000-frame window active for human house %d (Custom path)", (int)g_HumanPlayerHouse);
+	Aeloria_Debug_Log("PLAYER EXEMPTION (E.2.37): countdown frozen until CNC_Start_Mission_Timer hold_frames=%d human_house=%d (Custom path)",
+	                  PLAYER_EXEMPTION_FRAME_COUNT, (int)g_HumanPlayerHouse);
 
-	// Targeted catchup force for hasCreation objects (the starting infantry/vehicles recorded at Unlimbo).
-	// This runs AFTER the first Map.Render() + human house capture on the custom 4p path, so:
-	// - g_HumanPlayerHouse is known (isHumanEarly will be correct for the player's starting units).
-	// - The client should be providing a real ObjectList buffer.
-	// - The draw intercept will see hasCreation + list non-null (or protected if still null) and execute the
-	//   full population path (no early return), stamping safe E1/JEEP + Sort + selectable + pos into the real
-	//   client list slots and advancing CurrentDrawCount so the units are visible/selectable/orderable at skirmish start.
-	// This closes the "insertion gap" that caused "map but no units" even when SAFE_CLIENT_REG_EARLY + POST_FILL_STOMP fired.
-	for (auto& pair : g_AeloriaObjectCreationFrame) {
-		ObjectClass* obj = reinterpret_cast<ObjectClass*>(pair.first);
-		if (obj) {
-			char overrideOwner = (char)obj->Owner();
-			if (overrideOwner != HOUSE_NONE) {
-				int px = 0, py = 0;
-				Map.Coord_To_Pixel(obj->Render_Coord(), px, py);
-				DLLExportClass::DLL_Draw_Intercept(0, px, py, 32, 32, AELORIA_CLIENT_DRAW_FLAGS_CENTER, obj, DIR_N, 0x100, nullptr, overrideOwner);
-				Aeloria_Debug_Log("FORCED_CATCHUP_HASCREATION_AFTER_FIRST_RENDER this=%p owner=%d frame=%u pos=(%d,%d)", (void*)obj, (int)overrideOwner, Frame, px, py);
-			}
-		}
-	}
+	// E.2.27: forced catchup moved to CNC_Start_Mission_Timer (live start). Preview load must not call DLL_Draw_Intercept here.
 
 	Set_Palette(GamePalette.Get_Data());
 
+	g_AeloriaCncStartCompleted = true;
 	return true;
 }
 
@@ -3319,6 +4032,22 @@ extern "C" __declspec(dllexport) bool __cdecl CNC_Advance_Instance(uint64 player
 	}
 	else {
 		DLLExportClass::Set_Player_Context(DLLExportClass::GlyphxPlayerIDs[0]);
+	}
+
+	Aeloria_ApplyPendingMissionTimerArm("CNC_Advance_Instance");
+
+	// E.2.38/39: mission timer may be active before explicit live; skirmish Start may defer timer until GameActive.
+	if (g_AeloriaCncStartCompleted && GameActive && GAME_TO_PLAY != GAME_NORMAL && Scen.MissionTimer.Is_Active()) {
+		if (!g_AeloriaExplicitLiveMatch || !g_AeloriaSkirmishMatchActive) {
+			Aeloria_BeginLiveSkirmishMatch("Advance_mission_timer_active");
+		}
+	}
+
+	// E.2.41: do not arm live match at frame 1 in lobby (E.2.40 Advance_glyphx_skirmish_sim → launch AV ~2426).
+	if (g_AeloriaCncStartCompleted && GameActive && GAME_TO_PLAY != GAME_NORMAL && g_AeloriaUserRequestedLiveStart) {
+		if (!g_AeloriaExplicitLiveMatch || !g_AeloriaSkirmishMatchActive) {
+			Aeloria_BeginLiveSkirmishMatch("Advance_user_skirmish_start");
+		}
 	}
 
 	/*
@@ -3512,7 +4241,8 @@ extern "C" __declspec(dllexport) bool __cdecl CNC_Advance_Instance(uint64 player
 	**	touched from this driver (previous reuse caused permanent SKIP_DURING_GRACE for
 	**	the entire opening on custom maps, starving the Remastered client of real draws).
 	*/
-	if (g_PlayerExemptionFrames > 0) {
+	// E.2.37: lobby/preview sim must not burn the opening window before CNC_Start_Mission_Timer.
+	if (g_AeloriaPlayerExemptionCountdownActive && g_PlayerExemptionFrames > 0) {
 		g_PlayerExemptionFrames--;
 		// NOTE: Do NOT touch g_EarlyLoadGraceActive here. That flag is strictly for the
 		// single first Map.Render() call (set true immediately before it, set false
@@ -3523,12 +4253,12 @@ extern "C" __declspec(dllexport) bool __cdecl CNC_Advance_Instance(uint64 player
 		// The long exemption continues to work via Is_Player_Exempt() + the placeholder
 		// paths that check stabilityLevel < 2 and owner == human house.
 
-		if (g_PlayerExemptionFrames == 0) {
+		if (g_AeloriaPlayerExemptionCountdownActive && g_PlayerExemptionFrames == 0) {
 			int attempts = g_HumanPlayerDrawAttempts;
 			int fallbacks = g_HumanPlayerFallbackUses;
 			double pct = (attempts > 0) ? (100.0 * fallbacks / attempts) : 0.0;
 			Aeloria_Debug_Log("WINDOW_EXPIRED house=%d frames=%d attempts=%d fallbacks=%d fallback_pct=%.1f",
-			                  (int)g_HumanPlayerHouse, PLAYER_EXEMPTION_FRAME_COUNT, attempts, fallbacks, pct);
+			                  (int)g_HumanPlayerHouse, AELORIA_LIVE_MATCH_EXEMPTION_FRAME_COUNT, attempts, fallbacks, pct);
 
 			// === Phase C: Worst-offender reporting using per-object stability data ===
 			// This is the key output for diagnosing which specific units/buildings were the slowest
@@ -3624,41 +4354,48 @@ extern "C" __declspec(dllexport) bool __cdecl CNC_Advance_Instance(uint64 player
 				}
 			}
 
-			size_t prunedStab = 0;
-			size_t prunedCreation = 0;
-			size_t prunedLogMask = 0;
+			// E.2.35: never prune tracking maps at WINDOW_EXPIRED during a loaded live map (d580f9cd AV @ frame 600).
+			const bool liveMapLoaded = (GameActive && g_AeloriaCncStartCompleted);
+			if (!liveMapLoaded) {
+				size_t prunedStab = 0;
+				size_t prunedCreation = 0;
+				size_t prunedLogMask = 0;
 
-			for (auto it = g_AeloriaObjectStability.begin(); it != g_AeloriaObjectStability.end(); ) {
-				if (Aeloria_ShouldRetainTrackingAfterWindowExpire(it->first)) {
-					++it;
-				} else {
-					g_AeloriaObjectLogMask.erase(it->first);
-					it = g_AeloriaObjectStability.erase(it);
-					prunedStab++;
+				for (auto it = g_AeloriaObjectStability.begin(); it != g_AeloriaObjectStability.end(); ) {
+					if (Aeloria_ShouldRetainTrackingAfterWindowExpire(it->first)) {
+						++it;
+					} else {
+						g_AeloriaObjectLogMask.erase(it->first);
+						it = g_AeloriaObjectStability.erase(it);
+						prunedStab++;
+					}
 				}
-			}
 
-			for (auto it = g_AeloriaObjectCreationFrame.begin(); it != g_AeloriaObjectCreationFrame.end(); ) {
-				if (Aeloria_ShouldRetainTrackingAfterWindowExpire(it->first)) {
-					++it;
-				} else {
-					it = g_AeloriaObjectCreationFrame.erase(it);
-					prunedCreation++;
+				for (auto it = g_AeloriaObjectCreationFrame.begin(); it != g_AeloriaObjectCreationFrame.end(); ) {
+					if (Aeloria_ShouldRetainTrackingAfterWindowExpire(it->first)) {
+						++it;
+					} else {
+						it = g_AeloriaObjectCreationFrame.erase(it);
+						prunedCreation++;
+					}
 				}
-			}
 
-			for (auto it = g_AeloriaObjectLogMask.begin(); it != g_AeloriaObjectLogMask.end(); ) {
-				if (Aeloria_ShouldRetainTrackingAfterWindowExpire(it->first)) {
-					++it;
-				} else {
-					it = g_AeloriaObjectLogMask.erase(it);
-					prunedLogMask++;
+				for (auto it = g_AeloriaObjectLogMask.begin(); it != g_AeloriaObjectLogMask.end(); ) {
+					if (Aeloria_ShouldRetainTrackingAfterWindowExpire(it->first)) {
+						++it;
+					} else {
+						it = g_AeloriaObjectLogMask.erase(it);
+						prunedLogMask++;
+					}
 				}
-			}
 
-			Aeloria_Debug_Log("WINDOW_EXPIRED_PRUNE retained_stab=%zu retained_creation=%zu pruned_stab=%zu pruned_creation=%zu pruned_logmask=%zu",
-			                  g_AeloriaObjectStability.size(), g_AeloriaObjectCreationFrame.size(),
-			                  prunedStab, prunedCreation, prunedLogMask);
+				Aeloria_Debug_Log("WINDOW_EXPIRED_PRUNE retained_stab=%zu retained_creation=%zu pruned_stab=%zu pruned_creation=%zu pruned_logmask=%zu",
+				                  g_AeloriaObjectStability.size(), g_AeloriaObjectCreationFrame.size(),
+				                  prunedStab, prunedCreation, prunedLogMask);
+			} else {
+				Aeloria_Debug_Log("WINDOW_EXPIRED_PRUNE skipped live_map frame=%u stab=%zu creation=%zu",
+				                  Frame, g_AeloriaObjectStability.size(), g_AeloriaObjectCreationFrame.size());
+			}
 		}
 	}
 	// (No else clause forcing g_EarlyLoadGraceActive=false here — the short first-render
@@ -3673,9 +4410,25 @@ extern "C" __declspec(dllexport) bool __cdecl CNC_Advance_Instance(uint64 player
 		DLLExportClass::Computer_Message(false);
 	}
 
+	{
+		static bool s_aeloriaPrevGameActive = false;
+		if (s_aeloriaPrevGameActive && !GameActive) {
+			Scen.MissionTimer = 0;
+			Scen.MissionTimer.Stop();
+			Aeloria_ResetLiveMatchScope("GameActive_off");
+		}
+		// E.2.32: do not reset live scope on GameActive rising edge — Select_Game already calls
+		// Aeloria_OnMainMenuPhase(); this edge fired after CNC_Start_Custom_Instance and wiped
+		// g_AeloriaCncStartCompleted before CNC_Start_Mission_Timer (t=0 / ~2min instability).
+		s_aeloriaPrevGameActive = GameActive;
+	}
+
 	if (ProgEndCalled) {
 		GlyphX_Debug_Print("ProgEndCalled - GameActive = false");
 		GameActive = false;
+		Scen.MissionTimer = 0;
+		Scen.MissionTimer.Stop();
+		Aeloria_ResetLiveMatchScope("ProgEnd");
 	}
 
 	if (DLLExportClass::Legacy_Render_Enabled()) {
@@ -3935,16 +4688,33 @@ extern "C" __declspec(dllexport) void __cdecl CNC_Handle_Human_Team_Wins(uint64 
 **************************************************************************************************/
 extern "C" __declspec(dllexport) void __cdecl CNC_Start_Mission_Timer(int time)
 {
-	if (GameActive)
-	{
-		Scen.MissionTimer = time;
+	Aeloria_Debug_Log("CNC_Start_Mission_Timer entry time=%d GameActive=%d cnc_start=%d frame=%u",
+	                  time, GameActive ? 1 : 0, g_AeloriaCncStartCompleted ? 1 : 0, Frame);
 
-		if (!Scen.MissionTimer.Is_Active()) {
-			Scen.MissionTimer.Start();
-		}
-
-		Map.Redraw_Tab();
+	if (g_AeloriaCncStartCompleted) {
+		g_AeloriaUserRequestedLiveStart = true;
 	}
+
+	// E.2.39: GlyphX may invoke before GameActive; vanilla path was a silent no-op (fa46d5de: no LIVE_MATCH_ARM_ATTEMPT).
+	if (!GameActive) {
+		if (g_AeloriaCncStartCompleted) {
+			g_AeloriaPendingMissionTimerArm = true;
+			g_AeloriaPendingMissionTimerValue = time;
+			Aeloria_Debug_Log("PENDING_MISSION_TIMER_QUEUED time=%d frame=%u", time, Frame);
+		}
+		return;
+	}
+
+	Scen.MissionTimer = time;
+
+	if (!Scen.MissionTimer.Is_Active()) {
+		Scen.MissionTimer.Start();
+	}
+
+	Map.Redraw_Tab();
+
+	// E.2.27/37: live skirmish start only (never during map-preview load).
+	Aeloria_BeginLiveSkirmishMatch("CNC_Start_Mission_Timer");
 }
 
 
@@ -4607,6 +5377,10 @@ void DLLExportClass::On_Ping(const HouseClass* player_ptr, COORDINATE coord)
 **************************************************************************************************/
 void DLLExportClass::On_Game_Over(uint64 glyphx_Player_id, bool player_wins)
 {
+	Scen.MissionTimer = 0;
+	Scen.MissionTimer.Stop();
+	Aeloria_ResetLiveMatchScope("On_Game_Over");
+
 	if (EventCallback == NULL) {
 		return;
 	}
@@ -4690,6 +5464,10 @@ void DLLExportClass::On_Game_Over(uint64 glyphx_Player_id, bool player_wins)
 **************************************************************************************************/
 void DLLExportClass::On_Multiplayer_Game_Over(void)
 {
+	Scen.MissionTimer = 0;
+	Scen.MissionTimer.Stop();
+	Aeloria_ResetLiveMatchScope("On_Multiplayer_Game_Over");
+
 	if (EventCallback == NULL) {
 		return;
 	}
@@ -5149,22 +5927,35 @@ static bool Aeloria_ProducedRotorMayBulkWithoutMainCache(const ObjectClass* obj,
 
 void DLLExportClass::DLL_Draw_Intercept(int shape_number, int x, int y, int width, int height, int flags, const ObjectClass *object, DirType rotation, long scale, const char *shape_file_name, char override_owner)
 {
+	if (!object) {
+		return;
+	}
+
+	// E.2.40: do not block all client populate (E.2.39 regression: total invisibility when match unarmed).
+	if (!Aeloria_ClientLayerPopulateAllowed()) {
+		return;
+	}
+	const bool liveMatchLayerExport = Aeloria_MatchLayerExportAllowed();
+
 	// Phase 2 diagnostic (approved plan): loud entry into the actual client object population code.
 	// This is the moment the Remastered side decides whether to accept the draw for rendering + selection.
 	// We especially care what What_Am_I() returns for early creation objects.
 
 	uintptr_t key = 0;
 	bool hasCreation = false;
-	if (object) {
+	{
 		key = reinterpret_cast<uintptr_t>(object);
 		hasCreation = g_AeloriaObjectCreationFrame.find(key) != g_AeloriaObjectCreationFrame.end();
-		if (hasCreation && object->Is_Techno()) {
-			Aeloria_Repair_Early_Class_Pointer(const_cast<TechnoClass*>(static_cast<TechnoClass const*>(object)));
-		}
-		if (object->What_Am_I() == RTTI_BUILDING) {
-			uintptr_t at8 = *(uintptr_t*)((const char*)object + 8);
-			if (!Is_Plausible_Class_Pointer(at8)) {
-				Aeloria_Repair_Early_Class_Pointer(const_cast<BuildingClass*>(static_cast<BuildingClass const*>(object)));
+		// E.2.33: menu/map-preview LAYERS must not run repair on creation keys (stale pool AV).
+		if (g_AeloriaLiveLayerEnhancements) {
+			if (hasCreation && object->Is_Techno()) {
+				Aeloria_Repair_Early_Class_Pointer(const_cast<TechnoClass*>(static_cast<TechnoClass const*>(object)));
+			}
+			if (object->What_Am_I() == RTTI_BUILDING) {
+				uintptr_t at8 = *(uintptr_t*)((const char*)object + 8);
+				if (!Is_Plausible_Class_Pointer(at8)) {
+					Aeloria_Repair_Early_Class_Pointer(const_cast<BuildingClass*>(static_cast<BuildingClass const*>(object)));
+				}
 			}
 		}
 	}
@@ -5196,7 +5987,7 @@ void DLLExportClass::DLL_Draw_Intercept(int shape_number, int x, int y, int widt
 	}
 
 	// Unlimbo-only seed when the client ObjectList does not exist yet (scenario-start units).
-	if (ObjectList == nullptr && hasCreation && !skipHeavyEarlyPath) {
+	if (g_AeloriaLiveLayerEnhancements && ObjectList == nullptr && hasCreation && !skipHeavyEarlyPath) {
 		CNCObjectStruct localObj{};
 		memset(&localObj, 0, sizeof(localObj));
 		Convert_Type(object, localObj);
@@ -5216,7 +6007,17 @@ void DLLExportClass::DLL_Draw_Intercept(int shape_number, int x, int y, int widt
 		return;
 	}
 
+	// E.2.19: between Get_Layer_State calls ObjectList may point at a freed client buffer (menu AV).
+	if (!g_AeloriaLayerExportActive) {
+		return;
+	}
+
 	if (ObjectList == nullptr) {
+		return;
+	}
+
+	// E.2.32: guard client LAYERS object array (512 slots); overflow caused ClientG c0000005 mid-skirmish.
+	if (TotalObjectCount + CurrentDrawCount >= 512) {
 		return;
 	}
 
@@ -5422,10 +6223,17 @@ void DLLExportClass::DLL_Draw_Intercept(int shape_number, int x, int y, int widt
 			new_object.IsSubSurface = (ttype->PrimaryWeapon != NULL) && (ttype->PrimaryWeapon->Bullet != NULL) && ttype->PrimaryWeapon->Bullet->IsSubSurface;
 			new_object.IsIronCurtain = techno_object->IronCurtainCountDown > 0;
 
-			int full_name = techno_object->Full_Name();
-			if (full_name < 0)
-			{
-				new_object.OverrideDisplayName = Text_String(full_name);
+			// E.2.40/41: preview + under-construction buildings defer HUD/name (2426 / launch AV).
+			if (liveMatchLayerExport && Aeloria_SafeForFullTechnoLayerFill(object, hasCreation, key)) {
+				Aeloria_PopulateTechnoHudFields(new_object, techno_object);
+
+				int full_name = techno_object->Full_Name();
+				if (full_name < 0) {
+					const char* display = Text_String(full_name);
+					if (display != nullptr && display[0] != '\0') {
+						new_object.OverrideDisplayName = display;
+					}
+				}
 			}
 
 			HouseClass* old_player_ptr = PlayerPtr;
@@ -5625,7 +6433,8 @@ void DLLExportClass::DLL_Draw_Intercept(int shape_number, int x, int y, int widt
 		memset(new_object.ActionWithSelected, DAT_NONE, sizeof(new_object.ActionWithSelected));
 	}
 
-	if (base_object == NULL && object && object->Is_Techno()) {
+	if (liveMatchLayerExport && base_object == NULL && object && object->Is_Techno()
+	    && Aeloria_SafeForFullTechnoLayerFill(object, hasCreation, key)) {
 		Aeloria_PopulateTechnoHudFields(new_object, static_cast<const TechnoClass*>(object));
 	}
 
@@ -5642,13 +6451,18 @@ void DLLExportClass::DLL_Draw_Intercept(int shape_number, int x, int y, int widt
 		}
 	}
 
-	CurrentDrawCount++;
+	if (TotalObjectCount + CurrentDrawCount < 512) {
+		CurrentDrawCount++;
+	}
 }
 
 
 
 void DLLExportClass::DLL_Draw_Pip_Intercept(const ObjectClass* object, int pip)
 {
+	if (!g_AeloriaLayerExportActive || ObjectList == nullptr) {
+		return;
+	}
 	CNCObjectStruct* base_object = NULL;
 	for (int i = 0; i < CurrentDrawCount; ++i) {
 		CNCObjectStruct& draw_object = ObjectList->Objects[TotalObjectCount + i];
@@ -5667,6 +6481,9 @@ void DLLExportClass::DLL_Draw_Pip_Intercept(const ObjectClass* object, int pip)
 
 void DLLExportClass::DLL_Draw_Line_Intercept(int x, int y, int x1, int y1, unsigned char color, int frame)
 {
+	if (!g_AeloriaLayerExportActive || ObjectList == nullptr) {
+		return;
+	}
 	CNCObjectStruct& root_object = ObjectList->Objects[TotalObjectCount];
 	if (root_object.NumLines < MAX_OBJECT_LINES) {
 		root_object.Lines[root_object.NumLines].X = x;
@@ -5726,10 +6543,18 @@ void Aeloria_GraduateTrackedObject(const ObjectClass* obj)
 	if (cfIt != g_AeloriaObjectCreationFrame.end()) {
 		creationFrame = cfIt->second;
 	}
+
+	RTTIType rtti = obj->What_Am_I();
+	// E.2.44: premature Graduate erased creation map → E.2.43 guard bypass (5f1f8c7f).
+	if (stab.scenarioStartUnlimbo && !stab.producedUnitUnlimboSeeded
+	    && !Aeloria_IsExplicitLiveSkirmishMatch()
+	    && (rtti == RTTI_UNIT || rtti == RTTI_VESSEL || rtti == RTTI_INFANTRY)) {
+		return;
+	}
+
 	g_AeloriaObjectCreationFrame.erase(key);
 
-	bool scenarioStart = (creationFrame <= 10);
-	RTTIType rtti = obj->What_Am_I();
+	bool scenarioStart = (creationFrame <= 10) || stab.scenarioStartUnlimbo;
 	// E.2.13g: repurposed starting-unit slots must not take scenario-start graduate path.
 	if (stab.producedUnitUnlimboSeeded && Frame > 10) {
 		scenarioStart = false;
@@ -5744,13 +6569,24 @@ void Aeloria_GraduateTrackedObject(const ObjectClass* obj)
 	const bool pinnedProducedSafeDraw = Aeloria_IsEternalSafeProducedUnit(obj)
 	                                    || Aeloria_IsRepurposedHarvester(obj);
 	if (!aircraftBulkRetain && !pinnedProducedSafeDraw) {
-		stab.sustainRetired = true;
+		// E.2.21: produced ground/sea need sustain until client list has a real slot.
+		if (!(stab.producedUnitUnlimboSeeded
+		      && (rtti == RTTI_UNIT || rtti == RTTI_VESSEL)
+		      && !stab.clientListInserted)) {
+			stab.sustainRetired = true;
+		}
 	}
 
 	// Phase 4/5e/5g: drop mid-game produced techno from tracking maps once MAIN draw is safe.
 	// Retain stability until hasCachedMainDraw — virtual-only cache is not enough (1145 session).
 	if (!scenarioStart && !Aeloria_IsHumanDeployedBuilding(obj) && !Aeloria_IsRepurposedHarvester(obj)
 	    && !Aeloria_IsProducedBadPlus8Unit(obj) && !Aeloria_IsEternalSafeProducedUnit(obj)) {
+		// E.2.21: never drop WF/shipyard stab until complementary bulk inserted the client slot.
+		if (stab.producedUnitUnlimboSeeded
+		    && (rtti == RTTI_UNIT || rtti == RTTI_VESSEL)
+		    && !stab.clientListInserted) {
+			return;
+		}
 		if ((rtti == RTTI_INFANTRY || rtti == RTTI_UNIT || rtti == RTTI_AIRCRAFT)
 		    && !Aeloria_HasValidMainDrawCache(obj)) {
 			g_AeloriaObjectLogMask.erase(key);
@@ -5763,6 +6599,10 @@ void Aeloria_GraduateTrackedObject(const ObjectClass* obj)
 		}
 		g_AeloriaObjectStability.erase(key);
 		g_AeloriaObjectLogMask.erase(key);
+		return;
+	}
+	if (stab.scenarioStartUnlimbo && Aeloria_IsExplicitLiveSkirmishMatch()) {
+		stab.scenarioStartUnlimbo = false;
 	}
 }
 
@@ -5851,6 +6691,9 @@ bool Aeloria_TryNotifyProducedUnitMainDrawCache(const ObjectClass* obj, int shap
 void Aeloria_NotifyMainDrawCache(const ObjectClass* obj, int shape_number, int width, int height, int draw_x, int draw_y)
 {
 	if (!obj || shape_number <= 0 || width <= 0 || height <= 0) return;
+	if (Aeloria_StartingUnitLegacyMainBlocked(obj)) {
+		return;
+	}
 	uintptr_t key = reinterpret_cast<uintptr_t>(obj);
 	auto& stab = g_AeloriaObjectStability[key];
 	stab.hasCachedMainDraw = true;
@@ -5877,6 +6720,13 @@ void Aeloria_NotifyMainDrawCache(const ObjectClass* obj, int shape_number, int w
 		}
 	}
 	stab.lastGoodFrame = Frame;
+	// E.2.21: WF/shipyard units — lite-seed MAIN cache at Unlimbo must not graduate/erase stab
+	// before bulk or DLL_Draw_Intercept registers the client (phantom selectable, immobile HTANK).
+	if (stab.producedUnitUnlimboSeeded
+	    && (obj->What_Am_I() == RTTI_UNIT || obj->What_Am_I() == RTTI_VESSEL)
+	    && !stab.clientListInserted) {
+		return;
+	}
 	Aeloria_GraduateTrackedObject(obj);
 }
 
@@ -6298,6 +7148,8 @@ static void Aeloria_PopulateEarlyBulkSlot(CNCObjectStruct& slot, const ObjectCla
 		slot.DrawFlags = AELORIA_CLIENT_DRAW_FLAGS_CENTER;
 		if (hasCachedDims && stab->cachedShapeNumber > 0) {
 			slot.ShapeIndex = (unsigned short)stab->cachedShapeNumber;
+		} else if (stab && stab->producedUnitUnlimboSeeded) {
+			slot.ShapeIndex = 16;
 		} else {
 			slot.ShapeIndex = 0;
 		}
@@ -6419,14 +7271,17 @@ static bool Aeloria_IsFootLayerSustainCandidate(const ObjectClass* obj)
 
 static void Aeloria_SustainMissingFootLayerObjects(CNCObjectListStruct* list, int& totalCount, int exportLayer)
 {
-	if (!GameActive || !list) {
+	if (!g_AeloriaLayerExportActive || !list || !Aeloria_MatchLayerExportAllowed()) {
 		return;
 	}
 
 	int footAdded = 0;
 	const int baseTotal = totalCount;
 
-	auto tryInsert = [&](const ObjectClass* obj) {
+	auto tryInsert = [&](const ObjectClass* obj, bool hotlistOnlyCandidate) {
+		if (hotlistOnlyCandidate && exportLayer != LAYER_GROUND) {
+			return;
+		}
 		if (!Aeloria_IsFootLayerSustainCandidate(obj)) {
 			return;
 		}
@@ -6437,15 +7292,34 @@ static void Aeloria_SustainMissingFootLayerObjects(CNCObjectListStruct* list, in
 		if (idx >= 512) {
 			return;
 		}
+		if (!Aeloria_PrepareContiguousBulkSlot(list, idx, obj)) {
+			return;
+		}
 		Aeloria_PopulateEarlyBulkSlot(list->Objects[idx], obj, exportLayer);
+		if (!Aeloria_IsValidBulkPixelPos(list->Objects[idx].PositionX, list->Objects[idx].PositionY)) {
+			memset(&list->Objects[idx], 0, sizeof(CNCObjectStruct));
+			return;
+		}
 		footAdded++;
 	};
 
 	for (uintptr_t k : g_AeloriaStatelessInfantryHotList) {
-		tryInsert(reinterpret_cast<const ObjectClass*>(k));
+		if (!Aeloria_IsObjectTrackingKeyUsable(k)) {
+			continue;
+		}
+		tryInsert(reinterpret_cast<const ObjectClass*>(k), true);
 	}
-	for (auto& cp : g_AeloriaObjectCreationFrame) {
-		tryInsert(reinterpret_cast<const ObjectClass*>(cp.first));
+	// E.2.31: do not walk all creation keys — every produced infantry was re-inserted and blew LAYERS Count (~2min crash).
+	for (auto& kv : g_AeloriaObjectStability) {
+		uintptr_t k = kv.first;
+		if (!Aeloria_IsObjectTrackingKeyUsable(k)) {
+			continue;
+		}
+		const AeloriaObjectStability& stab = kv.second;
+		if (!stab.earlySafeClientRegistered || !stab.clientListInserted || stab.sustainRetired) {
+			continue;
+		}
+		tryInsert(reinterpret_cast<const ObjectClass*>(k), false);
 	}
 
 	if (footAdded > 0) {
@@ -6457,10 +7331,11 @@ static void Aeloria_SustainMissingFootLayerObjects(CNCObjectListStruct* list, in
 
 static bool Aeloria_ObjectNeedsBulkOrSustain(const ObjectClass* obj, AeloriaObjectStability& stab)
 {
-	if (!obj || !obj->IsActive || obj->IsInLimbo) return false;
+	if (!Aeloria_MatchLayerExportAllowed() || !obj || !obj->IsActive || obj->IsInLimbo) return false;
 	uintptr_t key = reinterpret_cast<uintptr_t>(obj);
 	bool tracked = g_AeloriaObjectCreationFrame.find(key) != g_AeloriaObjectCreationFrame.end();
 	if (tracked && !stab.clientListInserted) return true;
+	if (stab.producedUnitUnlimboSeeded && !stab.clientListInserted) return true;
 	if (!stab.earlySafeClientRegistered) return false;
 	if (!stab.clientListInserted) return true;
 	if (stab.sustainRetired) return false;
@@ -6478,6 +7353,13 @@ static bool Aeloria_ObjectNeedsBulkOrSustain(const ObjectClass* obj, AeloriaObje
 
 static bool Aeloria_AnyBulkWorkPending()
 {
+	if (!Aeloria_MatchLayerExportAllowed()) {
+		return false;
+	}
+	if (g_AeloriaObjectStability.empty() && g_AeloriaObjectCreationFrame.empty()) {
+		return false;
+	}
+
 	if (!g_AeloriaObjectCreationFrame.empty()) {
 		for (auto& cp : g_AeloriaObjectCreationFrame) {
 			const ObjectClass* obj = reinterpret_cast<const ObjectClass*>(cp.first);
@@ -6505,10 +7387,10 @@ static bool Aeloria_AnyBulkWorkPending()
 
 // Layer export normally requires IsDown; foot techno briefly clears it during MARK_UP/MARK_DOWN
 // while moving. Force export for Aeloria-tracked and zero-map objects so the client keeps them.
-// Must not run during main menu / attract (GameActive false) — caused menu AV in Gate 3c.
+// Must not run during main menu — GameActive stays true in Select_Game; use layer-export scope (E.2.19).
 static bool Aeloria_ForceLayerExport(const ObjectClass* object)
 {
-	if (!GameActive || !object || !object->IsActive || object->IsInLimbo) {
+	if (!g_AeloriaLayerExportActive || !Aeloria_MatchLayerExportAllowed() || !object || !object->IsActive || object->IsInLimbo) {
 		return false;
 	}
 	if (Aeloria_IsTrackedStartingUnit(object)) {
@@ -6542,8 +7424,57 @@ static bool Aeloria_ForceLayerExport(const ObjectClass* object)
 *
 * History: 1/29/2019 11:37AM - ST
 **************************************************************************************************/
+class AeloriaLayerExportScope {
+public:
+	AeloriaLayerExportScope() { g_AeloriaLayerExportActive = true; }
+	~AeloriaLayerExportScope()
+	{
+		g_AeloriaLayerExportActive = false;
+		g_AeloriaLiveLayerEnhancements = false;
+		DLLExportClass::ObjectList = nullptr;
+		DLLExportClass::CurrentDrawCount = 0;
+		DLLExportClass::TotalObjectCount = 0;
+	}
+};
+
 bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in, unsigned int buffer_size)
 {
+	AeloriaLayerExportScope layerExportScope;
+
+	if (g_AeloriaSkirmishMatchActive && !g_AeloriaExplicitLiveMatch) {
+		Aeloria_SetSkirmishMatchActive(false, "Get_Layer_State_not_explicit_live");
+	}
+
+	// E.2.33/35: lobby/map-preview — disarm; keep explicit live while mission timer runs (skirmish bulk).
+	if (!Aeloria_MatchLayerExportAllowed()) {
+		if (!Scen.MissionTimer.Is_Active()) {
+			g_AeloriaExplicitLiveMatch = false;
+		}
+		if (g_AeloriaSkirmishMatchActive) {
+			Aeloria_SetSkirmishMatchActive(false, "Get_Layer_State_preview_scope");
+		}
+		Aeloria_PruneDeadTrackingKeys("Get_Layer_State_preview");
+		Aeloria_EnsureStabilityForTrackedCreations("Get_Layer_State_preview");
+		if (!g_AeloriaCncStartCompleted) {
+			Aeloria_ClearScenarioTracking("Get_Layer_State_main_menu");
+		}
+	}
+
+	g_AeloriaLiveLayerEnhancements = Aeloria_MatchLayerExportAllowed();
+
+	{
+		static bool s_loggedPreviewLayerExport = false;
+		if (!s_loggedPreviewLayerExport && g_AeloriaCncStartCompleted && !Aeloria_MatchLayerExportAllowed()) {
+			s_loggedPreviewLayerExport = true;
+			Aeloria_Debug_Log("PREVIEW_LAYER_EXPORT frame=%u explicit=%d skirmish=%d timer_active=%d",
+			                  Frame, g_AeloriaExplicitLiveMatch ? 1 : 0, g_AeloriaSkirmishMatchActive ? 1 : 0,
+			                  Scen.MissionTimer.Is_Active() ? 1 : 0);
+		}
+		if (Aeloria_MatchLayerExportAllowed()) {
+			s_loggedPreviewLayerExport = false;
+		}
+	}
+
 	player_id;
 
 	static int _export_count = 0;
@@ -6578,7 +7509,10 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 		for (int index = 0; index < Map.Layer[layer].Count(); index++) {
 
 			ObjectClass *object = Map.Layer[layer][index];
-			if (object->IsActive) {
+			if (!object || !object->IsActive) {
+				continue;
+			}
+			{
 
 				unsigned int memory_needed = sizeof(CNCObjectListStruct);
 				memory_needed += (TotalObjectCount + 10) * sizeof(CNCObjectStruct);
@@ -6605,7 +7539,7 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 				}
 
 				bool drawInLayerExport = (Debug_Map || Debug_Unshroud || (object->IsDown && !object->IsInLimbo));
-				if (!drawInLayerExport && GameActive && Aeloria_ForceLayerExport(object)) {
+				if (!drawInLayerExport && Aeloria_MatchLayerExportAllowed() && Aeloria_ForceLayerExport(object)) {
 					drawInLayerExport = true;
 				}
 
@@ -6613,7 +7547,7 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 					int	x, y;
 					Map.Coord_To_Pixel(object->Render_Coord(), x, y);
 
-					if (GameActive && object->Is_Techno() && (Aeloria_IsTrackedStartingUnit(object) || Aeloria_IsStatelessUntrackedTechno(object)
+					if (Aeloria_MatchLayerExportAllowed() && object->Is_Techno() && (Aeloria_IsTrackedStartingUnit(object) || Aeloria_IsStatelessUntrackedTechno(object)
 					                              || g_AeloriaObjectCreationFrame.find(reinterpret_cast<uintptr_t>(object)) != g_AeloriaObjectCreationFrame.end())) {
 						Aeloria_Repair_Early_Class_Pointer(static_cast<TechnoClass*>(object));
 					}
@@ -6621,8 +7555,14 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 					/*
 					** Call to Draw_It can result in multiple callbacks to the draw intercept.
 					*/
+					if (TotalObjectCount >= 512) {
+						continue;
+					}
 					CurrentDrawCount = 0;
 					object->Draw_It(x, y, WINDOW_VIRTUAL);
+					if (TotalObjectCount + CurrentDrawCount > 512) {
+						CurrentDrawCount = 512 - TotalObjectCount;
+					}
 
 					/*
 					** If the root object is a factory, then the last base object is the object in production (rendered after infiltrated buildings when selected).
@@ -6706,12 +7646,17 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 	// bug in proposedIdx = Total + Current when Current holds last-layer value after normal Total updates).
 	// We now cleanly append graduated units right after the final normal Total (at the "end" of this export's normal data).
 	// Strengthened proposedIdx < 512, IsActive/!IsInLimbo already present. Added "first export with graduated" log + export_count visibility.
-	if (ObjectList != nullptr && Aeloria_AnyBulkWorkPending()) {
+	if (ObjectList != nullptr && Aeloria_MatchLayerExportAllowed() && Aeloria_AnyBulkWorkPending()) {
+		Aeloria_EnsureStabilityForTrackedCreations("Get_Layer_State_bulk");
+
 		int bulkAdded = 0;  // Step 4: separate counter, no sharing with CurrentDrawCount or normal batch
 		const int normalTotal = TotalObjectCount;
 
 		for (auto& cp : g_AeloriaObjectCreationFrame) {
 			uintptr_t k = cp.first;
+			if (!Aeloria_IsObjectTrackingKeyUsable(k)) {
+				continue;
+			}
 			auto sIt = g_AeloriaObjectStability.find(k);
 			if (sIt == g_AeloriaObjectStability.end()) continue;
 			auto& stab = sIt->second;
@@ -6774,6 +7719,10 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 		const bool sustainCapReached = (_export_count >= AELORIA_SUSTAIN_MAX_LAYER_EXPORTS);
 		for (auto& kv : g_AeloriaObjectStability) {
 			uintptr_t k = kv.first;
+			if (!Aeloria_IsObjectTrackingKeyUsable(k)) {
+				sustainSkippedInactive++;
+				continue;
+			}
 			auto& stab = kv.second;
 			if (!stab.earlySafeClientRegistered || !stab.clientListInserted || stab.sustainRetired) continue;
 
@@ -6810,7 +7759,10 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 			}
 
 			if (Aeloria_HasValidMainDrawCache(obj) && !aircraftSustainHandoff) {
-				Aeloria_GraduateTrackedObject(obj);
+				// E.2.17: never graduate produced bad+8 ground/sea to legacy sustain handoff (07f79f8e).
+				if (!Aeloria_IsProducedBadPlus8Unit(obj) && !Aeloria_IsEternalSafeProducedUnit(obj)) {
+					Aeloria_GraduateTrackedObject(obj);
+				}
 				continue;
 			}
 
@@ -6884,7 +7836,13 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 	}
 
 	// Phase 5b: foot units leave Map.Layer during MARK_UP; re-insert when the layer walk missed them.
-	Aeloria_SustainMissingFootLayerObjects(ObjectList, TotalObjectCount, ExportLayer);
+	Aeloria_SustainMissingFootLayerObjects(ObjectList, TotalObjectCount, LAYER_GROUND);
+
+	if (TotalObjectCount > 512) {
+		Aeloria_Debug_Log("LAYER_COUNT_CLAMP before=%d frame=%u (guard client LAYERS buffer)",
+		                  TotalObjectCount, Frame);
+		TotalObjectCount = 512;
+	}
 
 	// Vanilla always assigns Count after the layer walk (see TIBERIANDAWN Get_Layer_State). Keeping it
 	// inside the bulk-only path left stale/garbage Count when sustain retired (export 3: finalCount=16384 crash).
@@ -6955,7 +7913,7 @@ void DLLExportClass::Convert_Type(const ObjectClass *object, CNCObjectStruct &ob
 	if (g_AeloriaEnableVerboseDrawLogs) {
 		uintptr_t key = reinterpret_cast<uintptr_t>(object);
 		if (g_AeloriaObjectCreationFrame.find(key) != g_AeloriaObjectCreationFrame.end() &&
-		    (g_PlayerExemptionFrames > 0 || Frame < 300)) {
+		    (Aeloria_MatchLayerExportAllowed() || Frame < 60)) {
 			int stab = 0;
 			auto sIt = g_AeloriaObjectStability.find(key);
 			if (sIt != g_AeloriaObjectStability.end()) stab = sIt->second.stabilityLevel;

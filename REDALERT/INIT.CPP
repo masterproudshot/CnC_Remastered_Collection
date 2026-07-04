@@ -550,6 +550,7 @@ bool Select_Game(bool fade)
 	**	[Re]set any globals that need it, in preparation for a new scenario
 	*/
 	GameActive = true;
+	Aeloria_OnMainMenuPhase();
 	DoList.Init();
 	#ifdef MIRROR_QUEUE
 	MirrorList.Init();

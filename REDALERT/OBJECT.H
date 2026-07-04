@@ -369,6 +369,7 @@ struct AeloriaObjectStability {
     // Type enum captured at Unlimbo when Class resolves (UnitType / InfantryType value).
     int16_t  cachedTypeEnum = -1;
     // Phase 5i: war-factory produced unit — first Draw_It diagnostics (bit0=VIRTUAL, bit1=MAIN).
+    bool     scenarioStartUnlimbo = false; // E.2.44: survives creation-map erase until live match
     bool     producedUnitUnlimboSeeded = false;
     bool     producedUnitBadPlus8 = false;
     uint8_t  producedUnitFirstDrawMask = 0;
@@ -390,10 +391,24 @@ extern std::map<uintptr_t, uint32_t> g_AeloriaObjectCreationFrame;
 // stats line fully intact.
 // Default true so diagnosis builds stay chatty; set to false for clean play.
 extern bool g_AeloriaEnableVerboseDrawLogs;
+// E.2.20a: optional verbose draw log frame sampling (default 1 = every frame). Set via AELORIA_VERBOSE_DRAW_SAMPLE_DENOM in CNC_Init.
+extern int g_AeloriaVerboseDrawSampleDenom;
 // infantry-scale Phase 2: skip stability/creation maps for healthy barracks-produced infantry.
 extern bool g_AeloriaZeroMapProducedInfantry;
+// E.2.20c: skip stability/creation maps for healthy AI war-factory ground vehicles (default off).
+extern bool g_AeloriaZeroMapProducedVehicles;
 // infantry-scale Phase 3b: stateless client intercept for untracked techno with healthy Class.Raw().
 extern bool g_AeloriaStatelessUntrackedTechno;
+// True only while DLLExportClass::Get_Layer_State is building the client object list.
+// Main menu keeps GameActive true but must not touch a stale ObjectList pointer (Gate 3c / menu AV).
+extern bool g_AeloriaLayerExportActive;
+
+// E.2.24: Called from Select_Game when the main menu loop (re)starts — drops skirmish layer-export scope.
+void Aeloria_OnMainMenuPhase(void);
+// E.2.36: true while a custom/skirmish map finished CNC_Start and sim is active (not main-menu preview).
+bool Aeloria_IsLiveSkirmishMapLoaded(void);
+// E.2.43: true only after mission timer / explicit live skirmish arm (bulk + legacy MAIN graduation).
+bool Aeloria_IsExplicitLiveSkirmishMatch(void);
 
 // Distinct message tags for the once-per-object suppression (bit positions).
 // Only the high-volume per-frame draw diagnostics get unique tags here.
@@ -435,7 +450,8 @@ inline bool ShouldLogHeavyNonPlayerDiagnostics()
     if (g_FirstRenderTick == 0) return true;
     return (GetTickCount() - g_FirstRenderTick) < 8000;   // 8 real seconds
 }
-const int PLAYER_EXEMPTION_FRAME_COUNT = 600;   // ~40s logic frames for opening; per-object graduation clears most units earlier
+const int PLAYER_EXEMPTION_FRAME_COUNT = 600;   // preview hold value (not decremented until live match — E.2.37)
+const int AELORIA_LIVE_MATCH_EXEMPTION_FRAME_COUNT = 18000; // ~long skirmish after CNC_Start_Mission_Timer
 const int AELORIA_SUSTAIN_MAX_LAYER_EXPORTS = 12; // Cap sustain re-feeds after skirmish-start window
 
 inline bool Is_Plausible_Class_Pointer(uintptr_t ptr)
@@ -523,6 +539,42 @@ inline bool Aeloria_IsTrackedStartingUnit(const ObjectClass* obj)
 	if (obj == nullptr) return false;
 	uintptr_t key = reinterpret_cast<uintptr_t>(obj);
 	return g_AeloriaObjectCreationFrame.find(key) != g_AeloriaObjectCreationFrame.end();
+}
+
+inline bool Aeloria_IsScenarioStartUnlimboUnit(const ObjectClass* obj)
+{
+	if (obj == nullptr) return false;
+	uintptr_t key = reinterpret_cast<uintptr_t>(obj);
+	auto it = g_AeloriaObjectStability.find(key);
+	return it != g_AeloriaObjectStability.end()
+	    && it->second.scenarioStartUnlimbo
+	    && !it->second.producedUnitUnlimboSeeded;
+}
+
+// E.2.44/E.2.48: block legacy MAIN for scenario-start pool units until explicit live skirmish arm.
+inline bool Aeloria_StartingUnitLegacyMainBlocked(const ObjectClass* obj)
+{
+	if (obj == nullptr || Aeloria_IsExplicitLiveSkirmishMatch()) {
+		return false;
+	}
+	if (Aeloria_IsTrackedStartingUnit(obj) || Aeloria_IsScenarioStartUnlimboUnit(obj)) {
+		return true;
+	}
+	// E.2.48: preview prune dropped creation keys — earlySafe pool rows stay blocked until live arm.
+	if (Aeloria_IsLiveSkirmishMapLoaded()) {
+		uintptr_t key = reinterpret_cast<uintptr_t>(obj);
+		if (g_AeloriaObjectCreationFrame.find(key) == g_AeloriaObjectCreationFrame.end()) {
+			auto it = g_AeloriaObjectStability.find(key);
+			if (it != g_AeloriaObjectStability.end() && it->second.earlySafeClientRegistered
+			    && !it->second.producedUnitUnlimboSeeded) {
+				RTTIType rtti = obj->What_Am_I();
+				if (rtti == RTTI_UNIT || rtti == RTTI_INFANTRY || rtti == RTTI_VESSEL || rtti == RTTI_AIRCRAFT) {
+					return true;
+				}
+			}
+		}
+	}
+	return false;
 }
 
 // Refinery-spawned harvester reusing a starting-unit pool slot (e.g. former MCV).
@@ -620,8 +672,9 @@ inline bool Aeloria_TryClearProducedUnitRuntimeBadPlus8(const ObjectClass* obj, 
 		    && Aeloria_IsValidBulkPixelPos(stab.cachedDrawX, stab.cachedDrawY);
 	}
 	if (!cacheReady) return false;
-	it->second.producedUnitBadPlus8 = false;
-	return true;
+	// E.2.17: runtime unpin disabled — +8 flicker cleared pin → legacy blitter AV (07f79f8e 0xcf606).
+	(void)stab;
+	return false;
 }
 
 // E.2.13d: legacy Techno_Draw only after MAIN-window runtime unpin AND valid MAIN cache.
@@ -684,6 +737,20 @@ inline bool Aeloria_HumanBuildingNeedsPlaceholderDraw(const ObjectClass* obj)
 	return !Is_Plausible_Class_Pointer(at8);
 }
 
+// E.2.47: preview skirmish — all buildings with corrupt +8 (AI construction, e136 tail).
+inline bool Aeloria_PreviewBuildingNeedsSafeDraw(const ObjectClass* obj)
+{
+	if (obj == nullptr || obj->What_Am_I() != RTTI_BUILDING) return false;
+	if (!Aeloria_IsLiveSkirmishMapLoaded() || Aeloria_IsExplicitLiveSkirmishMatch()) return false;
+	uintptr_t at8 = *(uintptr_t*)((const char*)obj + 8);
+	return !Is_Plausible_Class_Pointer(at8);
+}
+
+inline bool Aeloria_BuildingNeedsPlaceholderDraw(const ObjectClass* obj)
+{
+	return Aeloria_HumanBuildingNeedsPlaceholderDraw(obj) || Aeloria_PreviewBuildingNeedsSafeDraw(obj);
+}
+
 // Starting units seeded at Unlimbo must not hit the legacy MAIN blitter until a confirmed-safe
 // MAIN-window draw (shape>0) has been cached. Virtual cache alone is not enough.
 // Also covers earlySafeClientRegistered units that were prematurely graduated off the creation
@@ -691,11 +758,47 @@ inline bool Aeloria_HumanBuildingNeedsPlaceholderDraw(const ObjectClass* obj)
 inline bool Aeloria_IsEarlyStartingUnitMainGuarded(const ObjectClass* obj)
 {
 	if (obj == nullptr) return false;
+	if (Aeloria_StartingUnitLegacyMainBlocked(obj)) {
+		return true;
+	}
+	// E.2.46/E.2.48: preview skirmish — starting technos after creation prune or unhealthy Class.Raw.
+	if (Aeloria_IsLiveSkirmishMapLoaded() && !Aeloria_IsExplicitLiveSkirmishMatch()
+	    && !Aeloria_IsProducedTechnoUnlimboSeeded(obj) && !Aeloria_HasSaneMainDrawCache(obj)) {
+		if (obj->Is_Techno()) {
+			uintptr_t at8 = *(uintptr_t*)((const char*)obj + 8);
+			TechnoClass const* techno = reinterpret_cast<TechnoClass const*>(obj);
+			if (!Is_Plausible_Class_Pointer(at8) || !Aeloria_TechnoClassRawIsHealthy(techno)) {
+				RTTIType rtti = obj->What_Am_I();
+				if (rtti == RTTI_UNIT || rtti == RTTI_INFANTRY || rtti == RTTI_VESSEL || rtti == RTTI_AIRCRAFT) {
+					return true;
+				}
+			}
+		}
+	}
 	if (Aeloria_IsHumanDeployedBuilding(obj)) {
 		if (Aeloria_HasTrustedHumanBuildingMainCache(obj)) return false;
 		return true;
 	}
-	if (Aeloria_HasValidMainDrawCache(obj)) return false;
+	// E.2.42: MAIN cache with invalid bulk coords still graduated too early (b7e7105c @ frame 48).
+	// E.2.48: preview pool rows with sane cache but corrupt Class must not drop MAIN guard (885446a6 MCV).
+	if (Aeloria_HasSaneMainDrawCache(obj)) {
+		if (Aeloria_IsLiveSkirmishMapLoaded() && !Aeloria_IsExplicitLiveSkirmishMatch()
+		    && !Aeloria_IsProducedTechnoUnlimboSeeded(obj) && obj->Is_Techno()) {
+			uintptr_t keyPreview = reinterpret_cast<uintptr_t>(obj);
+			auto stabPreview = g_AeloriaObjectStability.find(keyPreview);
+			if (stabPreview != g_AeloriaObjectStability.end()
+			    && (stabPreview->second.scenarioStartUnlimbo || stabPreview->second.earlySafeClientRegistered)) {
+				TechnoClass const* techno = reinterpret_cast<TechnoClass const*>(obj);
+				if (!Aeloria_TechnoClassRawIsHealthy(techno)) {
+					RTTIType rtti = obj->What_Am_I();
+					if (rtti == RTTI_UNIT || rtti == RTTI_INFANTRY || rtti == RTTI_VESSEL || rtti == RTTI_AIRCRAFT) {
+						return true;
+					}
+				}
+			}
+		}
+		return false;
+	}
 	// Eternal-safe produced / repurposed units use the WF safe-client path, not starting-unit placeholder guard.
 	if (Aeloria_IsRepurposedHarvester(obj) || Aeloria_IsEternalSafeProducedUnit(obj)) return false;
 	uintptr_t key = reinterpret_cast<uintptr_t>(obj);
@@ -720,7 +823,8 @@ inline bool Aeloria_IsEarlyStartingUnitMainGuarded(const ObjectClass* obj)
 // MAIN/tactical blitter must not run for starting-unit or produced-unit guards.
 inline bool Aeloria_NeedsSafeMainDrawGuard(const ObjectClass* obj)
 {
-	return Aeloria_IsEarlyStartingUnitMainGuarded(obj) || Aeloria_IsProducedBadPlus8Unit(obj);
+	return Aeloria_IsEarlyStartingUnitMainGuarded(obj) || Aeloria_IsProducedBadPlus8Unit(obj)
+	    || Aeloria_StartingUnitLegacyMainBlocked(obj);
 }
 
 inline bool Is_Player_Exempt(const ObjectClass* obj)
@@ -735,7 +839,8 @@ inline bool Is_Player_Exempt(const ObjectClass* obj)
 		// Bulk-registered starting units can be promoted to level 2 before any real shape
 		// draw succeeds; keep exemption until we have cached draw params from a real draw.
 		if (!Aeloria_HasValidMainDrawCache(obj)) {
-			if (Aeloria_IsHumanDeployedBuilding(obj) || g_PlayerExemptionFrames > 0 || Frame < 600) {
+			if (Aeloria_IsHumanDeployedBuilding(obj) || g_PlayerExemptionFrames > 0 || Frame < 600
+			    || (Aeloria_IsLiveSkirmishMapLoaded() && obj->Owner() == g_HumanPlayerHouse)) {
 				return true;
 			}
 		} else {
@@ -751,7 +856,8 @@ inline bool Is_Player_Exempt(const ObjectClass* obj)
 	// Step 2/3: all bulk-registered starting units (human + AI) stay exempt until real MAIN draw cache exists.
 	if (it != g_AeloriaObjectStability.end() && it->second.earlySafeClientRegistered
 	    && !Aeloria_HasValidMainDrawCache(obj)) {
-		if (g_PlayerExemptionFrames > 0 || Frame < 600) {
+		if (g_PlayerExemptionFrames > 0 || Frame < 600
+		    || (Aeloria_IsLiveSkirmishMapLoaded() && obj->Owner() == g_HumanPlayerHouse)) {
 			return true;
 		}
 	}
@@ -760,8 +866,12 @@ inline bool Is_Player_Exempt(const ObjectClass* obj)
 		return true;
 	}
 
-	if (g_PlayerExemptionFrames <= 0 && !g_EarlyLoadGraceActive)
-		return false;
+	// E.2.36: global cliff at frame 600 must not drop human-house guards mid-skirmish (d580f9cd @ ~1min).
+	if (g_PlayerExemptionFrames <= 0 && !g_EarlyLoadGraceActive) {
+		if (!(Aeloria_IsLiveSkirmishMapLoaded() && obj->Owner() == g_HumanPlayerHouse)) {
+			return false;
+		}
+	}
 
 	HousesType owner = obj->Owner();
 	// Human house gets the full long exemption + safe placeholder treatment.
@@ -786,6 +896,10 @@ inline bool Aeloria_ShouldLogVerbose(const ObjectClass* obj)
 {
 	if (obj == nullptr) return false;
 	if (!g_AeloriaEnableVerboseDrawLogs) return false;  // Master toggle off -> silence all per-draw spam (first-60s I/O + hundreds of k lines)
+	// E.2.20a: when denom>1, sample verbose per-draw diagnostics to every Nth frame.
+	if (g_AeloriaVerboseDrawSampleDenom > 1 && (Frame % (unsigned)g_AeloriaVerboseDrawSampleDenom) != 0) {
+		return false;
+	}
 	if (Is_Player_Exempt(obj)) return true;   // Full verbosity decision now delegated to Aeloria_ShouldLogOncePerObject (log each msg type once per object)
 	if (Frame < 600) return true;             // Full detail for the first 10 seconds (non-player only)
 	return false;
@@ -804,6 +918,7 @@ void Aeloria_Repair_Early_Class_Pointer(TechnoClass* techno);
 void Aeloria_Seed_Building_Creation(BuildingClass* building);
 void Aeloria_RefreshBuildingStabilityOnSeed(BuildingClass* building, bool humanDeployed);
 void Aeloria_Seed_Human_Building_Stability(BuildingClass* building);
+void Aeloria_TrySeedHumanBuildingClientExport(BuildingClass* building, bool at_construction_complete);
 
 // 5z-l: Accessory layer (WEAP2 roof, tank/vessel turrets) on guarded safe-draw paths.
 // Does not touch main-draw cache or graduation; uses explicit shape_file_name for client export.

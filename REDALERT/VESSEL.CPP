@@ -515,14 +515,7 @@ void VesselClass::Draw_It(int x, int y, WindowNumberType window) const
 		return;
 	}
 
-	if (producedTracked && Aeloria_TryClearProducedUnitRuntimeBadPlus8(selfObj, this)
-	    && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_PLAYER_CREATION)) {
-		uintptr_t stabKey = reinterpret_cast<uintptr_t>(this);
-		auto stabIt = g_AeloriaObjectStability.find(stabKey);
-		int typeEnum = (stabIt != g_AeloriaObjectStability.end()) ? (int)stabIt->second.cachedTypeEnum : -1;
-		Aeloria_Debug_Log("PRODUCED_UNIT_RUNTIME_PLUS8_CLEARED this=%p owner=%d frame=%u type_enum=%d (runtime +8 ok)",
-		                  (void*)this, (int)Owner(), Frame, typeEnum);
-	}
+	// E.2.17: no runtime unpin on MAIN (see UNIT.CPP).
 	at_plus_8 = *(uintptr_t*)((const char*)this + 8);
 	bad_plus_8 = !Is_Plausible_Class_Pointer(at_plus_8);
 	const bool eternalProducedMain = Aeloria_IsEternalSafeProducedUnit(selfObj);
@@ -553,6 +546,22 @@ void VesselClass::Draw_It(int x, int y, WindowNumberType window) const
 	if (useLegacyDraw && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_PRODUCED_UNIT_GRADUATED)) {
 		Aeloria_Debug_Log("PRODUCED_UNIT_GRADUATED_LEGACY_DRAW this=%p owner=%d frame=%u rtti=%d",
 		                  (void*)this, (int)Owner(), Frame, (int)What_Am_I());
+	}
+
+	if (Aeloria_StartingUnitLegacyMainBlocked(selfObj)
+	    || (Aeloria_IsScenarioStartUnlimboUnit(selfObj) && Aeloria_IsExplicitLiveSkirmishMatch())) {
+		at_plus_8 = *(uintptr_t*)((const char*)this + 8);
+		bad_plus_8 = !Is_Plausible_Class_Pointer(at_plus_8);
+		if (Aeloria_StartingUnitLegacyMainBlocked(selfObj)
+		    || !Aeloria_HasSaneMainDrawCache(selfObj)
+		    || !Aeloria_TechnoClassRawIsHealthy(this)
+		    || bad_plus_8) {
+			int shapenum = Aeloria_GuardedVesselShapeNumber(this);
+			DLL_Draw_Intercept(shapenum, x, y, drawW, drawH, AELORIA_CLIENT_DRAW_FLAGS_CENTER,
+			                   const_cast<VesselClass*>(this), DIR_N, 0x100, nullptr, (char)Owner());
+			Aeloria_DrawGuardedVesselTurret(this, vessel_type, PrimaryFacing, SecondaryFacing, x, y, drawW, drawH);
+			return;
+		}
 	}
 
 	if (g_AeloriaEnableVerboseDrawLogs && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_GUARD_PASSED)) {

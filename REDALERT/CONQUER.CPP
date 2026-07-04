@@ -3455,7 +3455,7 @@ static bool Aeloria_TryVirtualLayersExportDespiteBadPlus8(const ObjectClass* obj
                                                           ShapeFlags_Type flags, DirType rotation, long virtualscale,
                                                           void const* shapefile)
 {
-	if (window != WINDOW_VIRTUAL || object == nullptr || shapenum < 0) {
+	if (!g_AeloriaLayerExportActive || window != WINDOW_VIRTUAL || object == nullptr || shapenum < 0) {
 		return false;
 	}
 	int w = width;
@@ -3478,26 +3478,22 @@ static bool Aeloria_TryVirtualLayersExportDespiteBadPlus8(const ObjectClass* obj
 
 void CC_Draw_Shape(const ObjectClass *object, void const * shapefile, int shapenum, int x, int y, WindowNumberType window, ShapeFlags_Type flags, void const * fadingdata, void const * ghostdata, DirType rotation, long virtualscale, int width, int height)
 {
+	const bool aeloriaVerbose = g_AeloriaEnableVerboseDrawLogs; // E.2.20d: one read per draw
 	if (object) {
 		// Build 1 diagnostic: only log for player objects or the very first 10 seconds (throttled after stability)
 		uintptr_t at_plus_8 = *(uintptr_t*)((const char*)object + 8);
-		bool logGot = Aeloria_ShouldLogVerbose(object) && Aeloria_ShouldLogOncePerObject(object, AEL_LOG_CC_DRAW_GOT_OBJECT);
-		// During the long player exemption, suppress this very noisy per-draw log for player objects
-		// (the "bypassing" + SEVERE once-per-object logs + final stats are sufficient for visibility).
-		// Phase C: the central ShouldLogOncePerObject now also suppresses for objects that have
-		// already graduated to stabilityLevel 2.
-		// Phase 1 diagnostic (approved plan): relax suppression during -D so we see what the client
-		// is actually calling for the early creation objects. This is temporary for the proving run.
-		if (logGot && Is_Player_Exempt(object) && g_PlayerExemptionFrames > 0 && !g_AeloriaEnableVerboseDrawLogs) {
-			logGot = false;
+		// E.2.20d: skip ShouldLog* lookups on every draw when verbose is off
+		bool logGot = false;
+		if (aeloriaVerbose) {
+			logGot = Aeloria_ShouldLogVerbose(object) && Aeloria_ShouldLogOncePerObject(object, AEL_LOG_CC_DRAW_GOT_OBJECT);
 		}
 		if (logGot) {
 			Aeloria_Debug_Log("CC_Draw_Shape got Object this=%p RTTI=%d at+8=0x%08lx",
 			                  (void*)object, object->What_Am_I(), (unsigned long)at_plus_8);
 		}
 
-		// E.2.13f: human building ghost/preview — placeholder even when +8 is briefly plausible.
-		if (Aeloria_HumanBuildingNeedsPlaceholderDraw(object)) {
+		// E.2.13f/E.2.47: human + preview skirmish buildings with bad +8 — safe placeholder.
+		if (Aeloria_BuildingNeedsPlaceholderDraw(object)) {
 			DrawSafePlayerPlaceholder(object, x, y, (int)flags, rotation, virtualscale);
 			return;
 		}
@@ -3509,7 +3505,8 @@ void CC_Draw_Shape(const ObjectClass *object, void const * shapefile, int shapen
 		//   even reaching the main client paths after grace.
 		// - What w/h they arrive with (the reason the prior creation-record force never fired).
 		// - The exact moment the client stops "seeing" them.
-		if (object && Is_Player_Exempt(object) && g_PlayerExemptionFrames > 0 && g_AeloriaEnableVerboseDrawLogs) {
+		// E.2.20d: Phase-1 proving logs only when verbose draw logging is enabled
+		if (aeloriaVerbose && object && Is_Player_Exempt(object) && g_PlayerExemptionFrames > 0) {
 			uintptr_t key = reinterpret_cast<uintptr_t>(object);
 			bool hasCreation = g_AeloriaObjectCreationFrame.find(key) != g_AeloriaObjectCreationFrame.end();
 			int stabLevel = 0;
@@ -3522,7 +3519,7 @@ void CC_Draw_Shape(const ObjectClass *object, void const * shapefile, int shapen
 			// are *still* considered exempt. This directly answers "are the starting units still in the
 			// exemption set when the client should be drawing them?"
 			static bool phase1SnapshotDone = false;
-			if (!phase1SnapshotDone && Frame > 300 && g_AeloriaEnableVerboseDrawLogs) {
+			if (!phase1SnapshotDone && Frame > 300) {
 				int stillExemptCreation = 0;
 				for (auto& pair : g_AeloriaObjectCreationFrame) {
 					if (Is_Player_Exempt(reinterpret_cast<ObjectClass*>(pair.first))) stillExemptCreation++;
@@ -3539,7 +3536,8 @@ void CC_Draw_Shape(const ObjectClass *object, void const * shapefile, int shapen
 		**	This is the absolute last log before Buffer_Frame_To_Page.
 		**	Now throttled — only for human player + opening burst.
 		*/
-		if (g_EarlyLoadGraceActive) {
+		// E.2.20d: grace-frame draw diagnostics gated off hot path
+		if (aeloriaVerbose && g_EarlyLoadGraceActive) {
 			bool logThis = Aeloria_ShouldLogVerbose(object);
 			if (!Is_Player_Exempt(object) && !ShouldLogHeavyNonPlayerDiagnostics()) {
 				logThis = false;
@@ -3568,18 +3566,20 @@ void CC_Draw_Shape(const ObjectClass *object, void const * shapefile, int shapen
 		if (g_EarlyLoadGraceActive) {
 			HousesType owner = object ? object->Owner() : HOUSE_NONE;
 			if ((shapefile == nullptr || width <= 0 || height <= 0) && !Is_Player_Exempt(object)) {
-				// Only log Terrain suppression spam for the short real-time window after first render
-				bool logThis = Aeloria_ShouldLogVerbose(object);
-				if (!Is_Player_Exempt(object) && !ShouldLogHeavyNonPlayerDiagnostics()) {
-					logThis = false;
-				}
-				if (logThis) {
-					Aeloria_Debug_Log("GRACE FRAME SKIP BAD SHAPE: this=%p RTTI=%d owner=%d shape=%p num=%d w=%d h=%d -- suppressing draw to avoid blitter AV",
-					                  (void*)object, object->What_Am_I(), (int)owner, shapefile, shapenum, width, height);
+				// E.2.20d: only log Terrain suppression when verbose
+				if (aeloriaVerbose) {
+					bool logThis = Aeloria_ShouldLogVerbose(object);
+					if (!Is_Player_Exempt(object) && !ShouldLogHeavyNonPlayerDiagnostics()) {
+						logThis = false;
+					}
+					if (logThis) {
+						Aeloria_Debug_Log("GRACE FRAME SKIP BAD SHAPE: this=%p RTTI=%d owner=%d shape=%p num=%d w=%d h=%d -- suppressing draw to avoid blitter AV",
+						                  (void*)object, object->What_Am_I(), (int)owner, shapefile, shapenum, width, height);
+					}
 				}
 				return;
 			}
-			if (g_AeloriaEnableVerboseDrawLogs && Is_Player_Exempt(object) && Aeloria_ShouldLogOncePerObject(object, AEL_LOG_PLAYER_EXEMPT_BYPASS)) {
+			if (aeloriaVerbose && Is_Player_Exempt(object) && Aeloria_ShouldLogOncePerObject(object, AEL_LOG_PLAYER_EXEMPT_BYPASS)) {
 				Aeloria_Debug_Log("PLAYER EXEMPTION: bypassing bad shape for human House object this=%p RTTI=%d owner=%d w=%d h=%d -- proceeding to fallback dim compute",
 				                  (void*)object, object->What_Am_I(), (int)owner, width, height);
 			}
@@ -3635,7 +3635,8 @@ void CC_Draw_Shape(const ObjectClass *object, void const * shapefile, int shapen
 			auto createIt = g_AeloriaObjectCreationFrame.find(key);
 			int age = (createIt != g_AeloriaObjectCreationFrame.end()) ? (int)(Frame - createIt->second) : -1;
 			int fb = (stabIt != g_AeloriaObjectStability.end()) ? stabIt->second.fallbackUses : -1;
-			if (Aeloria_ShouldLogOncePerObject(object, AEL_LOG_GRACE_SKIP)) {
+			// E.2.20d: HARD_REJECT safety path unchanged; log only when verbose
+			if (aeloriaVerbose && Aeloria_ShouldLogOncePerObject(object, AEL_LOG_GRACE_SKIP)) {
 				Aeloria_Debug_Log("HARD_REJECT this=%p RTTI=%d at8=0x%08lx reason=plausible_ptr age=%d fallbacks=%d",
 				                  (void*)object, object->What_Am_I(), (unsigned long)at_plus_8, age, fb);
 			}
@@ -3668,7 +3669,8 @@ void CC_Draw_Shape(const ObjectClass *object, void const * shapefile, int shapen
 		if (Is_Player_Exempt(object) && g_PlayerExemptionFrames > 0 && (width <= 0 || height <= 0)) {
 			uintptr_t key = reinterpret_cast<uintptr_t>(object);
 			bool hasCreation = g_AeloriaObjectCreationFrame.find(key) != g_AeloriaObjectCreationFrame.end();
-			if (g_AeloriaEnableVerboseDrawLogs) {
+			// E.2.20d: virtual-window diagnostics gated
+			if (aeloriaVerbose) {
 				Aeloria_Debug_Log("VIRTUAL_FORCE_TAKEN this=%p RTTI=%d has_creation=%d (reason: bad virtual w/h) frame=%u",
 				                  (void*)object, object ? object->What_Am_I() : -1, hasCreation ? 1 : 0, Frame);
 			}
@@ -3682,12 +3684,12 @@ void CC_Draw_Shape(const ObjectClass *object, void const * shapefile, int shapen
 					stabIt->second.fallbackUses++;
 				}
 			}
-			if (Aeloria_ShouldLogOncePerObject(object, AEL_LOG_PLAYER_PHASE_B_SEVERE)) {
+			if (aeloriaVerbose && Aeloria_ShouldLogOncePerObject(object, AEL_LOG_PLAYER_PHASE_B_SEVERE)) {
 				Aeloria_Debug_Log("PLAYER EXEMPTION (Phase C, virtual): using safe placeholder via helper for human house %d (was w=%d h=%d)",
 				                  (int)owner, width, height);
 			}
 
-			if (g_AeloriaEnableVerboseDrawLogs) {
+			if (aeloriaVerbose) {
 				auto cIt = g_AeloriaObjectCreationFrame.find(reinterpret_cast<uintptr_t>(object));
 				int age = (cIt != g_AeloriaObjectCreationFrame.end()) ? (int)(Frame - cIt->second) : -1;
 				Aeloria_Debug_Log("PRE_PLACEHOLDER (virtual) this=%p RTTI=%d owner=%d w=%d h=%d age=%d",
@@ -3737,7 +3739,8 @@ void CC_Draw_Shape(const ObjectClass *object, void const * shapefile, int shapen
 			auto cIt = g_AeloriaObjectCreationFrame.find(reinterpret_cast<uintptr_t>(object));
 			if (stab.successfulRealDraws == 1 && cIt != g_AeloriaObjectCreationFrame.end()) {
 				int age = Frame - cIt->second;
-				if (g_AeloriaEnableVerboseDrawLogs && Aeloria_ShouldLogOncePerObject(object, AEL_LOG_FIRST_REAL_DRAW)) {
+				// E.2.20d
+				if (aeloriaVerbose && Aeloria_ShouldLogOncePerObject(object, AEL_LOG_FIRST_REAL_DRAW)) {
 					Aeloria_Debug_Log("FIRST_REAL_DRAW this=%p RTTI=%d owner=%d age=%d",
 					                  (void*)object, object->What_Am_I(), (int)object->Owner(), age);
 				}
@@ -3748,7 +3751,7 @@ void CC_Draw_Shape(const ObjectClass *object, void const * shapefile, int shapen
 				// Phase C spam reduction: drop this object from the once-per log mask now that
 				// it has graduated. Future draw diagnostics for it will use the lighter gate.
 				g_AeloriaObjectLogMask.erase(reinterpret_cast<uintptr_t>(object));
-				if (g_AeloriaEnableVerboseDrawLogs) {
+				if (aeloriaVerbose) {
 					auto cIt = g_AeloriaObjectCreationFrame.find(reinterpret_cast<uintptr_t>(object));
 					int age = (cIt != g_AeloriaObjectCreationFrame.end()) ? (int)(Frame - cIt->second) : -1;
 					Aeloria_Debug_Log("OBJECT STABILIZED this=%p RTTI=%d owner=%d draws=%u age=%d level=2",
@@ -3767,7 +3770,8 @@ void CC_Draw_Shape(const ObjectClass *object, void const * shapefile, int shapen
 			auto cIt = g_AeloriaObjectCreationFrame.find(reinterpret_cast<uintptr_t>(object));
 			if (stab.fallbackUses == 1 && cIt != g_AeloriaObjectCreationFrame.end()) {
 				int age = Frame - cIt->second;
-				if (g_AeloriaEnableVerboseDrawLogs && Aeloria_ShouldLogOncePerObject(object, AEL_LOG_FIRST_FALLBACK)) {
+				// E.2.20d
+				if (aeloriaVerbose && Aeloria_ShouldLogOncePerObject(object, AEL_LOG_FIRST_FALLBACK)) {
 					Aeloria_Debug_Log("FIRST_FALLBACK this=%p RTTI=%d owner=%d age=%d born_bad_or_became_bad=1",
 					                  (void*)object, object->What_Am_I(), (int)object->Owner(), age);
 				}
@@ -3775,7 +3779,8 @@ void CC_Draw_Shape(const ObjectClass *object, void const * shapefile, int shapen
 
 			HousesType owner = object ? object->Owner() : HOUSE_NONE;
 
-			if (Aeloria_ShouldLogOncePerObject(object, AEL_LOG_PLAYER_PHASE_B_SEVERE)) {
+			// E.2.20d
+			if (aeloriaVerbose && Aeloria_ShouldLogOncePerObject(object, AEL_LOG_PLAYER_PHASE_B_SEVERE)) {
 				Aeloria_Debug_Log("PLAYER_EXEMPTION_SEVERE house=%d w=%d h=%d action=placeholder this=%p RTTI=%d",
 				                  (int)owner, width, height, (void*)object, object->What_Am_I());
 			}
@@ -3783,11 +3788,13 @@ void CC_Draw_Shape(const ObjectClass *object, void const * shapefile, int shapen
 			// For non-stabilized player objects with bad shape data, draw a reliable
 			// visible placeholder through the client's rendering path.
 			if (stab.stabilityLevel < 2 || Aeloria_IsHumanDeployedBuilding(object)) {
-				// Extra diagnostic breadcrumb right before the placeholder call on bad shape.
-				auto cIt = g_AeloriaObjectCreationFrame.find(reinterpret_cast<uintptr_t>(object));
-				int age = (cIt != g_AeloriaObjectCreationFrame.end()) ? (int)(Frame - cIt->second) : -1;
-				Aeloria_Debug_Log("PRE_PLACEHOLDER this=%p RTTI=%d owner=%d w=%d h=%d age=%d",
-				                  (void*)object, object->What_Am_I(), (int)object->Owner(), width, height, age);
+				// E.2.20d: diagnostic breadcrumb only when verbose
+				if (aeloriaVerbose) {
+					auto cIt = g_AeloriaObjectCreationFrame.find(reinterpret_cast<uintptr_t>(object));
+					int age = (cIt != g_AeloriaObjectCreationFrame.end()) ? (int)(Frame - cIt->second) : -1;
+					Aeloria_Debug_Log("PRE_PLACEHOLDER this=%p RTTI=%d owner=%d w=%d h=%d age=%d",
+					                  (void*)object, object->What_Am_I(), (int)object->Owner(), width, height, age);
+				}
 
 				DrawSafePlayerPlaceholder(object, x, y, (int)flags, rotation, virtualscale);
 				return;
@@ -3827,29 +3834,28 @@ void CC_Draw_Shape(const ObjectClass *object, void const * shapefile, int shapen
 
 void CC_Draw_Shape(const ObjectClass *object, const char *shape_file_name, void const * shapefile, int shapenum, int x, int y, WindowNumberType window, ShapeFlags_Type flags, void const * fadingdata, void const * ghostdata, DirType rotation, long virtualscale, char override_owner)
 {
+	const bool aeloriaVerbose = g_AeloriaEnableVerboseDrawLogs; // E.2.20d: one read per draw
 	if (object) {
 		uintptr_t at_plus_8 = *(uintptr_t*)((const char*)object + 8);
-		bool logGot = Aeloria_ShouldLogVerbose(object) && Aeloria_ShouldLogOncePerObject(object, AEL_LOG_CC_DRAW_GOT_OBJECT);
-		// Phase 1 diagnostic (approved plan): relax suppression during -D so we see what the client
-		// is actually calling for the early creation objects. This is temporary for the proving run.
-		if (logGot && Is_Player_Exempt(object) && g_PlayerExemptionFrames > 0 && !g_AeloriaEnableVerboseDrawLogs) {
-			logGot = false;
+		// E.2.20d: skip ShouldLog* lookups on every draw when verbose is off
+		bool logGot = false;
+		if (aeloriaVerbose) {
+			logGot = Aeloria_ShouldLogVerbose(object) && Aeloria_ShouldLogOncePerObject(object, AEL_LOG_CC_DRAW_GOT_OBJECT);
 		}
-		// Phase C: central stability check in ShouldLogOncePerObject further reduces chatter for graduated objects.
 		if (logGot) {
 			Aeloria_Debug_Log("CC_Draw_Shape got Object this=%p RTTI=%d at+8=0x%08lx (name overload)",
 			                  (void*)object, object->What_Am_I(), (unsigned long)at_plus_8);
 		}
 
-		// E.2.13f: human building ghost/preview — placeholder even when +8 is briefly plausible.
-		if (Aeloria_HumanBuildingNeedsPlaceholderDraw(object)) {
+		// E.2.13f/E.2.47: human + preview skirmish buildings with bad +8 — safe placeholder.
+		if (Aeloria_BuildingNeedsPlaceholderDraw(object)) {
 			DrawSafePlayerPlaceholder(object, x, y, (int)flags, rotation, virtualscale, shape_file_name, override_owner);
 			return;
 		}
 
 		// === PHASE 1 PROVING LOG (approved plan) ===
-		// Same loud diagnostic for the name overload (used by Techno_Draw_Object_Virtual etc.).
-		if (object && Is_Player_Exempt(object) && g_PlayerExemptionFrames > 0 && g_AeloriaEnableVerboseDrawLogs) {
+		// E.2.20d: Same loud diagnostic for the name overload (used by Techno_Draw_Object_Virtual etc.).
+		if (aeloriaVerbose && object && Is_Player_Exempt(object) && g_PlayerExemptionFrames > 0) {
 			uintptr_t key = reinterpret_cast<uintptr_t>(object);
 			bool hasCreation = g_AeloriaObjectCreationFrame.find(key) != g_AeloriaObjectCreationFrame.end();
 			int stabLevel = 0;
@@ -3865,7 +3871,8 @@ void CC_Draw_Shape(const ObjectClass *object, const char *shape_file_name, void 
 		**	Owner/House now included for always-approve diagnostics.
 		**	Throttled after 5-minute stability to prevent 650k-line log floods.
 		*/
-		if (g_EarlyLoadGraceActive) {
+		// E.2.20d: grace-frame draw diagnostics gated off hot path
+		if (aeloriaVerbose && g_EarlyLoadGraceActive) {
 			bool logThis = Aeloria_ShouldLogVerbose(object);
 			if (!Is_Player_Exempt(object) && !ShouldLogHeavyNonPlayerDiagnostics()) {
 				logThis = false;
@@ -3890,17 +3897,20 @@ void CC_Draw_Shape(const ObjectClass *object, const char *shape_file_name, void 
 		if (g_EarlyLoadGraceActive) {
 			HousesType owner = object ? object->Owner() : HOUSE_NONE;
 			if (shapefile == nullptr && !Is_Player_Exempt(object)) {
-				bool logThis = Aeloria_ShouldLogVerbose(object);
-				if (!Is_Player_Exempt(object) && !ShouldLogHeavyNonPlayerDiagnostics()) {
-					logThis = false;
-				}
-				if (logThis) {
-					Aeloria_Debug_Log("GRACE FRAME SKIP BAD SHAPE (name): this=%p RTTI=%d owner=%d shape=%p num=%d -- suppressing draw",
-					                  (void*)object, object->What_Am_I(), (int)owner, shapefile, shapenum);
+				// E.2.20d: only log when verbose
+				if (aeloriaVerbose) {
+					bool logThis = Aeloria_ShouldLogVerbose(object);
+					if (!Is_Player_Exempt(object) && !ShouldLogHeavyNonPlayerDiagnostics()) {
+						logThis = false;
+					}
+					if (logThis) {
+						Aeloria_Debug_Log("GRACE FRAME SKIP BAD SHAPE (name): this=%p RTTI=%d owner=%d shape=%p num=%d -- suppressing draw",
+						                  (void*)object, object->What_Am_I(), (int)owner, shapefile, shapenum);
+					}
 				}
 				return;
 			}
-			if (g_AeloriaEnableVerboseDrawLogs && Is_Player_Exempt(object) && Aeloria_ShouldLogOncePerObject(object, AEL_LOG_PLAYER_EXEMPT_BYPASS)) {
+			if (aeloriaVerbose && Is_Player_Exempt(object) && Aeloria_ShouldLogOncePerObject(object, AEL_LOG_PLAYER_EXEMPT_BYPASS)) {
 				Aeloria_Debug_Log("PLAYER EXEMPTION (name): bypassing bad shape for human House object this=%p RTTI=%d owner=%d",
 				                  (void*)object, object->What_Am_I(), (int)owner);
 			}
@@ -3955,7 +3965,8 @@ void CC_Draw_Shape(const ObjectClass *object, const char *shape_file_name, void 
 			auto createIt = g_AeloriaObjectCreationFrame.find(key);
 			int age = (createIt != g_AeloriaObjectCreationFrame.end()) ? (int)(Frame - createIt->second) : -1;
 			int fb = (stabIt != g_AeloriaObjectStability.end()) ? stabIt->second.fallbackUses : -1;
-			if (Aeloria_ShouldLogOncePerObject(object, AEL_LOG_GRACE_SKIP)) {
+			// E.2.20d: HARD_REJECT safety path unchanged; log only when verbose
+			if (aeloriaVerbose && Aeloria_ShouldLogOncePerObject(object, AEL_LOG_GRACE_SKIP)) {
 				Aeloria_Debug_Log("HARD_REJECT this=%p RTTI=%d at8=0x%08lx reason=plausible_ptr age=%d fallbacks=%d",
 				                  (void*)object, object->What_Am_I(), (unsigned long)at_plus_8, age, fb);
 			}
@@ -3976,7 +3987,8 @@ void CC_Draw_Shape(const ObjectClass *object, const char *shape_file_name, void 
 		if (Is_Player_Exempt(object) && g_PlayerExemptionFrames > 0 && (width <= 0 || height <= 0)) {
 			uintptr_t key = reinterpret_cast<uintptr_t>(object);
 			bool hasCreation = g_AeloriaObjectCreationFrame.find(key) != g_AeloriaObjectCreationFrame.end();
-			if (g_AeloriaEnableVerboseDrawLogs) {
+			// E.2.20d: virtual-window diagnostics gated
+			if (aeloriaVerbose) {
 				Aeloria_Debug_Log("VIRTUAL_FORCE_TAKEN this=%p RTTI=%d has_creation=%d (reason: bad virtual w/h, name) frame=%u",
 				                  (void*)object, object ? object->What_Am_I() : -1, hasCreation ? 1 : 0, Frame);
 			}
@@ -3990,12 +4002,12 @@ void CC_Draw_Shape(const ObjectClass *object, const char *shape_file_name, void 
 					stabIt->second.fallbackUses++;
 				}
 			}
-			if (Aeloria_ShouldLogOncePerObject(object, AEL_LOG_PLAYER_PHASE_B_SEVERE)) {
+			if (aeloriaVerbose && Aeloria_ShouldLogOncePerObject(object, AEL_LOG_PLAYER_PHASE_B_SEVERE)) {
 				Aeloria_Debug_Log("PLAYER EXEMPTION (Phase C, virtual name): using safe placeholder via helper for human house %d (was w=%d h=%d)",
 				                  (int)owner, width, height);
 			}
 
-			if (g_AeloriaEnableVerboseDrawLogs) {
+			if (aeloriaVerbose) {
 				auto cIt = g_AeloriaObjectCreationFrame.find(reinterpret_cast<uintptr_t>(object));
 				int age = (cIt != g_AeloriaObjectCreationFrame.end()) ? (int)(Frame - cIt->second) : -1;
 				Aeloria_Debug_Log("PRE_PLACEHOLDER (virtual name) this=%p RTTI=%d owner=%d w=%d h=%d age=%d",
@@ -4044,7 +4056,8 @@ void CC_Draw_Shape(const ObjectClass *object, const char *shape_file_name, void 
 			auto cIt = g_AeloriaObjectCreationFrame.find(reinterpret_cast<uintptr_t>(object));
 			if (stab.successfulRealDraws == 1 && cIt != g_AeloriaObjectCreationFrame.end()) {
 				int age = Frame - cIt->second;
-				if (g_AeloriaEnableVerboseDrawLogs && Aeloria_ShouldLogOncePerObject(object, AEL_LOG_FIRST_REAL_DRAW)) {
+				// E.2.20d
+				if (aeloriaVerbose && Aeloria_ShouldLogOncePerObject(object, AEL_LOG_FIRST_REAL_DRAW)) {
 					Aeloria_Debug_Log("FIRST_REAL_DRAW (name) this=%p RTTI=%d owner=%d age=%d",
 					                  (void*)object, object->What_Am_I(), (int)object->Owner(), age);
 				}
@@ -4055,7 +4068,7 @@ void CC_Draw_Shape(const ObjectClass *object, const char *shape_file_name, void 
 				// Phase C spam reduction: drop this object from the once-per log mask now that
 				// it has graduated. Future draw diagnostics for it will use the lighter gate.
 				g_AeloriaObjectLogMask.erase(reinterpret_cast<uintptr_t>(object));
-				if (g_AeloriaEnableVerboseDrawLogs) {
+				if (aeloriaVerbose) {
 					auto cIt = g_AeloriaObjectCreationFrame.find(reinterpret_cast<uintptr_t>(object));
 					int age = (cIt != g_AeloriaObjectCreationFrame.end()) ? (int)(Frame - cIt->second) : -1;
 					Aeloria_Debug_Log("OBJECT STABILIZED (name) this=%p RTTI=%d owner=%d draws=%u age=%d level=2",
@@ -4074,7 +4087,8 @@ void CC_Draw_Shape(const ObjectClass *object, const char *shape_file_name, void 
 			auto cIt = g_AeloriaObjectCreationFrame.find(reinterpret_cast<uintptr_t>(object));
 			if (stab.fallbackUses == 1 && cIt != g_AeloriaObjectCreationFrame.end()) {
 				int age = Frame - cIt->second;
-				if (g_AeloriaEnableVerboseDrawLogs && Aeloria_ShouldLogOncePerObject(object, AEL_LOG_FIRST_FALLBACK)) {
+				// E.2.20d
+				if (aeloriaVerbose && Aeloria_ShouldLogOncePerObject(object, AEL_LOG_FIRST_FALLBACK)) {
 					Aeloria_Debug_Log("FIRST_FALLBACK (name) this=%p RTTI=%d owner=%d age=%d born_bad_or_became_bad=1",
 					                  (void*)object, object->What_Am_I(), (int)object->Owner(), age);
 				}
@@ -4082,16 +4096,20 @@ void CC_Draw_Shape(const ObjectClass *object, const char *shape_file_name, void 
 
 			HousesType owner = object ? object->Owner() : HOUSE_NONE;
 
-			if (Aeloria_ShouldLogOncePerObject(object, AEL_LOG_PLAYER_PHASE_B_SEVERE)) {
+			// E.2.20d
+			if (aeloriaVerbose && Aeloria_ShouldLogOncePerObject(object, AEL_LOG_PLAYER_PHASE_B_SEVERE)) {
 				Aeloria_Debug_Log("PLAYER_EXEMPTION_SEVERE (name) house=%d w=%d h=%d action=placeholder this=%p RTTI=%d",
 				                  (int)owner, w, h, (void*)object, object->What_Am_I());
 			}
 
 			if (stab.stabilityLevel < 2 || Aeloria_IsHumanDeployedBuilding(object)) {
-				auto cIt = g_AeloriaObjectCreationFrame.find(reinterpret_cast<uintptr_t>(object));
-				int age = (cIt != g_AeloriaObjectCreationFrame.end()) ? (int)(Frame - cIt->second) : -1;
-				Aeloria_Debug_Log("PRE_PLACEHOLDER (name) this=%p RTTI=%d owner=%d w=%d h=%d age=%d",
-				                  (void*)object, object->What_Am_I(), (int)object->Owner(), w, h, age);
+				// E.2.20d: diagnostic breadcrumb only when verbose
+				if (aeloriaVerbose) {
+					auto cIt = g_AeloriaObjectCreationFrame.find(reinterpret_cast<uintptr_t>(object));
+					int age = (cIt != g_AeloriaObjectCreationFrame.end()) ? (int)(Frame - cIt->second) : -1;
+					Aeloria_Debug_Log("PRE_PLACEHOLDER (name) this=%p RTTI=%d owner=%d w=%d h=%d age=%d",
+					                  (void*)object, object->What_Am_I(), (int)object->Owner(), w, h, age);
+				}
 
 				DrawSafePlayerPlaceholder(object, x, y, (int)flags, rotation, virtualscale, shape_file_name, override_owner);
 				return;
