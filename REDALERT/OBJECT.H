@@ -391,6 +391,8 @@ extern std::map<uintptr_t, uint32_t> g_AeloriaObjectCreationFrame;
 // stats line fully intact.
 // Default true so diagnosis builds stay chatty; set to false for clean play.
 extern bool g_AeloriaEnableVerboseDrawLogs;
+// E.2.50: non-debug quiet mode — rate-limit high-volume critical prefixes (launcher sets AELORIA_QUIET=1).
+extern bool g_AeloriaQuietMode;
 // E.2.20a: optional verbose draw log frame sampling (default 1 = every frame). Set via AELORIA_VERBOSE_DRAW_SAMPLE_DENOM in CNC_Init.
 extern int g_AeloriaVerboseDrawSampleDenom;
 // infantry-scale Phase 2: skip stability/creation maps for healthy barracks-produced infantry.
@@ -409,6 +411,9 @@ void Aeloria_OnMainMenuPhase(void);
 bool Aeloria_IsLiveSkirmishMapLoaded(void);
 // E.2.43: true only after mission timer / explicit live skirmish arm (bulk + legacy MAIN graduation).
 bool Aeloria_IsExplicitLiveSkirmishMatch(void);
+// E.2.50: throttle preview-only prune/ensure on loaded map before explicit live match.
+const int AELORIA_PREVIEW_LAYER_MAINTAIN_INTERVAL = 4;
+bool Aeloria_ShouldRunPreviewLayerMaintain(void);
 
 // Distinct message tags for the once-per-object suppression (bit positions).
 // Only the high-volume per-frame draw diagnostics get unique tags here.
@@ -436,6 +441,7 @@ enum AeloriaLogTag {
 	AEL_LOG_PLACEHOLDER_MARKER = 20,  // Phase 5z-n9 PR4: once per yellow visibility marker log
 	AEL_LOG_BUILDING_STAB_REFRESH = 21, // E.2.11: once per building stab refresh (was 2k+ critical writes)
 	AEL_LOG_PRODUCED_UNIT_GRADUATED = 22, // E.2.11: once per produced unit legacy draw graduation
+	AEL_LOG_QUIET_HARVESTER = 23,       // E.2.50: once per harvester object for HARVESTER_* critical logs in quiet mode
 	// Room for more
 	AEL_LOG_MAX = 31
 };

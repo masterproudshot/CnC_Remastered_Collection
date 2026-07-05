@@ -644,6 +644,7 @@ std::map<uintptr_t, uint32_t> g_AeloriaObjectCreationFrame;
 // AELORIA_ENABLE_VERBOSE_DRAW_LOGS=1 environment variable to force this to true at runtime
 // (via the read in CNC_Init below). This is what makes "the debugmode flag flips the loggins switch on".
 bool g_AeloriaEnableVerboseDrawLogs = false;
+bool g_AeloriaQuietMode = false;
 int g_AeloriaVerboseDrawSampleDenom = 1;
 
 // infantry-scale Phase 2: healthy barracks infantry skip per-object tracking maps.
@@ -784,6 +785,75 @@ static bool Aeloria_IsCriticalLogMessage(const char *fmt)
 	return false;
 }
 
+// E.2.50: milestone critical prefixes that must never be quiet-throttled.
+static bool Aeloria_IsNeverQuietLimitedCritical(const char *fmt)
+{
+	if (!fmt || !fmt[0]) return false;
+
+	static const char *never[] = {
+		"SEVERE",
+		"LIVE_SKIRMISH",
+		"PREVIEW_PRUNE",
+		"DEAD_TRACKING",
+		"AELORIA_SESSION",
+		"CNC_INIT",
+		nullptr
+	};
+
+	for (int i = 0; never[i] != nullptr; ++i) {
+		if (strncmp(fmt, never[i], strlen(never[i])) == 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// E.2.50: when verbose is off and quiet mode is on, rate-limit noisy critical families.
+// Uses per-object dedup for HARVESTER_* (no call-site guard) plus an 8-frame bucket per family.
+static bool Aeloria_ShouldEmitQuietCriticalLog(const char *fmt, va_list args)
+{
+	if (g_AeloriaEnableVerboseDrawLogs || !g_AeloriaQuietMode) {
+		return true;
+	}
+	if (Aeloria_IsNeverQuietLimitedCritical(fmt)) {
+		return true;
+	}
+
+	int bucket = -1;
+	int harvesterObjectTag = -1;
+	if (strncmp(fmt, "CONSTRUCTION_SEED", 17) == 0) {
+		bucket = 0;
+	} else if (strncmp(fmt, "PRODUCED_UNIT_FIRST_DRAW", 24) == 0) {
+		bucket = 1;
+	} else if (strncmp(fmt, "BUILDING_STAB_REFRESH", 21) == 0) {
+		bucket = 2;
+	} else if (strncmp(fmt, "HARVESTER_", 10) == 0) {
+		bucket = 3;
+		harvesterObjectTag = AEL_LOG_QUIET_HARVESTER;
+	} else {
+		return true;
+	}
+
+	if (harvesterObjectTag >= 0 && strstr(fmt, "this=%p") != nullptr) {
+		va_list copy;
+		va_copy(copy, args);
+		const void *obj = va_arg(copy, const void *);
+		va_end(copy);
+		if (!Aeloria_ShouldLogOncePerObject(obj, harvesterObjectTag)) {
+			return false;
+		}
+	}
+
+	static unsigned s_lastQuietCriticalFrame[4] = {0};
+	const unsigned interval = 8;
+	if (s_lastQuietCriticalFrame[bucket] != 0
+	    && Frame - s_lastQuietCriticalFrame[bucket] < interval) {
+		return false;
+	}
+	s_lastQuietCriticalFrame[bucket] = Frame;
+	return true;
+}
+
 // E.2.20a: when verbose sampling is enabled (denom>1), emit non-critical verbose logs only every Nth frame.
 static bool Aeloria_ShouldEmitVerboseDrawLog(const char *fmt)
 {
@@ -800,14 +870,28 @@ void Aeloria_Debug_Log(const char *fmt, ...)
 {
 	if (!fmt) return;
 
+	va_list args;
+	va_start(args, fmt);
+
 	// When verbose is off, drop the per-frame hot-path spam before touching the log file.
 	if (!Aeloria_IsCriticalLogMessage(fmt)) {
 		if (!g_AeloriaEnableVerboseDrawLogs) {
+			va_end(args);
 			return;
 		}
 		if (!Aeloria_ShouldEmitVerboseDrawLog(fmt)) {
+			va_end(args);
 			return;
 		}
+	} else {
+		va_list quietArgs;
+		va_copy(quietArgs, args);
+		if (!Aeloria_ShouldEmitQuietCriticalLog(fmt, quietArgs)) {
+			va_end(quietArgs);
+			va_end(args);
+			return;
+		}
+		va_end(quietArgs);
 	}
 
 	// Lazy open on first use — now with unique per-run filename (timestamp + short nanoid)
@@ -864,11 +948,12 @@ void Aeloria_Debug_Log(const char *fmt, ...)
 		}
 	}
 
-	if (!s_aeloria_log) return;
+	if (!s_aeloria_log) {
+		va_end(args);
+		return;
+	}
 
 	char buffer[512];
-	va_list args;
-	va_start(args, fmt);
 	vsnprintf(buffer, sizeof(buffer) - 1, fmt, args);
 	va_end(args);
 	buffer[sizeof(buffer) - 1] = '\0';
@@ -2297,6 +2382,21 @@ bool Aeloria_IsExplicitLiveSkirmishMatch(void)
 	return g_AeloriaSkirmishMatchActive && g_AeloriaExplicitLiveMatch && !ProgEndCalled;
 }
 
+bool Aeloria_ShouldRunPreviewLayerMaintain(void)
+{
+	if (!Aeloria_IsLiveSkirmishMapLoaded() || Aeloria_IsExplicitLiveSkirmishMatch()) {
+		return true;
+	}
+
+	static unsigned s_lastPreviewMaintainFrame = 0;
+	if (s_lastPreviewMaintainFrame != 0
+	    && Frame - s_lastPreviewMaintainFrame < (unsigned)AELORIA_PREVIEW_LAYER_MAINTAIN_INTERVAL) {
+		return false;
+	}
+	s_lastPreviewMaintainFrame = Frame;
+	return true;
+}
+
 // E.2.45/46: loaded skirmish PREVIEW — keep creation/stab for live starting units.
 // E.2.46: do not require Is_Plausible_Class_Pointer(this) for creation retain — pool slots are
 // often 4-byte misaligned (885446a6 plausible=0 active=1) yet still live @ frame 0.
@@ -2766,6 +2866,22 @@ extern "C" __declspec(dllexport) void __cdecl CNC_Init(const char *command_line,
 		}
 	}
 
+	// E.2.50: AELORIA_QUIET=1 — rate-limit high-volume critical prefixes when verbose draw is off.
+	{
+		char val[16] = {0};
+		if (GetEnvironmentVariableA("AELORIA_QUIET", val, sizeof(val)) > 0) {
+			if (val[0] == '1' || _stricmp(val, "true") == 0 || _stricmp(val, "yes") == 0 || _stricmp(val, "on") == 0) {
+				g_AeloriaQuietMode = true;
+			} else if (val[0] == '0' || _stricmp(val, "false") == 0 || _stricmp(val, "no") == 0 || _stricmp(val, "off") == 0) {
+				g_AeloriaQuietMode = false;
+			}
+		}
+		char quietMsg[96];
+		_snprintf(quietMsg, sizeof(quietMsg), "AELORIA: g_AeloriaQuietMode = %s\n",
+		          g_AeloriaQuietMode ? "TRUE" : "FALSE");
+		OutputDebugStringA(quietMsg);
+	}
+
 	{
 		char val[16] = {0};
 		if (GetEnvironmentVariableA("AELORIA_ZERO_MAP_PRODUCED_INFANTRY", val, sizeof(val)) > 0) {
@@ -2822,9 +2938,10 @@ extern "C" __declspec(dllexport) void __cdecl CNC_Init(const char *command_line,
 	DLLExportClass::Init();
 
 	// Eager file log so menu-phase / pre-skirmish exits still leave a correlation artifact.
-	Aeloria_Debug_Log("CNC_INIT command_line=%s verbose_draw=%d zero_map_inf=%d zero_map_veh=%d frame=%u",
+	Aeloria_Debug_Log("CNC_INIT command_line=%s verbose_draw=%d quiet=%d zero_map_inf=%d zero_map_veh=%d frame=%u",
 	                  command_line ? command_line : "(null)",
 	                  g_AeloriaEnableVerboseDrawLogs ? 1 : 0,
+	                  g_AeloriaQuietMode ? 1 : 0,
 	                  g_AeloriaZeroMapProducedInfantry ? 1 : 0,
 	                  g_AeloriaZeroMapProducedVehicles ? 1 : 0,
 	                  Frame);
@@ -7453,8 +7570,11 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 		if (g_AeloriaSkirmishMatchActive) {
 			Aeloria_SetSkirmishMatchActive(false, "Get_Layer_State_preview_scope");
 		}
-		Aeloria_PruneDeadTrackingKeys("Get_Layer_State_preview");
-		Aeloria_EnsureStabilityForTrackedCreations("Get_Layer_State_preview");
+		// E.2.50: preview prune/ensure at most every N frames on loaded map before live match.
+		if (Aeloria_ShouldRunPreviewLayerMaintain()) {
+			Aeloria_PruneDeadTrackingKeys("Get_Layer_State_preview");
+			Aeloria_EnsureStabilityForTrackedCreations("Get_Layer_State_preview");
+		}
 		if (!g_AeloriaCncStartCompleted) {
 			Aeloria_ClearScenarioTracking("Get_Layer_State_main_menu");
 		}
