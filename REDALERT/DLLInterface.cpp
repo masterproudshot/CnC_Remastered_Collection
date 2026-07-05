@@ -6182,6 +6182,8 @@ static const int AELORIA_LAYERS_CLIENT_CAP = 512;
 static const int AELORIA_LAYERS_NEAR_CAP_THRESHOLD = 480;
 
 static void Aeloria_LogLayersCapDrop(const char* site, int total, int draw, int dropped, const void* obj = nullptr);
+static void Aeloria_OnLayersSlotReplaced(const ObjectClass* obj, int slotIdx);
+static void Aeloria_TrimDrawCountPreferRetain(CNCObjectListStruct* list, int totalBase, int& drawCount);
 
 static bool Aeloria_LayersSlotRetainPriority(const ObjectClass* obj)
 {
@@ -6460,10 +6462,63 @@ static bool Aeloria_TryReplaceLayersSlotAtCap(CNCObjectListStruct* list, int cou
 		memset(&list->Objects[evictIdx], 0, sizeof(CNCObjectStruct));
 		return false;
 	}
+	Aeloria_OnLayersSlotReplaced(incoming, evictIdx);
 	static unsigned s_lastReplaceLogFrame = 0;
 	if (s_lastReplaceLogFrame != Frame) {
 		s_lastReplaceLogFrame = Frame;
 		Aeloria_Debug_Log("LAYERS_SLOT_REPLACE y_third_in=%d y_third_out=%d idx=%d frame=%u",
+		                  inThird, outThird, evictIdx, Frame);
+	}
+	return true;
+}
+
+static void Aeloria_OnLayersSlotReplaced(const ObjectClass* obj, int slotIdx)
+{
+	if (!obj || slotIdx < 0) {
+		return;
+	}
+	uintptr_t key = reinterpret_cast<uintptr_t>(obj);
+	auto it = g_AeloriaObjectStability.find(key);
+	if (it != g_AeloriaObjectStability.end()) {
+		it->second.clientListInserted = true;
+		if (it->second.stabilityLevel < 1) {
+			it->second.stabilityLevel = 1;
+		}
+	}
+	(void)slotIdx;
+}
+
+// E.2.59b: at cap, run Draw_It into evicted slot (full intercept) instead of bulk-only populate.
+static bool Aeloria_LayersReplaceDrawIntoSlotAtCap(CNCObjectListStruct* list, int& totalCount, int& currentDrawCount,
+                                                   ObjectClass* object, int x, int y, bool previewLayerWalk, int& outDrawBase)
+{
+	outDrawBase = -1;
+	if (!Aeloria_LayersSlotReplaceEnabled() || totalCount < AELORIA_LAYERS_CLIENT_CAP
+	    || !list || !object) {
+		return false;
+	}
+	if (!Aeloria_GuardLayerPopulateObjectPtr(object, "LayersReplaceDrawIntoSlotAtCap", "replace_draw")) {
+		return false;
+	}
+	const int inThird = Aeloria_LayersObjectYThirdFromObject(object);
+	const int evictIdx = Aeloria_FindEvictableSlotIndex(list, totalCount, inThird);
+	if (evictIdx < 0) {
+		return false;
+	}
+	const ObjectClass* evicted = static_cast<const ObjectClass*>(list->Objects[evictIdx].CNCInternalObjectPointer);
+	const int outThird = Aeloria_LayersObjectYThirdFromSlot(list->Objects[evictIdx], evicted);
+	const int savedTotal = totalCount;
+	currentDrawCount = 0;
+	totalCount = evictIdx;
+	object->Draw_It(x, y, WINDOW_VIRTUAL);
+	Aeloria_TrimDrawCountPreferRetain(list, evictIdx, currentDrawCount);
+	totalCount = savedTotal;
+	outDrawBase = evictIdx;
+	Aeloria_OnLayersSlotReplaced(object, evictIdx);
+	static unsigned s_lastReplaceDrawLogFrame = 0;
+	if (s_lastReplaceDrawLogFrame != Frame) {
+		s_lastReplaceDrawLogFrame = Frame;
+		Aeloria_Debug_Log("LAYERS_SLOT_REPLACE y_third_in=%d y_third_out=%d idx=%d mode=draw_it frame=%u",
 		                  inThird, outThird, evictIdx, Frame);
 	}
 	return true;
@@ -6533,16 +6588,24 @@ static void Aeloria_ReshuffleLayersListAtCap(CNCObjectListStruct* list, int coun
 	Aeloria_MaybeLogLayersTrimBand(keptByThird, droppedByThird);
 }
 
-static void Aeloria_StripUnsafeDrawSlots(CNCObjectListStruct* list, int totalBase, int& drawCount)
+static void Aeloria_StripUnsafeDrawSlots(CNCObjectListStruct* list, int totalBase, int& drawCount, bool previewLayerWalk)
 {
 	if (!Aeloria_LayersFailClosedEnabled() || !list || drawCount <= 0) {
+		return;
+	}
+	if (previewLayerWalk) {
 		return;
 	}
 	int writeIdx = 0;
 	for (int i = 0; i < drawCount; ++i) {
 		CNCObjectStruct& slot = list->Objects[totalBase + i];
 		const ObjectClass* obj = static_cast<const ObjectClass*>(slot.CNCInternalObjectPointer);
-		if (!obj || !Aeloria_IsExportSafeObjectPtr(obj)) {
+		if (!obj) {
+			continue;
+		}
+		if (!Aeloria_IsExportSafeObjectPtr(obj)
+		    && !Aeloria_IsLayerPopulateObjectPtr(obj)
+		    && !Aeloria_LayersSlotRetainPriorityV2(obj)) {
 			continue;
 		}
 		if (writeIdx != i) {
@@ -8678,11 +8741,16 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 					/*
 					** Call to Draw_It can result in multiple callbacks to the draw intercept.
 					*/
-					if (TotalObjectCount >= AELORIA_LAYERS_CLIENT_CAP
-					    && Aeloria_TryReplaceLayersSlotAtCap(ObjectList, TotalObjectCount, object, ExportLayer)) {
-						continue;
+					int drawSlotBase = TotalObjectCount;
+					bool replacedInPlaceAtCap = false;
+					if (TotalObjectCount >= AELORIA_LAYERS_CLIENT_CAP) {
+						if (Aeloria_LayersReplaceDrawIntoSlotAtCap(ObjectList, TotalObjectCount, CurrentDrawCount, object, x, y, previewLayerWalk, drawSlotBase)) {
+							replacedInPlaceAtCap = true;
+						} else if (Aeloria_TryReplaceLayersSlotAtCap(ObjectList, TotalObjectCount, object, ExportLayer)) {
+							continue;
+						}
 					}
-					if (Aeloria_LayersWalkShouldSkipAtCap(ObjectList, TotalObjectCount, object)) {
+					if (!replacedInPlaceAtCap && Aeloria_LayersWalkShouldSkipAtCap(ObjectList, TotalObjectCount, object)) {
 						Aeloria_LogLayersCapDrop("layer_walk_skip", TotalObjectCount, 0, 1, object);
 						Aeloria_LogLayerExportSkip("Get_Layer_State_walk", "layers_cap_pre_draw", TotalObjectCount);
 						continue;
@@ -8707,9 +8775,12 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 							continue;
 						}
 					}
-					CurrentDrawCount = 0;
-					object->Draw_It(x, y, WINDOW_VIRTUAL);
-					Aeloria_TrimDrawCountPreferRetain(ObjectList, TotalObjectCount, CurrentDrawCount);
+					if (!replacedInPlaceAtCap) {
+						CurrentDrawCount = 0;
+						object->Draw_It(x, y, WINDOW_VIRTUAL);
+						Aeloria_TrimDrawCountPreferRetain(ObjectList, TotalObjectCount, CurrentDrawCount);
+						drawSlotBase = TotalObjectCount;
+					}
 
 					/*
 					** If the root object is a factory, then the last base object is the object in production (rendered after infiltrated buildings when selected).
@@ -8717,11 +8788,11 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 					** This only occurs in skirmish and multiplayer.
 					*/
 					if ((GAME_TO_PLAY != GAME_NORMAL) && (CurrentDrawCount > 0)) {
-						if (TotalObjectCount >= 512) {
-							Aeloria_LogLateGameAvGuard("Get_Layer_State_factory", "root_slot_bounds", TotalObjectCount);
+						if (drawSlotBase < 0 || drawSlotBase >= 512) {
+							Aeloria_LogLateGameAvGuard("Get_Layer_State_factory", "root_slot_bounds", drawSlotBase);
 							continue;
 						}
-						CNCObjectStruct& root_object = ObjectList->Objects[TotalObjectCount];
+						CNCObjectStruct& root_object = ObjectList->Objects[drawSlotBase];
 						if (root_object.IsFactory) {
 							BuildingClass* building = (BuildingClass*)root_object.CNCInternalObjectPointer;
 							if (!Aeloria_GuardLayerPopulateObjectPtr(building, "Get_Layer_State_factory", "factory_root")) {
@@ -8735,12 +8806,12 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 							FactoryClass* factory = building->House->IsHuman ? building->House->Fetch_Factory(building->Class->ToBuild) : building->Factory;
 							if (factory != nullptr) {
 								for (int i = CurrentDrawCount - 1; i > 0; --i) {
-									if (TotalObjectCount + i >= 512) {
+									if (drawSlotBase + i >= 512) {
 										Aeloria_LogLateGameAvGuard("Get_Layer_State_factory", "prod_slot_bounds",
-										                           TotalObjectCount + i);
+										                           drawSlotBase + i);
 										break;
 									}
-									CNCObjectStruct& base_object = ObjectList->Objects[TotalObjectCount + i];
+									CNCObjectStruct& base_object = ObjectList->Objects[drawSlotBase + i];
 									if (base_object.SubObject) {
 										continue;
 									}
@@ -8755,13 +8826,13 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 									void* production_object = base_object.CNCInternalObjectPointer;
 									int new_draw_count = i;
 									for (int j = i + 1; j < CurrentDrawCount; ++j) {
-										CNCObjectStruct& cnc_object = ObjectList->Objects[TotalObjectCount + j];
+										CNCObjectStruct& cnc_object = ObjectList->Objects[drawSlotBase + j];
 										if (cnc_object.CNCInternalObjectPointer != production_object) {
-											memcpy(ObjectList->Objects + TotalObjectCount + new_draw_count, &cnc_object, sizeof(CNCObjectStruct));
+											memcpy(ObjectList->Objects + drawSlotBase + new_draw_count, &cnc_object, sizeof(CNCObjectStruct));
 											new_draw_count++;
 										}
 									}
-									memset(ObjectList->Objects + TotalObjectCount + new_draw_count, 0, (CurrentDrawCount - new_draw_count) * sizeof(CNCObjectStruct));
+									memset(ObjectList->Objects + drawSlotBase + new_draw_count, 0, (CurrentDrawCount - new_draw_count) * sizeof(CNCObjectStruct));
 									CurrentDrawCount = new_draw_count;
 									break;
 								}
@@ -8775,12 +8846,12 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 					** even though they get drawn as sub-objects (after the base object)
 					*/
 					for (int i = 1; i < CurrentDrawCount; ++i) {
-						if (TotalObjectCount + i >= 512) {
+						if (drawSlotBase + i >= 512) {
 							Aeloria_LogLateGameAvGuard("Get_Layer_State_shadow", "shadow_slot_bounds",
-							                           TotalObjectCount + i);
+							                           drawSlotBase + i);
 							break;
 						}
-						CNCObjectStruct& sub_object = ObjectList->Objects[TotalObjectCount + i];
+						CNCObjectStruct& sub_object = ObjectList->Objects[drawSlotBase + i];
 						if (!sub_object.SubObject) {
 							continue;
 						}
@@ -8796,7 +8867,7 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 							if ((strncmp(sub_object.AssetName, "RROTOR", CNC_OBJECT_ASSET_NAME_LENGTH) != 0) &&
 								(strncmp(sub_object.AssetName, "LROTOR", CNC_OBJECT_ASSET_NAME_LENGTH) != 0)) {
 								for (int j = i - 1; j >= 0; --j) {
-									CNCObjectStruct& base_object = ObjectList->Objects[TotalObjectCount + j];
+									CNCObjectStruct& base_object = ObjectList->Objects[drawSlotBase + j];
 									if (!base_object.SubObject && (base_object.CNCInternalObjectPointer == sub_object.CNCInternalObjectPointer)) {
 										int sort_order = base_object.SortOrder;
 										base_object.SortOrder = sub_object.SortOrder;
@@ -8808,8 +8879,10 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 						}
 					}
 
-					Aeloria_StripUnsafeDrawSlots(ObjectList, TotalObjectCount, CurrentDrawCount);
-					TotalObjectCount += CurrentDrawCount;
+					Aeloria_StripUnsafeDrawSlots(ObjectList, drawSlotBase, CurrentDrawCount, previewLayerWalk);
+					if (!replacedInPlaceAtCap) {
+						TotalObjectCount += CurrentDrawCount;
+					}
 				}
 			}
 		}
