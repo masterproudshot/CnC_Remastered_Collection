@@ -114,6 +114,11 @@ namespace MobiusEditor.Model
 
         public void Init(GameType gameType, TheaterType theater, HouseType house, DirectionType direction)
         {
+            if (Globals.SkipTypeThumbnailInit)
+            {
+                return;
+            }
+
             if (Globals.TheTilesetManager.GetTileData(theater.Tilesets, Name, 0, out Tile tile))
             {
                 RenderSize = new Size(tile.Image.Width / Globals.TileScale, tile.Image.Height / Globals.TileScale);

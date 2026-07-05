@@ -143,6 +143,11 @@ namespace MobiusEditor.Model
 
         public void Init(GameType gameType, TheaterType theater, HouseType house, DirectionType direction)
         {
+            if (Globals.SkipTypeThumbnailInit)
+            {
+                return;
+            }
+
             var mockBuilding = new Building()
             {
                 Type = this,

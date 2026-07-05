@@ -60,6 +60,9 @@ namespace MobiusEditor
         public static TeamColorManager TheTeamColorManager;
         public static GameTextManager TheGameTextManager;
 
+        /// <summary>Skip expensive per-type thumbnail rendering during headless MapGen CLI runs.</summary>
+        public static bool SkipTypeThumbnailInit;
+
         public static readonly string RootSaveDirectory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Personal), @"CnCRemastered\Local_Custom_Maps");
 
 #if DEVELOPER
