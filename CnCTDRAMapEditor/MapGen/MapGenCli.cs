@@ -260,8 +260,9 @@ namespace MobiusEditor.MapGen
         {
             Console.WriteLine("Usage:");
             Console.WriteLine("  CnCTDRAMapEditorD.exe --mapgen generate --name MyMap --seed 42 --players 4 \\");
-            Console.WriteLine("    --size 64 --ore 0.58 --gems 0.045 --mines 14 [--terrain-profile flat] [--spawn-layout corners8] \\");
+            Console.WriteLine("    --size 64 --ore 0.58 --gems 0.045 --mines 14 [--terrain-profile flat|temperate-mixed] [--spawn-layout corners8] \\");
             Console.WriteLine("    [--ore-patches 14] [--data <CnCRemastered>] [--out <path.mpr>]");
+            Console.WriteLine("  Terrain profiles: flat (v1 clear) | temperate-mixed (v2 water/rock/cliff/trees).");
             Console.WriteLine("  Spawn layouts: corners8 | octagonOpen | middleRoad (octagonOpen/middleRoad require --size 126).");
             Console.WriteLine("  CnCTDRAMapEditorD.exe --mapgen repair-previews --dir <Red_Alert folder> [--data <CnCRemastered>]");
             Console.WriteLine("  CnCTDRAMapEditorD.exe --mapgen repair-previews --mpr <file.mpr> [--data <CnCRemastered>]");

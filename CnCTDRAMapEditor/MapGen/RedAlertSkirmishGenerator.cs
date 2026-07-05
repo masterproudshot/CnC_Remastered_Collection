@@ -1,5 +1,5 @@
 //
-// Procedural Red Alert skirmish maps (flat terrain v1 + clustered resources).
+// Procedural Red Alert skirmish maps (flat terrain v1 + temperate-mixed v2 + clustered resources).
 //
 using MobiusEditor.Interface;
 using MobiusEditor.Model;
@@ -16,7 +16,7 @@ namespace MobiusEditor.MapGen
     {
         public string Name { get; set; } = "AIGen_Map";
         public string Theater { get; set; } = "Temperate";
-        /// <summary>B1 terrain profile: flat (v1), temperate-mixed (schema; B2 implements).</summary>
+        /// <summary>B1 terrain profile: flat (v1), temperate-mixed (v2).</summary>
         public string TerrainProfile { get; set; } = MapGenTerrainProfiles.Flat;
         /// <summary>B1 spawn layout: corners8, octagonOpen, middleRoad.</summary>
         public string SpawnLayout { get; set; } = MapGenSpawnLayouts.Corners8;
@@ -55,7 +55,12 @@ namespace MobiusEditor.MapGen
                 plugin.Map.TopLeft = new Point(margin, margin);
                 plugin.Map.Size = new Size(recipe.MapSize, recipe.MapSize);
 
-                FillClearTerrain(plugin.Map);
+                var spawnTilesForTerrain = MapGenSpawnTiles.Resolve(plugin.Map, recipe.Players, layout);
+                TerrainPlacement.Apply(plugin.Map, random, spawnTilesForTerrain, new TerrainPlacement.Options
+                {
+                    TerrainProfile = recipe.TerrainProfile,
+                    SpawnPadRadius = 5
+                });
 
                 var spawnTiles = PlacePlayerWaypoints(plugin.Map, recipe.Players, layout);
                 ResourcePlacement.Apply(plugin.Map, random, spawnTiles, new ResourcePlacement.Options
@@ -125,20 +130,6 @@ namespace MobiusEditor.MapGen
             return errors;
         }
 
-        private static void FillClearTerrain(Map map)
-        {
-            var clearType = map.TemplateTypes.FirstOrDefault(t => t.Equals("clear1"));
-            if (clearType == null)
-            {
-                return;
-            }
-
-            foreach (var p in EnumerateRect(map.Bounds))
-            {
-                map.Templates[p] = new Template { Type = clearType, Icon = 0 };
-            }
-        }
-
         private static List<Point> PlacePlayerWaypoints(Map map, int players, SpawnLayoutResolution layout)
         {
             var spawns = new List<Point>();
@@ -205,17 +196,6 @@ namespace MobiusEditor.MapGen
                 }
                 wp.Cell = cell;
                 spawns.Add(tile);
-            }
-        }
-
-        private static IEnumerable<Point> EnumerateRect(Rectangle rect)
-        {
-            for (int y = rect.Top; y < rect.Bottom; y++)
-            {
-                for (int x = rect.Left; x < rect.Right; x++)
-                {
-                    yield return new Point(x, y);
-                }
             }
         }
     }

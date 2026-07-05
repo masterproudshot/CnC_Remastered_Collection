@@ -3,7 +3,9 @@
 //
 using System;
 using System.Collections.Generic;
+using System.Drawing;
 using System.Linq;
+using MobiusEditor.Model;
 
 namespace MobiusEditor.MapGen
 {
@@ -188,6 +190,74 @@ namespace MobiusEditor.MapGen
                         PlacementNote = "corners8: four corners + four edge midpoints on playable rect."
                     };
             }
+        }
+    }
+
+    public static class MapGenSpawnTiles
+    {
+        /// <summary>Resolve spawn tile locations without assigning waypoints (for terrain pad clearing).</summary>
+        public static List<Point> Resolve(Map map, int players, SpawnLayoutResolution layout)
+        {
+            if (layout == null)
+            {
+                return new List<Point>();
+            }
+
+            if (layout.UsesReferenceCells)
+            {
+                return ResolveReferenceTiles(map, players, layout.ReferenceCells);
+            }
+
+            return ResolveCorners8Tiles(map, players);
+        }
+
+        private static List<Point> ResolveCorners8Tiles(Map map, int players)
+        {
+            var bounds = map.Bounds;
+            int inset = 6;
+            var corners = new[]
+            {
+                new Point(bounds.Left + inset, bounds.Top + inset),
+                new Point(bounds.Right - inset - 1, bounds.Top + inset),
+                new Point(bounds.Left + inset, bounds.Bottom - inset - 1),
+                new Point(bounds.Right - inset - 1, bounds.Bottom - inset - 1),
+                new Point(bounds.Left + bounds.Width / 2, bounds.Top + inset),
+                new Point(bounds.Left + bounds.Width / 2, bounds.Bottom - inset - 1),
+                new Point(bounds.Left + inset, bounds.Top + bounds.Height / 2),
+                new Point(bounds.Right - inset - 1, bounds.Top + bounds.Height / 2),
+            };
+
+            return CollectValidTiles(map, players, corners);
+        }
+
+        private static List<Point> ResolveReferenceTiles(Map map, int players, IReadOnlyList<int> referenceCells)
+        {
+            const int globalWidth = 128;
+            int count = Math.Min(players, referenceCells.Count);
+            var tiles = new Point[count];
+            for (int i = 0; i < count; i++)
+            {
+                int globalCell = referenceCells[i];
+                tiles[i] = new Point(globalCell % globalWidth, globalCell / globalWidth);
+            }
+
+            return CollectValidTiles(map, players, tiles);
+        }
+
+        private static List<Point> CollectValidTiles(Map map, int players, IReadOnlyList<Point> tiles)
+        {
+            var spawns = new List<Point>();
+            for (int i = 0; i < players && i < tiles.Count; i++)
+            {
+                var tile = tiles[i];
+                if (!map.Metrics.GetCell(tile, out _))
+                {
+                    continue;
+                }
+                spawns.Add(tile);
+            }
+
+            return spawns;
         }
     }
 }
