@@ -805,6 +805,7 @@ static bool Aeloria_IsNeverQuietLimitedCritical(const char *fmt)
 		"DEAD_TRACKING",
 		"AELORIA_SESSION",
 		"CNC_INIT",
+		"BULK_POST_COUNT",
 		nullptr
 	};
 
@@ -2172,6 +2173,7 @@ static void Aeloria_ClearScenarioTracking(const char* reason)
 
 static void Aeloria_PruneDeadTrackingKeys(const char* reason);
 static bool Aeloria_PreviewSkirmishTrackingRetain(uintptr_t key);
+static bool Aeloria_IsPreviewMapBuildingLayerPtr(const ObjectClass* obj);
 
 // E.2.31: preview/disarm in Get_Layer_State must not wipe live creation rows (skirmish ~2min AV).
 static bool Aeloria_DisarmReasonUsesDeadPruneOnly(const char* reason)
@@ -2226,12 +2228,15 @@ static unsigned s_lateGameAvGuardLogBudget = 32;
 static unsigned s_layerExportSkipLogBudget = 48;
 // E.2.54: cap preview placeholder emits per Get_Layer_State (1a02369b frame-0 flood crash).
 static unsigned s_previewSafeEmitBudget = 64;
+// E.2.58: budgeted preview bulk for map-placed buildings (not in creation tracking).
+static unsigned s_previewMapBuildingBulkBudget = 48;
 
 static void Aeloria_ResetLayerExportDiagBudgets(void)
 {
 	s_lateGameAvGuardLogBudget = 32;
 	s_layerExportSkipLogBudget = 48;
 	s_previewSafeEmitBudget = 64;
+	s_previewMapBuildingBulkBudget = 48;
 }
 
 static void Aeloria_LogLayerExportSkip(const char* site, const char* reason, uintptr_t key = 0)
@@ -2276,6 +2281,51 @@ static bool Aeloria_GuardExportObjectPtr(const ObjectClass* obj, const char* sit
 	return false;
 }
 
+// E.2.56: client LAYERS populate — wider than export-safe (misaligned pool this + tracked creations).
+static bool Aeloria_IsLayerPopulateObjectPtr(const ObjectClass* obj)
+{
+	if (!obj || !obj->IsActive || obj->IsInLimbo) {
+		return false;
+	}
+	uintptr_t key = reinterpret_cast<uintptr_t>(obj);
+	if (key < 0x10000) {
+		return false;
+	}
+	if (Aeloria_IsExportSafeObjectPtr(obj)) {
+		return true;
+	}
+	if (g_AeloriaObjectCreationFrame.find(key) != g_AeloriaObjectCreationFrame.end()) {
+		return true;
+	}
+	if (Aeloria_PreviewSkirmishTrackingRetain(key)) {
+		return true;
+	}
+	if (Aeloria_IsPreviewMapBuildingLayerPtr(obj)) {
+		return true;
+	}
+	if (obj->Is_Techno()) {
+		int owner = (int)obj->Owner();
+		if (owner >= 0 && owner < MAX_HOUSES) {
+			TechnoClass* tc = const_cast<TechnoClass*>(static_cast<TechnoClass const*>(obj));
+			Aeloria_Repair_Early_Class_Pointer(tc);
+			if (Aeloria_TechnoClassRawIsHealthy(tc)) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+static bool Aeloria_GuardLayerPopulateObjectPtr(const ObjectClass* obj, const char* site, const char* reason)
+{
+	if (Aeloria_IsLayerPopulateObjectPtr(obj)) {
+		return true;
+	}
+	uintptr_t key = obj ? reinterpret_cast<uintptr_t>(obj) : 0;
+	Aeloria_LogLateGameAvGuard(site, reason, key);
+	return false;
+}
+
 static void Aeloria_EnsureStabilityForTrackedCreations(const char* reason)
 {
 	size_t ensured = 0;
@@ -2294,7 +2344,9 @@ static void Aeloria_EnsureStabilityForTrackedCreations(const char* reason)
 		}
 
 		ObjectClass* obj = reinterpret_cast<ObjectClass*>(k);
-		if (!Aeloria_GuardExportObjectPtr(obj, "EnsureStabilityForTrackedCreations", "tracked_creation")) {
+		const bool inCreation = (g_AeloriaObjectCreationFrame.find(k) != g_AeloriaObjectCreationFrame.end());
+		if (!inCreation
+		    && !Aeloria_GuardLayerPopulateObjectPtr(obj, "EnsureStabilityForTrackedCreations", "tracked_creation")) {
 			continue;
 		}
 		auto& stab = g_AeloriaObjectStability[k];
@@ -6228,8 +6280,8 @@ void DLLExportClass::DLL_Draw_Intercept(int shape_number, int x, int y, int widt
 	{
 		key = reinterpret_cast<uintptr_t>(object);
 		hasCreation = g_AeloriaObjectCreationFrame.find(key) != g_AeloriaObjectCreationFrame.end();
-		// E.2.33: menu/map-preview LAYERS must not run repair on creation keys (stale pool AV).
-		if (g_AeloriaLiveLayerEnhancements) {
+		// E.2.33/56: live enhancements or preview creation keys need Class repair before populate.
+		if (g_AeloriaLiveLayerEnhancements || (hasCreation && Aeloria_IsLiveSkirmishMapLoaded())) {
 			if (hasCreation && object->Is_Techno()) {
 				Aeloria_Repair_Early_Class_Pointer(const_cast<TechnoClass*>(static_cast<TechnoClass const*>(object)));
 			}
@@ -6304,7 +6356,7 @@ void DLLExportClass::DLL_Draw_Intercept(int shape_number, int x, int y, int widt
 		Aeloria_LogLateGameAvGuard("DLL_Draw_Intercept", "layers_cap_intercept", TotalObjectCount);
 		return;
 	}
-	if (!Aeloria_GuardExportObjectPtr(object, "DLL_Draw_Intercept", "intercept_populate")) {
+	if (!Aeloria_GuardLayerPopulateObjectPtr(object, "DLL_Draw_Intercept", "intercept_populate")) {
 		return;
 	}
 	Aeloria_MaybeLogLayersNearCap(TotalObjectCount + CurrentDrawCount, "intercept_guard", TotalObjectCount, CurrentDrawCount);
@@ -7351,7 +7403,7 @@ void Aeloria_RecordProducedAircraftVirtualEmit(const ObjectClass* obj)
 static void Aeloria_PopulateEarlyBulkSlot(CNCObjectStruct& slot, const ObjectClass* obj, int exportLayer)
 {
 	memset(&slot, 0, sizeof(slot));
-	if (!Aeloria_GuardExportObjectPtr(obj, "PopulateEarlyBulkSlot", "bulk_populate")) {
+	if (!Aeloria_GuardLayerPopulateObjectPtr(obj, "PopulateEarlyBulkSlot", "bulk_populate")) {
 		return;
 	}
 
@@ -7582,7 +7634,7 @@ static void Aeloria_SustainMissingFootLayerObjects(CNCObjectListStruct* list, in
 		if (hotlistOnlyCandidate && exportLayer != LAYER_GROUND) {
 			return;
 		}
-		if (!Aeloria_GuardExportObjectPtr(obj, "SustainMissingFootLayer", "foot_sustain")) {
+		if (!Aeloria_GuardLayerPopulateObjectPtr(obj, "SustainMissingFootLayer", "foot_sustain")) {
 			return;
 		}
 		if (!Aeloria_IsFootLayerSustainCandidate(obj)) {
@@ -7749,10 +7801,14 @@ static bool Aeloria_IsPreviewLayerWalkObjectPtr(const ObjectClass* obj)
 	if (!Aeloria_IsLiveSkirmishMapLoaded() || Aeloria_IsExplicitLiveSkirmishMatch()) {
 		return Aeloria_IsExportSafeObjectPtr(obj);
 	}
+	uintptr_t key = reinterpret_cast<uintptr_t>(obj);
+	// E.2.58: starting forces @ frame 0 before PreviewSkirmishTrackingRetain keys settle.
+	if (g_AeloriaObjectCreationFrame.find(key) != g_AeloriaObjectCreationFrame.end()) {
+		return true;
+	}
 	if (Aeloria_IsPreviewMapBuildingLayerPtr(obj)) {
 		return true;
 	}
-	uintptr_t key = reinterpret_cast<uintptr_t>(obj);
 	if (Aeloria_PreviewSkirmishTrackingRetain(key)) {
 		return true;
 	}
@@ -7761,7 +7817,7 @@ static bool Aeloria_IsPreviewLayerWalkObjectPtr(const ObjectClass* obj)
 
 static bool Aeloria_IsPreviewSafeEmitCandidate(const ObjectClass* obj)
 {
-	if (!Aeloria_GuardExportObjectPtr(obj, "PreviewSafeEmit", "emit_candidate")) {
+	if (!Aeloria_GuardLayerPopulateObjectPtr(obj, "PreviewSafeEmit", "emit_candidate")) {
 		return false;
 	}
 	uintptr_t key = reinterpret_cast<uintptr_t>(obj);
@@ -7876,7 +7932,7 @@ static void Aeloria_FactoryProductionAssetFallback(CNCObjectStruct& root_object,
 	if (!building || !building->Class || root_object.ProductionAssetName[0] != '\0') {
 		return;
 	}
-	if (!Aeloria_GuardExportObjectPtr(building, "Get_Layer_State_factory", "factory_fallback")) {
+	if (!Aeloria_GuardLayerPopulateObjectPtr(building, "Get_Layer_State_factory", "factory_fallback")) {
 		return;
 	}
 	FactoryClass* factory = nullptr;
@@ -7889,7 +7945,7 @@ static void Aeloria_FactoryProductionAssetFallback(CNCObjectStruct& root_object,
 		return;
 	}
 	TechnoClass* production = factory->Get_Object();
-	if (production == nullptr || !Aeloria_GuardExportObjectPtr(production, "Get_Layer_State_factory", "factory_prod_obj")) {
+	if (production == nullptr || !Aeloria_GuardLayerPopulateObjectPtr(production, "Get_Layer_State_factory", "factory_prod_obj")) {
 		return;
 	}
 	Aeloria_Repair_Early_Class_Pointer(production);
@@ -7911,10 +7967,30 @@ static void Aeloria_FactoryProductionAssetFallback(CNCObjectStruct& root_object,
 	}
 }
 
+// E.2.58: map-placed base buildings on preview skirmish (E.2.55 walk only — need bulk populate).
+static bool Aeloria_PreviewBulkNeedsMapBuildings(void)
+{
+	if (!Aeloria_IsLiveSkirmishMapLoaded() || Aeloria_IsExplicitLiveSkirmishMatch()) {
+		return false;
+	}
+	for (int layer = 0; layer < DLL_LAYER_COUNT; layer++) {
+		for (int index = 0; index < Map.Layer[layer].Count(); index++) {
+			const ObjectClass* obj = Map.Layer[layer][index];
+			if (Aeloria_IsPreviewMapBuildingLayerPtr(obj)) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
 static bool Aeloria_AnyPreviewBulkWorkPending(void)
 {
 	if (!Aeloria_IsLiveSkirmishMapLoaded() || Aeloria_IsExplicitLiveSkirmishMatch()) {
 		return false;
+	}
+	if (Aeloria_PreviewBulkNeedsMapBuildings()) {
+		return true;
 	}
 	if (g_AeloriaObjectStability.empty() && g_AeloriaObjectCreationFrame.empty()) {
 		return false;
@@ -8143,7 +8219,7 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 						CNCObjectStruct& root_object = ObjectList->Objects[TotalObjectCount];
 						if (root_object.IsFactory) {
 							BuildingClass* building = (BuildingClass*)root_object.CNCInternalObjectPointer;
-							if (!Aeloria_GuardExportObjectPtr(building, "Get_Layer_State_factory", "factory_root")) {
+							if (!Aeloria_GuardLayerPopulateObjectPtr(building, "Get_Layer_State_factory", "factory_root")) {
 								continue;
 							}
 							if (!building->House || !building->Class) {
@@ -8270,7 +8346,7 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 			if (stab.clientListInserted) continue;
 
 			const ObjectClass* obj = reinterpret_cast<const ObjectClass*>(k);
-			if (!Aeloria_GuardExportObjectPtr(obj, "Get_Layer_State_bulk", "bulk_hascreation")) {
+			if (!Aeloria_GuardLayerPopulateObjectPtr(obj, "Get_Layer_State_bulk", "bulk_hascreation")) {
 				continue;
 			}
 			if (Aeloria_IsHumanDeployedBuilding(obj) && liveBulkExport) {
@@ -8327,6 +8403,70 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 			}
 		}
 
+		// E.2.58: preview bulk for map buildings that pass walk but miss Draw_It/intercept populate.
+		if (previewBulkExport && Aeloria_PreviewBulkNeedsMapBuildings()) {
+			int previewMapBulkAdded = 0;
+			for (int layer = 0; layer < DLL_LAYER_COUNT && s_previewMapBuildingBulkBudget > 0; layer++) {
+				for (int index = 0; index < Map.Layer[layer].Count() && s_previewMapBuildingBulkBudget > 0; index++) {
+					const ObjectClass* obj = Map.Layer[layer][index];
+					if (!Aeloria_IsPreviewMapBuildingLayerPtr(obj)) {
+						continue;
+					}
+					if (!Aeloria_GuardLayerPopulateObjectPtr(obj, "Get_Layer_State_preview_bulk", "preview_map_building")) {
+						continue;
+					}
+					int listCountSoFar = normalTotal + bulkAdded + previewMapBulkAdded;
+					if (Aeloria_ObjectAlreadyInExportList(ObjectList, listCountSoFar, obj)) {
+						continue;
+					}
+					int proposedIdx = normalTotal + bulkAdded + previewMapBulkAdded;
+					if (proposedIdx < 0 || proposedIdx >= AELORIA_LAYERS_CLIENT_CAP) {
+						Aeloria_LogLayersCapDrop("preview_map_bulk", normalTotal, bulkAdded + previewMapBulkAdded, 1, obj);
+						continue;
+					}
+					if (!Aeloria_PrepareContiguousBulkSlot(ObjectList, proposedIdx, obj)) {
+						continue;
+					}
+					CNCObjectStruct& slot = ObjectList->Objects[proposedIdx];
+					Aeloria_PopulateEarlyBulkSlot(slot, obj, layer);
+					if (slot.Type == UNKNOWN || slot.CNCInternalObjectPointer != obj) {
+						memset(&slot, 0, sizeof(slot));
+						continue;
+					}
+					if (!Aeloria_IsValidBulkPixelPos(slot.PositionX, slot.PositionY)) {
+						int px = 0, py = 0;
+						Map.Coord_To_Pixel(obj->Render_Coord(), px, py);
+						if (Aeloria_IsValidBulkPixelPos(px, py)) {
+							slot.PositionX = (short)px;
+							slot.PositionY = (short)py;
+						} else {
+							Aeloria_Debug_Log("PREVIEW_MAP_BULK_SKIP_POS this=%p owner=%d idx=%d pos=(%d,%d) frame=%u",
+							                  (void*)obj, (int)obj->Owner(), proposedIdx, (int)slot.PositionX, (int)slot.PositionY, Frame);
+							memset(&slot, 0, sizeof(slot));
+							continue;
+						}
+					}
+					if (slot.Owner < 0 || slot.Owner >= MAX_HOUSES) {
+						memset(&slot, 0, sizeof(slot));
+						continue;
+					}
+					uintptr_t k = reinterpret_cast<uintptr_t>(obj);
+					auto& stab = g_AeloriaObjectStability[k];
+					stab.rtti = (uint8_t)RTTI_BUILDING;
+					stab.earlySafeClientRegistered = true;
+					stab.clientListInserted = true;
+					if (stab.stabilityLevel < 1) {
+						stab.stabilityLevel = 1;
+					}
+					previewMapBulkAdded++;
+					s_previewMapBuildingBulkBudget--;
+					Aeloria_Debug_Log("PREVIEW_MAP_BULK_INSERT this=%p owner=%d idx=%d pos=(%d,%d) layer=%d frame=%u",
+					                  (void*)obj, (int)slot.Owner, proposedIdx, (int)slot.PositionX, (int)slot.PositionY, layer, Frame);
+				}
+			}
+			bulkAdded += previewMapBulkAdded;
+		}
+
 		// Sustain pass (approved plan 2026-06-13): re-feed graduated early units every export until normal layer walk includes them.
 		// Fixes finalCount=18 -> 0 after frame 0 (graduation one-shot + IsDown/guard prune on normal layer walk).
 		// Do NOT gate on successfulRealDraws — early safe registration sets that to 1 optimistically before any real draw.
@@ -8345,7 +8485,7 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 			if (!stab.earlySafeClientRegistered || !stab.clientListInserted || stab.sustainRetired) continue;
 
 			const ObjectClass* obj = reinterpret_cast<const ObjectClass*>(k);
-			if (!Aeloria_GuardExportObjectPtr(obj, "Get_Layer_State_sustain", "sustain_reinsert")) {
+			if (!Aeloria_GuardLayerPopulateObjectPtr(obj, "Get_Layer_State_sustain", "sustain_reinsert")) {
 				sustainSkippedInactive++;
 				continue;
 			}
