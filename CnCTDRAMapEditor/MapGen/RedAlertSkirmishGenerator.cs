@@ -16,6 +16,10 @@ namespace MobiusEditor.MapGen
     {
         public string Name { get; set; } = "AIGen_Map";
         public string Theater { get; set; } = "Temperate";
+        /// <summary>B1 terrain profile: flat (v1), temperate-mixed (schema; B2 implements).</summary>
+        public string TerrainProfile { get; set; } = MapGenTerrainProfiles.Flat;
+        /// <summary>B1 spawn layout: corners8, octagonOpen, middleRoad.</summary>
+        public string SpawnLayout { get; set; } = MapGenSpawnLayouts.Corners8;
         public int Seed { get; set; } = 1;
         public int Players { get; set; } = 4;
         public int MapSize { get; set; } = 64;
@@ -35,20 +39,8 @@ namespace MobiusEditor.MapGen
     {
         public static IList<string> Generate(MapGenRecipe recipe, string outputMprPath)
         {
-            var errors = new List<string>();
-            if (recipe == null)
-            {
-                errors.Add("Recipe is null.");
-                return errors;
-            }
-            if (recipe.Players < 2 || recipe.Players > 8)
-            {
-                errors.Add("Players must be between 2 and 8.");
-            }
-            if (recipe.MapSize < 16 || recipe.MapSize > 126)
-            {
-                errors.Add("MapSize must be between 16 and 126.");
-            }
+            var validationErrors = MapGenRecipeValidation.ValidateAndResolve(recipe, out SpawnLayoutResolution layout);
+            var errors = new List<string>(validationErrors);
             if (errors.Count > 0)
             {
                 return errors;
@@ -65,7 +57,7 @@ namespace MobiusEditor.MapGen
 
                 FillClearTerrain(plugin.Map);
 
-                var spawnTiles = PlacePlayerWaypoints(plugin.Map, recipe.Players, random);
+                var spawnTiles = PlacePlayerWaypoints(plugin.Map, recipe.Players, layout);
                 ResourcePlacement.Apply(plugin.Map, random, spawnTiles, new ResourcePlacement.Options
                 {
                     OreDensity = recipe.OreDensity,
@@ -118,7 +110,10 @@ namespace MobiusEditor.MapGen
                     }
                     else
                     {
-                        errors.AddRange(RedAlertMapSidecars.RepairMpr(outputMprPath));
+                        errors.AddRange(RedAlertMapSidecars.WriteSidecars(
+                            plugin.Map,
+                            outputMprPath,
+                            RedAlertMapSidecars.MetadataFromRecipe(recipe, layout)));
                     }
                 }
                 catch (Exception ex)
@@ -144,7 +139,18 @@ namespace MobiusEditor.MapGen
             }
         }
 
-        private static List<Point> PlacePlayerWaypoints(Map map, int players, Random random)
+        private static List<Point> PlacePlayerWaypoints(Map map, int players, SpawnLayoutResolution layout)
+        {
+            var spawns = new List<Point>();
+            if (layout.UsesReferenceCells)
+            {
+                return PlaceReferenceWaypoints(map, players, layout.ReferenceCells, spawns);
+            }
+
+            return PlaceCorners8Waypoints(map, players, spawns);
+        }
+
+        private static List<Point> PlaceCorners8Waypoints(Map map, int players, List<Point> spawns)
         {
             var bounds = map.Bounds;
             int inset = 6;
@@ -160,15 +166,39 @@ namespace MobiusEditor.MapGen
                 new Point(bounds.Right - inset - 1, bounds.Top + bounds.Height / 2),
             };
 
-            var spawns = new List<Point>();
-            for (int i = 0; i < players && i < map.Waypoints.Length; i++)
+            AssignWaypointCells(map, players, corners, spawns);
+            return spawns;
+        }
+
+        private static List<Point> PlaceReferenceWaypoints(
+            Map map,
+            int players,
+            IReadOnlyList<int> referenceCells,
+            List<Point> spawns)
+        {
+            const int globalWidth = 128;
+            int count = Math.Min(players, referenceCells.Count);
+            var tiles = new Point[count];
+            for (int i = 0; i < count; i++)
+            {
+                int globalCell = referenceCells[i];
+                tiles[i] = new Point(globalCell % globalWidth, globalCell / globalWidth);
+            }
+
+            AssignWaypointCells(map, players, tiles, spawns);
+            return spawns;
+        }
+
+        private static void AssignWaypointCells(Map map, int players, IReadOnlyList<Point> tiles, List<Point> spawns)
+        {
+            for (int i = 0; i < players && i < map.Waypoints.Length && i < tiles.Count; i++)
             {
                 var wp = map.Waypoints[i];
                 if (wp.Flag != WaypointFlag.PlayerStart)
                 {
                     continue;
                 }
-                var tile = corners[i];
+                var tile = tiles[i];
                 if (!map.Metrics.GetCell(tile, out int cell))
                 {
                     continue;
@@ -176,8 +206,6 @@ namespace MobiusEditor.MapGen
                 wp.Cell = cell;
                 spawns.Add(tile);
             }
-
-            return spawns;
         }
 
         private static IEnumerable<Point> EnumerateRect(Rectangle rect)

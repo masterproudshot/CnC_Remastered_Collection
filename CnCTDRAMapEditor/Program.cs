@@ -31,24 +31,10 @@ namespace MobiusEditor
         [STAThread]
         static void Main(string[] args)
         {
-            if (args != null && args.Length > 0 && string.Equals(args[0], "--mapgen", StringComparison.OrdinalIgnoreCase))
+            if (args != null && args.Length >= 2 &&
+                string.Equals(args[0], "--mapgen", StringComparison.OrdinalIgnoreCase))
             {
-                try
-                {
-                    Environment.ExitCode = MapGenCli.Run(args);
-                }
-                catch (Exception ex)
-                {
-                    try
-                    {
-                        var logPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "mapgen-error.txt");
-                        File.WriteAllText(logPath, ex.ToString());
-                    }
-                    catch
-                    {
-                    }
-                    Environment.ExitCode = 1;
-                }
+                Environment.ExitCode = MapGenCli.Run(args);
                 return;
             }
 
