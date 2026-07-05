@@ -11,11 +11,33 @@ using System.IO;
 
 namespace MobiusEditor.MapGen
 {
+    public sealed class MapGenSidecarMetadata
+    {
+        public string TerrainProfile { get; set; }
+        public string SpawnLayout { get; set; }
+        public int ResolvedWaypointCount { get; set; }
+    }
+
     public static class RedAlertMapSidecars
     {
         private const long MinTgaBytes = 4096;
 
-        public static IList<string> WriteSidecars(Map map, string mprPath)
+        public static MapGenSidecarMetadata MetadataFromRecipe(MapGenRecipe recipe, SpawnLayoutResolution layout)
+        {
+            if (recipe == null || layout == null)
+            {
+                return null;
+            }
+
+            return new MapGenSidecarMetadata
+            {
+                TerrainProfile = recipe.TerrainProfile,
+                SpawnLayout = recipe.SpawnLayout,
+                ResolvedWaypointCount = layout.WaypointCount
+            };
+        }
+
+        public static IList<string> WriteSidecars(Map map, string mprPath, MapGenSidecarMetadata metadata = null)
         {
             var errors = new List<string>();
             if (map == null)
@@ -51,7 +73,7 @@ namespace MobiusEditor.MapGen
 
             try
             {
-                WriteJson(map, jsonPath);
+                WriteJson(map, jsonPath, metadata);
             }
             catch (Exception ex)
             {
@@ -92,7 +114,7 @@ namespace MobiusEditor.MapGen
             return errors;
         }
 
-        private static void WriteJson(Map map, string jsonPath)
+        private static void WriteJson(Map map, string jsonPath, MapGenSidecarMetadata metadata)
         {
             using (var fs = new FileStream(jsonPath, FileMode.Create, FileAccess.Write, FileShare.Read))
             using (var sw = new StreamWriter(fs))
@@ -109,6 +131,15 @@ namespace MobiusEditor.MapGen
                 writer.WriteValue(map.MapSection.Height);
                 writer.WritePropertyName("Theater");
                 writer.WriteValue(map.MapSection.Theater.Name.ToUpper());
+                if (metadata != null)
+                {
+                    writer.WritePropertyName("TerrainProfile");
+                    writer.WriteValue(metadata.TerrainProfile);
+                    writer.WritePropertyName("SpawnLayout");
+                    writer.WriteValue(metadata.SpawnLayout);
+                    writer.WritePropertyName("ResolvedWaypointCount");
+                    writer.WriteValue(metadata.ResolvedWaypointCount);
+                }
                 writer.WritePropertyName("Waypoints");
                 writer.WriteStartArray();
                 foreach (var waypoint in map.Waypoints)

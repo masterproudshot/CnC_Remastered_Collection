@@ -180,9 +180,11 @@
     <Compile Include="Globals.cs" />
     <Compile Include="MapGen\EditorDataHost.cs" />
     <Compile Include="MapGen\MapGenCli.cs" />
+    <Compile Include="MapGen\MapGenSpawnLayout.cs" />
     <Compile Include="MapGen\RedAlertSkirmishGenerator.cs" />
     <Compile Include="MapGen\ResourcePlacement.cs" />
     <Compile Include="MapGen\RedAlertMapSidecars.cs" />
+    <Compile Include="MapGen\TerrainPlacement.cs" />
     <Compile Include="Interface\IBrowsableType.cs" />
     <Compile Include="Interface\ICellOccupier.cs" />
     <Compile Include="Interface\ICellOverlapper.cs" />

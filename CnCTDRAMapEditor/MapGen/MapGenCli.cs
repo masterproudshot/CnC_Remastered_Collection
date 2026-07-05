@@ -68,6 +68,8 @@ namespace MobiusEditor.MapGen
                         case "gem-patch-min": recipe.MinGemCellsPerPatch = int.Parse(value); break;
                         case "gem-patch-max": recipe.MaxGemCellsPerPatch = int.Parse(value); break;
                         case "briefing": recipe.Briefing = value; break;
+                        case "terrain-profile": recipe.TerrainProfile = value; break;
+                        case "spawn-layout": recipe.SpawnLayout = value; break;
                         case "data": gameRoot = value; break;
                         case "out": outputPath = value; break;
                         default:
@@ -86,6 +88,22 @@ namespace MobiusEditor.MapGen
                 }
                 outputPath = Path.Combine(saveDir, SanitizeFileName(recipe.Name) + ".mpr");
             }
+
+            var validationErrors = MapGenRecipeValidation.ValidateAndResolve(recipe, out SpawnLayoutResolution layout);
+            if (validationErrors.Count > 0)
+            {
+                foreach (var e in validationErrors)
+                {
+                    Console.Error.WriteLine(e);
+                    WriteLog("VALIDATION: " + e);
+                }
+                return 2;
+            }
+
+            WriteLog("Resolved SpawnLayout=" + layout.Layout + " waypoints=" + layout.WaypointCount +
+                     " TerrainProfile=" + recipe.TerrainProfile);
+            Console.WriteLine("Resolved waypoint count: " + layout.WaypointCount +
+                              " (layout=" + layout.Layout + ", terrain=" + recipe.TerrainProfile + ")");
 
             if (!EditorDataHost.TryInitialize(gameRoot, out string initError))
             {
@@ -242,7 +260,10 @@ namespace MobiusEditor.MapGen
         {
             Console.WriteLine("Usage:");
             Console.WriteLine("  CnCTDRAMapEditorD.exe --mapgen generate --name MyMap --seed 42 --players 4 \\");
-            Console.WriteLine("    --size 64 --ore 0.58 --gems 0.045 --mines 14 [--ore-patches 14] [--data <CnCRemastered>] [--out <path.mpr>]");
+            Console.WriteLine("    --size 64 --ore 0.58 --gems 0.045 --mines 14 [--terrain-profile flat|temperate-mixed] [--spawn-layout corners8] \\");
+            Console.WriteLine("    [--ore-patches 14] [--data <CnCRemastered>] [--out <path.mpr>]");
+            Console.WriteLine("  Terrain profiles: flat (v1 clear) | temperate-mixed (v2 water/rock/cliff/trees).");
+            Console.WriteLine("  Spawn layouts: corners8 | octagonOpen | middleRoad (octagonOpen/middleRoad require --size 126).");
             Console.WriteLine("  CnCTDRAMapEditorD.exe --mapgen repair-previews --dir <Red_Alert folder> [--data <CnCRemastered>]");
             Console.WriteLine("  CnCTDRAMapEditorD.exe --mapgen repair-previews --mpr <file.mpr> [--data <CnCRemastered>]");
         }
