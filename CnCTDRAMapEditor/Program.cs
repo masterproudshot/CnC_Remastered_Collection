@@ -13,6 +13,7 @@
 // GNU General Public License along with permitted additional restrictions 
 // with this program. If not, see https://github.com/electronicarts/CnC_Remastered_Collection
 using MobiusEditor.Dialogs;
+using MobiusEditor.MapGen;
 using MobiusEditor.Utility;
 using System;
 using System.Globalization;
@@ -28,8 +29,15 @@ namespace MobiusEditor
         /// The main entry point for the application.
         /// </summary>
         [STAThread]
-        static void Main()
+        static void Main(string[] args)
         {
+            if (args != null && args.Length >= 2 &&
+                string.Equals(args[0], "--mapgen", StringComparison.OrdinalIgnoreCase))
+            {
+                Environment.ExitCode = MapGenCli.Run(args);
+                return;
+            }
+
             // Change current culture to en-US
             if (Thread.CurrentThread.CurrentCulture.Name != "en-US")
             {

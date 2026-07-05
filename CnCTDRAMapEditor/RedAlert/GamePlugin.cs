@@ -1219,6 +1219,92 @@ namespace MobiusEditor.RedAlert
             return true;
         }
 
+        /// <summary>Headless save for MapGen CLI — MPR only; sidecars written separately.</summary>
+        public bool SaveMprOnly(string path, FileType fileType)
+        {
+            if (CollectValidationErrors().Count > 0)
+            {
+                return false;
+            }
+
+            var mprPath = Path.ChangeExtension(path, ".mpr");
+            var ini = new INI();
+            using (var mprWriter = new StreamWriter(mprPath))
+            {
+                SaveINI(ini, fileType);
+                mprWriter.Write(ini.ToString());
+            }
+
+            return true;
+        }
+
+        /// <summary>Validation errors for CLI (no MessageBox).</summary>
+        public IList<string> CollectValidationErrors()
+        {
+            var errors = new List<string>();
+
+            int numAircraft = Map.Technos.OfType<Unit>().Where(u => u.Occupier.Type.IsAircraft).Count();
+            int numBuildings = Map.Buildings.OfType<Building>().Where(x => x.Occupier.IsPrebuilt).Count();
+            int numInfantry = Map.Technos.OfType<InfantryGroup>().Sum(item => item.Occupier.Infantry.Count(i => i != null));
+            int numTerrain = Map.Technos.OfType<Terrain>().Count();
+            int numUnits = Map.Technos.OfType<Unit>().Where(u => u.Occupier.Type.IsUnit).Count();
+            int numVessels = Map.Technos.OfType<Unit>().Where(u => u.Occupier.Type.IsVessel).Count();
+            int numWaypoints = Map.Waypoints.Count(w => w.Cell.HasValue);
+
+            if (numAircraft > Constants.MaxAircraft)
+            {
+                errors.Add(string.Format("Maximum number of aircraft exceeded ({0} > {1})", numAircraft, Constants.MaxAircraft));
+            }
+
+            if (numBuildings > Constants.MaxBuildings)
+            {
+                errors.Add(string.Format("Maximum number of structures exceeded ({0} > {1})", numBuildings, Constants.MaxBuildings));
+            }
+
+            if (numInfantry > Constants.MaxInfantry)
+            {
+                errors.Add(string.Format("Maximum number of infantry exceeded ({0} > {1})", numInfantry, Constants.MaxInfantry));
+            }
+
+            if (numTerrain > Constants.MaxTerrain)
+            {
+                errors.Add(string.Format("Maximum number of terrain objects exceeded ({0} > {1})", numTerrain, Constants.MaxTerrain));
+            }
+
+            if (numUnits > Constants.MaxUnits)
+            {
+                errors.Add(string.Format("Maximum number of units exceeded ({0} > {1})", numUnits, Constants.MaxUnits));
+            }
+
+            if (numVessels > Constants.MaxVessels)
+            {
+                errors.Add(string.Format("Maximum number of ships exceeded ({0} > {1})", numVessels, Constants.MaxVessels));
+            }
+
+            if (Map.TeamTypes.Count > Constants.MaxTeams)
+            {
+                errors.Add(string.Format("Maximum number of team types exceeded ({0} > {1})", Map.TeamTypes.Count, Constants.MaxTeams));
+            }
+
+            if (Map.Triggers.Count > Constants.MaxTriggers)
+            {
+                errors.Add(string.Format("Maximum number of triggers exceeded ({0} > {1})", Map.Triggers.Count, Constants.MaxTriggers));
+            }
+
+            if (!Map.BasicSection.SoloMission && (numWaypoints < 2))
+            {
+                errors.Add("Skirmish/Multiplayer maps need at least 2 waypoints for player starting locations.");
+            }
+
+            var homeWaypoint = Map.Waypoints.Where(w => w.Equals("Home")).FirstOrDefault();
+            if (Map.BasicSection.SoloMission && homeWaypoint != null && !homeWaypoint.Cell.HasValue)
+            {
+                errors.Add("Single-player maps need the Home waypoint to be placed.");
+            }
+
+            return errors;
+        }
+
         private void SaveINI(INI ini, FileType fileType)
         {
             if (extraSections != null)
@@ -1577,84 +1663,19 @@ namespace MobiusEditor.RedAlert
 
         private bool Validate()
         {
-            StringBuilder sb = new StringBuilder("Error(s) during map validation:");
-
-            bool ok = true;
-            int numAircraft = Map.Technos.OfType<Unit>().Where(u => u.Occupier.Type.IsAircraft).Count();
-            int numBuildings = Map.Buildings.OfType<Building>().Where(x => x.Occupier.IsPrebuilt).Count();
-            int numInfantry = Map.Technos.OfType<InfantryGroup>().Sum(item => item.Occupier.Infantry.Count(i => i != null));
-            int numTerrain = Map.Technos.OfType<Terrain>().Count();
-            int numUnits = Map.Technos.OfType<Unit>().Where(u => u.Occupier.Type.IsUnit).Count();
-            int numVessels = Map.Technos.OfType<Unit>().Where(u => u.Occupier.Type.IsVessel).Count();
-            int numWaypoints = Map.Waypoints.Count(w => w.Cell.HasValue);
-
-            if (numAircraft > Constants.MaxAircraft)
+            var errors = CollectValidationErrors();
+            if (errors.Count > 0)
             {
-                sb.Append(Environment.NewLine + string.Format("Maximum number of aircraft exceeded ({0} > {1})", numAircraft, Constants.MaxAircraft));
-                ok = false;
-            }
-
-            if (numBuildings > Constants.MaxBuildings)
-            {
-                sb.Append(Environment.NewLine + string.Format("Maximum number of structures exceeded ({0} > {1})", numBuildings, Constants.MaxBuildings));
-                ok = false;
-            }
-
-            if (numInfantry > Constants.MaxInfantry)
-            {
-                sb.Append(Environment.NewLine + string.Format("Maximum number of infantry exceeded ({0} > {1})", numInfantry, Constants.MaxInfantry));
-                ok = false;
-            }
-
-            if (numTerrain > Constants.MaxTerrain)
-            {
-                sb.Append(Environment.NewLine + string.Format("Maximum number of terrain objects exceeded ({0} > {1})", numTerrain, Constants.MaxTerrain));
-                ok = false;
-            }
-
-            if (numUnits > Constants.MaxUnits)
-            {
-                sb.Append(Environment.NewLine + string.Format("Maximum number of units exceeded ({0} > {1})", numUnits, Constants.MaxUnits));
-                ok = false;
-            }
-
-            if (numVessels > Constants.MaxVessels)
-            {
-                sb.Append(Environment.NewLine + string.Format("Maximum number of ships exceeded ({0} > {1})", numVessels, Constants.MaxVessels));
-                ok = false;
-            }
-
-            if (Map.TeamTypes.Count > Constants.MaxTeams)
-            {
-                sb.Append(Environment.NewLine + string.Format("Maximum number of team types exceeded ({0} > {1})", Map.TeamTypes.Count, Constants.MaxTeams));
-                ok = false;
-            }
-
-            if (Map.Triggers.Count > Constants.MaxTriggers)
-            {
-                sb.Append(Environment.NewLine + string.Format("Maximum number of triggers exceeded ({0} > {1})", Map.Triggers.Count, Constants.MaxTriggers));
-                ok = false;
-            }
-
-            if (!Map.BasicSection.SoloMission && (numWaypoints < 2))
-            {
-                sb.Append(Environment.NewLine + "Skirmish/Multiplayer maps need at least 2 waypoints for player starting locations.");
-                ok = false;
-            }
-
-            var homeWaypoint = Map.Waypoints.Where(w => w.Equals("Home")).FirstOrDefault();
-            if (Map.BasicSection.SoloMission && !homeWaypoint.Cell.HasValue)
-            {
-                sb.Append(Environment.NewLine + string.Format("Single-player maps need the Home waypoint to be placed.", Map.Triggers.Count, Constants.MaxTriggers));
-                ok = false;
-            }
-
-            if (!ok)
-            {
+                var sb = new StringBuilder("Error(s) during map validation:");
+                foreach (var error in errors)
+                {
+                    sb.Append(Environment.NewLine + error);
+                }
                 MessageBox.Show(sb.ToString(), "Validation Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return false;
             }
 
-            return ok;
+            return true;
         }
 
         private void BasicSection_PropertyChanged(object sender, PropertyChangedEventArgs e)
