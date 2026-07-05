@@ -780,6 +780,7 @@ static bool Aeloria_IsCriticalLogMessage(const char *fmt)
 		"LAYERS_NEAR_CAP",
 		"LAYERS_CAP_DROP",
 		"LAYERS_TRIM_BAND",
+		"LAYERS_SLOT_REPLACE",
 		"LAYER_EXPORT_SKIP",
 		"PREVIEW_SAFE_LAYER_EMIT",
 		"FACTORY_PROD_ASSET_FALLBACK",
@@ -2258,6 +2259,21 @@ static void Aeloria_LogLateGameAvGuard(const char* site, const char* reason, uin
 	s_lateGameAvGuardLogBudget--;
 	Aeloria_Debug_Log("LATE_GAME_AV_GUARD site=%s reason=%s key=%p frame=%u budget=%u",
 	                  site ? site : "?", reason ? reason : "?", (void*)key, Frame, s_lateGameAvGuardLogBudget);
+}
+
+// E.2.61: fail-closed export when ptr unsafe (default on).
+static bool Aeloria_LayersFailClosedEnabled()
+{
+	static int cached = -1;
+	if (cached < 0) {
+		char val[8] = {};
+		if (GetEnvironmentVariableA("AELORIA_LAYERS_FAIL_CLOSED", val, sizeof(val)) > 0 && val[0] == '0') {
+			cached = 0;
+		} else {
+			cached = 1;
+		}
+	}
+	return cached != 0;
 }
 
 static bool Aeloria_IsExportSafeObjectPtr(const ObjectClass* obj)
@@ -6352,6 +6368,194 @@ static int Aeloria_ClampLayersListFair(CNCObjectListStruct* list, int count)
 	return writeIdx;
 }
 
+// E.2.59b: slot replace + reshuffle at cap=512 (AELORIA_LAYERS_SLOT_REPLACE=0 disables).
+static bool Aeloria_LayersSlotReplaceEnabled()
+{
+	static int cached = -1;
+	if (cached < 0) {
+		char val[8] = {};
+		if (GetEnvironmentVariableA("AELORIA_LAYERS_SLOT_REPLACE", val, sizeof(val)) > 0 && val[0] == '0') {
+			cached = 0;
+		} else {
+			cached = 1;
+		}
+	}
+	return cached != 0;
+}
+
+static void Aeloria_BuildLayersThirdHistogram(CNCObjectListStruct* list, int count, int hist[3])
+{
+	hist[0] = hist[1] = hist[2] = 0;
+	if (!list || count <= 0) {
+		return;
+	}
+	const int n = min(count, AELORIA_LAYERS_CLIENT_CAP);
+	for (int i = 0; i < n; ++i) {
+		const ObjectClass* obj = static_cast<const ObjectClass*>(list->Objects[i].CNCInternalObjectPointer);
+		int t = Aeloria_LayersObjectYThirdFromSlot(list->Objects[i], obj);
+		if (t >= 0 && t < 3) {
+			++hist[t];
+		}
+	}
+}
+
+static int Aeloria_FindEvictableSlotIndex(CNCObjectListStruct* list, int count, int incomingThird)
+{
+	if (!list || count <= 0) {
+		return -1;
+	}
+	int hist[3] = {0, 0, 0};
+	Aeloria_BuildLayersThirdHistogram(list, count, hist);
+	int evictThird = 0;
+	for (int t = 1; t < 3; ++t) {
+		if (hist[t] > hist[evictThird]) {
+			evictThird = t;
+		}
+	}
+	if (incomingThird >= 0 && incomingThird < 3 && hist[incomingThird] < hist[evictThird]) {
+		evictThird = 0;
+		for (int t = 0; t < 3; ++t) {
+			if (t != incomingThird && hist[t] > hist[evictThird]) {
+				evictThird = t;
+			}
+		}
+	}
+	const int n = min(count, AELORIA_LAYERS_CLIENT_CAP);
+	for (int i = n - 1; i >= 0; --i) {
+		const ObjectClass* obj = static_cast<const ObjectClass*>(list->Objects[i].CNCInternalObjectPointer);
+		if (Aeloria_LayersSlotRetainPriorityV2(obj)) {
+			continue;
+		}
+		int t = Aeloria_LayersObjectYThirdFromSlot(list->Objects[i], obj);
+		if (t == evictThird) {
+			return i;
+		}
+	}
+	for (int i = n - 1; i >= 0; --i) {
+		const ObjectClass* obj = static_cast<const ObjectClass*>(list->Objects[i].CNCInternalObjectPointer);
+		if (!Aeloria_LayersSlotRetainPriorityV2(obj)) {
+			return i;
+		}
+	}
+	return -1;
+}
+
+static bool Aeloria_TryReplaceLayersSlotAtCap(CNCObjectListStruct* list, int count, const ObjectClass* incoming, int exportLayer)
+{
+	if (!Aeloria_LayersSlotReplaceEnabled() || !list || !incoming || count < AELORIA_LAYERS_CLIENT_CAP) {
+		return false;
+	}
+	if (!Aeloria_GuardLayerPopulateObjectPtr(incoming, "TryReplaceLayersSlotAtCap", "replace_populate")) {
+		return false;
+	}
+	const int inThird = Aeloria_LayersObjectYThirdFromObject(incoming);
+	const int evictIdx = Aeloria_FindEvictableSlotIndex(list, count, inThird);
+	if (evictIdx < 0) {
+		return false;
+	}
+	const ObjectClass* evicted = static_cast<const ObjectClass*>(list->Objects[evictIdx].CNCInternalObjectPointer);
+	const int outThird = Aeloria_LayersObjectYThirdFromSlot(list->Objects[evictIdx], evicted);
+	Aeloria_PopulateEarlyBulkSlot(list->Objects[evictIdx], incoming, exportLayer);
+	if (list->Objects[evictIdx].CNCInternalObjectPointer != incoming) {
+		memset(&list->Objects[evictIdx], 0, sizeof(CNCObjectStruct));
+		return false;
+	}
+	static unsigned s_lastReplaceLogFrame = 0;
+	if (s_lastReplaceLogFrame != Frame) {
+		s_lastReplaceLogFrame = Frame;
+		Aeloria_Debug_Log("LAYERS_SLOT_REPLACE y_third_in=%d y_third_out=%d idx=%d frame=%u",
+		                  inThird, outThird, evictIdx, Frame);
+	}
+	return true;
+}
+
+static void Aeloria_ReshuffleLayersListAtCap(CNCObjectListStruct* list, int count)
+{
+	if (!list || count < AELORIA_LAYERS_NEAR_CAP_THRESHOLD || count > AELORIA_LAYERS_CLIENT_CAP) {
+		return;
+	}
+	if (!Aeloria_LayersSlotReplaceEnabled() || !Aeloria_LayersFairTrimEnabled()) {
+		return;
+	}
+	static CNCObjectStruct s_reshuffleScratch[AELORIA_LAYERS_CLIENT_CAP];
+	const int cap = count;
+
+	int priOrder[AELORIA_LAYERS_CLIENT_CAP];
+	int priN = 0;
+	int thirdList[3][AELORIA_LAYERS_CLIENT_CAP];
+	int thirdN[3] = {0, 0, 0};
+
+	for (int i = 0; i < count; ++i) {
+		const ObjectClass* obj = static_cast<const ObjectClass*>(list->Objects[i].CNCInternalObjectPointer);
+		if (Aeloria_LayersSlotRetainPriorityV2(obj)) {
+			if (priN < cap) {
+				priOrder[priN++] = i;
+			}
+		} else {
+			int t = Aeloria_LayersObjectYThirdFromSlot(list->Objects[i], obj);
+			if (thirdN[t] < cap) {
+				thirdList[t][thirdN[t]++] = i;
+			}
+		}
+	}
+
+	int writeIdx = 0;
+	for (int p = 0; p < priN && writeIdx < cap; ++p) {
+		s_reshuffleScratch[writeIdx++] = list->Objects[priOrder[p]];
+	}
+	int cursors[3] = {0, 0, 0};
+	int keptByThird[3] = {0, 0, 0};
+	while (writeIdx < cap) {
+		bool progress = false;
+		for (int t = 0; t < 3; ++t) {
+			if (cursors[t] < thirdN[t]) {
+				const int src = thirdList[t][cursors[t]++];
+				s_reshuffleScratch[writeIdx++] = list->Objects[src];
+				++keptByThird[t];
+				progress = true;
+				if (writeIdx >= cap) {
+					break;
+				}
+			}
+		}
+		if (!progress) {
+			break;
+		}
+	}
+	if (writeIdx == 0) {
+		return;
+	}
+	memcpy(list->Objects, s_reshuffleScratch, (size_t)writeIdx * sizeof(CNCObjectStruct));
+	int droppedByThird[3] = {0, 0, 0};
+	for (int t = 0; t < 3; ++t) {
+		droppedByThird[t] = max(0, thirdN[t] - cursors[t]);
+	}
+	Aeloria_MaybeLogLayersTrimBand(keptByThird, droppedByThird);
+}
+
+static void Aeloria_StripUnsafeDrawSlots(CNCObjectListStruct* list, int totalBase, int& drawCount)
+{
+	if (!Aeloria_LayersFailClosedEnabled() || !list || drawCount <= 0) {
+		return;
+	}
+	int writeIdx = 0;
+	for (int i = 0; i < drawCount; ++i) {
+		CNCObjectStruct& slot = list->Objects[totalBase + i];
+		const ObjectClass* obj = static_cast<const ObjectClass*>(slot.CNCInternalObjectPointer);
+		if (!obj || !Aeloria_IsExportSafeObjectPtr(obj)) {
+			continue;
+		}
+		if (writeIdx != i) {
+			memcpy(list->Objects + totalBase + writeIdx, &slot, sizeof(CNCObjectStruct));
+		}
+		++writeIdx;
+	}
+	if (writeIdx < drawCount) {
+		memset(list->Objects + totalBase + writeIdx, 0, (size_t)(drawCount - writeIdx) * sizeof(CNCObjectStruct));
+	}
+	drawCount = writeIdx;
+}
+
 static void Aeloria_MaybeLogLayersNearCap(int count, const char* site, int total, int draw)
 {
 	if (count < AELORIA_LAYERS_NEAR_CAP_THRESHOLD) {
@@ -6359,11 +6563,20 @@ static void Aeloria_MaybeLogLayersNearCap(int count, const char* site, int total
 	}
 	static unsigned s_lastNearCapFrame = 0;
 	static int s_lastNearCapCount = -1;
+	static unsigned s_lastNearCapPinnedLogFrame = 0;
 	if (s_lastNearCapFrame == Frame && s_lastNearCapCount == count) {
+		return;
+	}
+	// E.2.61: pinned at 512 — log at most once per 600 frames unless count changed.
+	if (count >= AELORIA_LAYERS_CLIENT_CAP && count == s_lastNearCapCount
+	    && Frame < s_lastNearCapPinnedLogFrame + 600) {
 		return;
 	}
 	s_lastNearCapFrame = Frame;
 	s_lastNearCapCount = count;
+	if (count >= AELORIA_LAYERS_CLIENT_CAP) {
+		s_lastNearCapPinnedLogFrame = Frame;
+	}
 	Aeloria_Debug_Log("LAYERS_NEAR_CAP count=%d site=%s total=%d draw=%d frame=%u",
 	                  count, site, total, draw, Frame);
 }
@@ -6372,6 +6585,18 @@ static void Aeloria_LogLayersCapDrop(const char* site, int total, int draw, int 
 {
 	static unsigned s_lastDropFrame = 0;
 	static const char* s_lastDropSite = nullptr;
+	static unsigned s_capDropBudgetFrame = 0;
+	static int s_capDropBudgetUsed = 0;
+	if (total >= AELORIA_LAYERS_NEAR_CAP_THRESHOLD) {
+		if (s_capDropBudgetFrame != Frame) {
+			s_capDropBudgetFrame = Frame;
+			s_capDropBudgetUsed = 0;
+		}
+		if (s_capDropBudgetUsed >= 2) {
+			return;
+		}
+		++s_capDropBudgetUsed;
+	}
 	if (s_lastDropFrame == Frame && s_lastDropSite == site) {
 		return;
 	}
@@ -6619,6 +6844,9 @@ void DLLExportClass::DLL_Draw_Intercept(int shape_number, int x, int y, int widt
 
 	// E.2.32/E.2.49: guard client LAYERS object array (512 slots); overflow caused ClientG c0000005 mid-skirmish.
 	if (TotalObjectCount + CurrentDrawCount >= AELORIA_LAYERS_CLIENT_CAP) {
+		if (Aeloria_TryReplaceLayersSlotAtCap(ObjectList, TotalObjectCount, object, ExportLayer)) {
+			return;
+		}
 		Aeloria_LogLayersCapDrop("intercept_guard", TotalObjectCount, CurrentDrawCount, 1, object);
 		Aeloria_LogLateGameAvGuard("DLL_Draw_Intercept", "layers_cap_intercept", TotalObjectCount);
 		return;
@@ -8450,9 +8678,19 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 					/*
 					** Call to Draw_It can result in multiple callbacks to the draw intercept.
 					*/
+					if (TotalObjectCount >= AELORIA_LAYERS_CLIENT_CAP
+					    && Aeloria_TryReplaceLayersSlotAtCap(ObjectList, TotalObjectCount, object, ExportLayer)) {
+						continue;
+					}
 					if (Aeloria_LayersWalkShouldSkipAtCap(ObjectList, TotalObjectCount, object)) {
 						Aeloria_LogLayersCapDrop("layer_walk_skip", TotalObjectCount, 0, 1, object);
 						Aeloria_LogLayerExportSkip("Get_Layer_State_walk", "layers_cap_pre_draw", TotalObjectCount);
+						continue;
+					}
+					if (Aeloria_LayersFailClosedEnabled() && !previewLayerWalk
+					    && !Aeloria_IsExportSafeObjectPtr(object)) {
+						Aeloria_LogLayerExportSkip("Get_Layer_State_walk", "fail_closed_pre_draw",
+						                           reinterpret_cast<uintptr_t>(object));
 						continue;
 					}
 					// E.2.51: WER 000b7fdf → Techno_Draw_Object (+0x2f); skip Draw_It when Class/+8 unhealthy after prune/reuse.
@@ -8570,6 +8808,7 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 						}
 					}
 
+					Aeloria_StripUnsafeDrawSlots(ObjectList, TotalObjectCount, CurrentDrawCount);
 					TotalObjectCount += CurrentDrawCount;
 				}
 			}
@@ -8635,6 +8874,10 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 			int existingIdx = Aeloria_FindObjectExportIndex(ObjectList, obj);
 			int proposedIdx = (existingIdx >= 0) ? existingIdx : (normalTotal + bulkAdded);
 			if (proposedIdx < 0 || proposedIdx >= AELORIA_LAYERS_CLIENT_CAP) {
+				if (normalTotal >= AELORIA_LAYERS_CLIENT_CAP
+				    && Aeloria_TryReplaceLayersSlotAtCap(ObjectList, normalTotal, obj, ExportLayer)) {
+					continue;
+				}
 				Aeloria_LogLayersCapDrop("bulk_idx", normalTotal, bulkAdded, 1, obj);
 				continue;
 			}
@@ -8688,6 +8931,10 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 					}
 					int proposedIdx = normalTotal + bulkAdded + previewMapBulkAdded;
 					if (proposedIdx < 0 || proposedIdx >= AELORIA_LAYERS_CLIENT_CAP) {
+						if (normalTotal >= AELORIA_LAYERS_CLIENT_CAP
+						    && Aeloria_TryReplaceLayersSlotAtCap(ObjectList, normalTotal, obj, layer)) {
+							continue;
+						}
 						Aeloria_LogLayersCapDrop("preview_map_bulk", normalTotal, bulkAdded + previewMapBulkAdded, 1, obj);
 						continue;
 					}
@@ -8825,6 +9072,10 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 			int existingIdx = Aeloria_FindObjectExportIndex(ObjectList, obj);
 			int proposedIdx = (existingIdx >= 0) ? existingIdx : (normalTotal + bulkAdded + sustainAdded);
 			if (proposedIdx < 0 || proposedIdx >= AELORIA_LAYERS_CLIENT_CAP) {
+				if (normalTotal >= AELORIA_LAYERS_CLIENT_CAP
+				    && Aeloria_TryReplaceLayersSlotAtCap(ObjectList, normalTotal, obj, ExportLayer)) {
+					continue;
+				}
 				Aeloria_LogLayersCapDrop("sustain_idx", normalTotal, bulkAdded + sustainAdded, 1, obj);
 				continue;
 			}
@@ -8883,6 +9134,10 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 		}
 	} else if (TotalObjectCount >= AELORIA_LAYERS_NEAR_CAP_THRESHOLD) {
 		Aeloria_MaybeLogLayersNearCap(TotalObjectCount, "total_finalize", TotalObjectCount, 0);
+	}
+
+	if (ObjectList != nullptr && TotalObjectCount >= AELORIA_LAYERS_NEAR_CAP_THRESHOLD) {
+		Aeloria_ReshuffleLayersListAtCap(ObjectList, TotalObjectCount);
 	}
 
 	// Vanilla always assigns Count after the layer walk (see TIBERIANDAWN Get_Layer_State). Keeping it
