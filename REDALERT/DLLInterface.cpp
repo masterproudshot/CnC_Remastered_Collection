@@ -773,6 +773,9 @@ static bool Aeloria_IsCriticalLogMessage(const char *fmt)
 		"STATELESS_TECHNO_DRAW",
 		"STATELESS_HOTLIST_SUSTAIN",
 		"FOOT_LAYER_SUSTAIN",
+		"LATE_GAME_AV_GUARD",
+		"TRACKING_PRUNE",
+		"DEAD_TRACKING_PRUNED",
 		nullptr
 	};
 
@@ -2127,6 +2130,41 @@ static bool Aeloria_IsObjectTrackingKeyUsable(uintptr_t key)
 	return (obj != nullptr && obj->IsActive);
 }
 
+// E.2.51: late-game AV guards — pool objects may be pruned from tracking maps but still exported.
+static unsigned s_lateGameAvGuardLogBudget = 32;
+
+static void Aeloria_LogLateGameAvGuard(const char* site, const char* reason, uintptr_t key = 0)
+{
+	if (s_lateGameAvGuardLogBudget == 0) {
+		return;
+	}
+	s_lateGameAvGuardLogBudget--;
+	Aeloria_Debug_Log("LATE_GAME_AV_GUARD site=%s reason=%s key=%p frame=%u budget=%u",
+	                  site ? site : "?", reason ? reason : "?", (void*)key, Frame, s_lateGameAvGuardLogBudget);
+}
+
+static bool Aeloria_IsExportSafeObjectPtr(const ObjectClass* obj)
+{
+	if (!obj) {
+		return false;
+	}
+	uintptr_t key = reinterpret_cast<uintptr_t>(obj);
+	if (!Is_Plausible_Class_Pointer(key)) {
+		return false;
+	}
+	return obj->IsActive && !obj->IsInLimbo;
+}
+
+static bool Aeloria_GuardExportObjectPtr(const ObjectClass* obj, const char* site, const char* reason)
+{
+	if (Aeloria_IsExportSafeObjectPtr(obj)) {
+		return true;
+	}
+	uintptr_t key = obj ? reinterpret_cast<uintptr_t>(obj) : 0;
+	Aeloria_LogLateGameAvGuard(site, reason, key);
+	return false;
+}
+
 static void Aeloria_EnsureStabilityForTrackedCreations(const char* reason)
 {
 	size_t ensured = 0;
@@ -2145,6 +2183,9 @@ static void Aeloria_EnsureStabilityForTrackedCreations(const char* reason)
 		}
 
 		ObjectClass* obj = reinterpret_cast<ObjectClass*>(k);
+		if (!Aeloria_GuardExportObjectPtr(obj, "EnsureStabilityForTrackedCreations", "tracked_creation")) {
+			continue;
+		}
 		auto& stab = g_AeloriaObjectStability[k];
 		stab.rtti = (uint8_t)obj->What_Am_I();
 		stab.earlySafeClientRegistered = false;
@@ -6018,6 +6059,10 @@ void DLLExportClass::DLL_Draw_Intercept(int shape_number, int x, int y, int widt
 
 	// E.2.32: guard client LAYERS object array (512 slots); overflow caused ClientG c0000005 mid-skirmish.
 	if (TotalObjectCount + CurrentDrawCount >= 512) {
+		Aeloria_LogLateGameAvGuard("DLL_Draw_Intercept", "layers_cap_intercept", TotalObjectCount);
+		return;
+	}
+	if (!Aeloria_GuardExportObjectPtr(object, "DLL_Draw_Intercept", "intercept_populate")) {
 		return;
 	}
 
@@ -6036,6 +6081,10 @@ void DLLExportClass::DLL_Draw_Intercept(int shape_number, int x, int y, int widt
 	CNCObjectStruct* base_object = NULL;
 	char sub_object = 0;
 	for (int i = 0; i < CurrentDrawCount; ++i) {
+		if (TotalObjectCount + i >= 512) {
+			Aeloria_LogLateGameAvGuard("DLL_Draw_Intercept", "sub_object_bounds", TotalObjectCount + i);
+			break;
+		}
 		CNCObjectStruct& draw_object = ObjectList->Objects[TotalObjectCount + i];
 		if (draw_object.CNCInternalObjectPointer == object) {
 			if (base_object == NULL) {
@@ -7054,6 +7103,9 @@ void Aeloria_RecordProducedAircraftVirtualEmit(const ObjectClass* obj)
 static void Aeloria_PopulateEarlyBulkSlot(CNCObjectStruct& slot, const ObjectClass* obj, int exportLayer)
 {
 	memset(&slot, 0, sizeof(slot));
+	if (!Aeloria_GuardExportObjectPtr(obj, "PopulateEarlyBulkSlot", "bulk_populate")) {
+		return;
+	}
 
 	uintptr_t objKey = reinterpret_cast<uintptr_t>(obj);
 	auto stabIt = g_AeloriaObjectStability.find(objKey);
@@ -7280,6 +7332,9 @@ static void Aeloria_SustainMissingFootLayerObjects(CNCObjectListStruct* list, in
 
 	auto tryInsert = [&](const ObjectClass* obj, bool hotlistOnlyCandidate) {
 		if (hotlistOnlyCandidate && exportLayer != LAYER_GROUND) {
+			return;
+		}
+		if (!Aeloria_GuardExportObjectPtr(obj, "SustainMissingFootLayer", "foot_sustain")) {
 			return;
 		}
 		if (!Aeloria_IsFootLayerSustainCandidate(obj)) {
@@ -7509,7 +7564,11 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 		for (int index = 0; index < Map.Layer[layer].Count(); index++) {
 
 			ObjectClass *object = Map.Layer[layer][index];
-			if (!object || !object->IsActive) {
+			if (!Aeloria_IsExportSafeObjectPtr(object)) {
+				if (object) {
+					Aeloria_LogLateGameAvGuard("Get_Layer_State_walk", "unsafe_layer_obj",
+					                           reinterpret_cast<uintptr_t>(object));
+				}
 				continue;
 			}
 			{
@@ -7556,11 +7615,24 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 					** Call to Draw_It can result in multiple callbacks to the draw intercept.
 					*/
 					if (TotalObjectCount >= 512) {
+						Aeloria_LogLateGameAvGuard("Get_Layer_State_walk", "layers_cap_pre_draw", TotalObjectCount);
 						continue;
+					}
+					// E.2.51: WER 000b7fdf → Techno_Draw_Object (+0x2f); skip Draw_It when Class/+8 unhealthy after prune/reuse.
+					if (object->Is_Techno()) {
+						TechnoClass const* techno = static_cast<TechnoClass const*>(object);
+						Aeloria_Repair_Early_Class_Pointer(const_cast<TechnoClass*>(techno));
+						if (!Aeloria_TechnoClassRawIsHealthy(techno)) {
+							Aeloria_LogLateGameAvGuard("Get_Layer_State_walk", "techno_unhealthy_pre_draw",
+							                           reinterpret_cast<uintptr_t>(object));
+							continue;
+						}
 					}
 					CurrentDrawCount = 0;
 					object->Draw_It(x, y, WINDOW_VIRTUAL);
 					if (TotalObjectCount + CurrentDrawCount > 512) {
+						Aeloria_LogLateGameAvGuard("Get_Layer_State_walk", "layers_cap_post_draw",
+						                           TotalObjectCount + CurrentDrawCount);
 						CurrentDrawCount = 512 - TotalObjectCount;
 					}
 
@@ -7570,14 +7642,38 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 					** This only occurs in skirmish and multiplayer.
 					*/
 					if ((GAME_TO_PLAY != GAME_NORMAL) && (CurrentDrawCount > 0)) {
+						if (TotalObjectCount >= 512) {
+							Aeloria_LogLateGameAvGuard("Get_Layer_State_factory", "root_slot_bounds", TotalObjectCount);
+							continue;
+						}
 						CNCObjectStruct& root_object = ObjectList->Objects[TotalObjectCount];
 						if (root_object.IsFactory) {
 							BuildingClass* building = (BuildingClass*)root_object.CNCInternalObjectPointer;
+							if (!Aeloria_GuardExportObjectPtr(building, "Get_Layer_State_factory", "factory_root")) {
+								continue;
+							}
+							if (!building->House || !building->Class) {
+								Aeloria_LogLateGameAvGuard("Get_Layer_State_factory", "factory_house_or_class",
+								                           reinterpret_cast<uintptr_t>(building));
+								continue;
+							}
 							FactoryClass* factory = building->House->IsHuman ? building->House->Fetch_Factory(building->Class->ToBuild) : building->Factory;
 							if (factory != nullptr) {
 								for (int i = CurrentDrawCount - 1; i > 0; --i) {
+									if (TotalObjectCount + i >= 512) {
+										Aeloria_LogLateGameAvGuard("Get_Layer_State_factory", "prod_slot_bounds",
+										                           TotalObjectCount + i);
+										break;
+									}
 									CNCObjectStruct& base_object = ObjectList->Objects[TotalObjectCount + i];
 									if (base_object.SubObject) {
+										continue;
+									}
+									if (base_object.CNCInternalObjectPointer
+									    && !Aeloria_IsExportSafeObjectPtr(
+									        reinterpret_cast<const ObjectClass*>(base_object.CNCInternalObjectPointer))) {
+										Aeloria_LogLateGameAvGuard("Get_Layer_State_factory", "prod_obj_stale",
+										                           reinterpret_cast<uintptr_t>(base_object.CNCInternalObjectPointer));
 										continue;
 									}
 									strncpy(root_object.ProductionAssetName, base_object.TypeName, CNC_OBJECT_ASSET_NAME_LENGTH);
@@ -7603,8 +7699,20 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 					** even though they get drawn as sub-objects (after the base object)
 					*/
 					for (int i = 1; i < CurrentDrawCount; ++i) {
+						if (TotalObjectCount + i >= 512) {
+							Aeloria_LogLateGameAvGuard("Get_Layer_State_shadow", "shadow_slot_bounds",
+							                           TotalObjectCount + i);
+							break;
+						}
 						CNCObjectStruct& sub_object = ObjectList->Objects[TotalObjectCount + i];
 						if (!sub_object.SubObject) {
+							continue;
+						}
+						if (sub_object.CNCInternalObjectPointer
+						    && !Aeloria_IsExportSafeObjectPtr(
+						        reinterpret_cast<const ObjectClass*>(sub_object.CNCInternalObjectPointer))) {
+							Aeloria_LogLateGameAvGuard("Get_Layer_State_shadow", "shadow_obj_stale",
+							                           reinterpret_cast<uintptr_t>(sub_object.CNCInternalObjectPointer));
 							continue;
 						}
 						static const int shadow_flags = SHAPE_PREDATOR | SHAPE_FADING;
@@ -7663,7 +7771,9 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 			if (stab.clientListInserted) continue;
 
 			const ObjectClass* obj = reinterpret_cast<const ObjectClass*>(k);
-			if (!obj || !obj->IsActive || obj->IsInLimbo) continue;
+			if (!Aeloria_GuardExportObjectPtr(obj, "Get_Layer_State_bulk", "bulk_hascreation")) {
+				continue;
+			}
 			if (Aeloria_IsHumanDeployedBuilding(obj)) continue;
 			// Produced war-factory units: defer bulk until tactical MAIN draw caches coords (5z-n4).
 			if (stab.producedUnitUnlimboSeeded && !Aeloria_HasValidMainDrawCache(obj)
@@ -7727,7 +7837,10 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 			if (!stab.earlySafeClientRegistered || !stab.clientListInserted || stab.sustainRetired) continue;
 
 			const ObjectClass* obj = reinterpret_cast<const ObjectClass*>(k);
-			if (!obj || !obj->IsActive || obj->IsInLimbo) { sustainSkippedInactive++; continue; }
+			if (!Aeloria_GuardExportObjectPtr(obj, "Get_Layer_State_sustain", "sustain_reinsert")) {
+				sustainSkippedInactive++;
+				continue;
+			}
 			// Produced war-factory units: defer sustain until MAIN draw caches coords (5z-n5).
 			if (stab.producedUnitUnlimboSeeded && !Aeloria_HasValidMainDrawCache(obj)
 			    && !Aeloria_ProducedRotorMayBulkWithoutMainCache(obj, stab)) {
