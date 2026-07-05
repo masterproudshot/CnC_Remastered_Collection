@@ -6193,7 +6193,7 @@ static bool Aeloria_LayersSlotRetainPriority(const ObjectClass* obj)
 	return Aeloria_IsTrackedStartingUnit(obj) || Aeloria_IsHumanDeployedBuilding(obj);
 }
 
-// E.2.59: fair geographic trim under 512 cap (default on; AELORIA_LAYERS_FAIR_TRIM=0 reverts to E.2.49 trim).
+// E.2.65: uniform cap trim (priority first, stable list order). AELORIA_LAYERS_FAIR_TRIM=0 → E.2.49 legacy trim only.
 static bool Aeloria_LayersFairTrimEnabled()
 {
 	static int cached = -1;
@@ -6206,47 +6206,6 @@ static bool Aeloria_LayersFairTrimEnabled()
 		}
 	}
 	return cached != 0;
-}
-
-static int Aeloria_LayersObjectYThirdFromObject(const ObjectClass* obj)
-{
-	if (!obj) {
-		return 1;
-	}
-	CELL cell = Coord_Cell(obj->Render_Coord());
-	int relY = Cell_Y(cell) - Map.MapCellY;
-	int h = Map.MapCellHeight;
-	if (h < 1) {
-		h = 1;
-	}
-	if (relY < 0) {
-		relY = 0;
-	}
-	int third = (relY * 3) / h;
-	if (third > 2) {
-		third = 2;
-	}
-	return third;
-}
-
-static int Aeloria_LayersObjectYThirdFromSlot(const CNCObjectStruct& slot, const ObjectClass* obj)
-{
-	int relY = (int)slot.CellY - Map.MapCellY;
-	int h = Map.MapCellHeight;
-	if (h < 1) {
-		h = 1;
-	}
-	if (relY < 0) {
-		relY = 0;
-	}
-	int third = (relY * 3) / h;
-	if (third > 2) {
-		third = 2;
-	}
-	if (obj && third == 1 && slot.CellY == 0 && slot.CellX == 0) {
-		return Aeloria_LayersObjectYThirdFromObject(obj);
-	}
-	return third;
 }
 
 static bool Aeloria_LayersSlotRetainPriorityV2(const ObjectClass* obj)
@@ -6263,38 +6222,44 @@ static bool Aeloria_LayersSlotRetainPriorityV2(const ObjectClass* obj)
 	return false;
 }
 
-static void Aeloria_MaybeLogLayersTrimBand(const int keptByThird[3], const int droppedByThird[3])
+// Compact slots: retain-priority objects first (stable index order), then others in stable index order. Map position agnostic.
+static int Aeloria_LayersUniformCompactSlots(CNCObjectStruct* outSlots, const CNCObjectStruct* inSlots, int count, int cap)
 {
-	static unsigned s_lastBandFrame = 0;
-	if (s_lastBandFrame == Frame) {
-		return;
+	if (!outSlots || !inSlots || count <= 0 || cap <= 0) {
+		return 0;
 	}
-	s_lastBandFrame = Frame;
-	for (int t = 0; t < 3; ++t) {
-		if (keptByThird[t] > 0 || droppedByThird[t] > 0) {
-			Aeloria_Debug_Log("LAYERS_TRIM_BAND y_third=%d kept=%d dropped=%d frame=%u",
-			                  t, keptByThird[t], droppedByThird[t], Frame);
+	int priIdx[AELORIA_LAYERS_CLIENT_CAP];
+	int nonPriIdx[AELORIA_LAYERS_CLIENT_CAP];
+	int priN = 0;
+	int nonPriN = 0;
+	const int n = min(count, AELORIA_LAYERS_CLIENT_CAP);
+	for (int i = 0; i < n; ++i) {
+		const ObjectClass* obj = static_cast<const ObjectClass*>(inSlots[i].CNCInternalObjectPointer);
+		if (Aeloria_LayersSlotRetainPriorityV2(obj)) {
+			if (priN < AELORIA_LAYERS_CLIENT_CAP) {
+				priIdx[priN++] = i;
+			}
+		} else if (nonPriN < AELORIA_LAYERS_CLIENT_CAP) {
+			nonPriIdx[nonPriN++] = i;
 		}
 	}
+	int writeIdx = 0;
+	for (int p = 0; p < priN && writeIdx < cap; ++p) {
+		outSlots[writeIdx++] = inSlots[priIdx[p]];
+	}
+	for (int q = 0; q < nonPriN && writeIdx < cap; ++q) {
+		outSlots[writeIdx++] = inSlots[nonPriIdx[q]];
+	}
+	return writeIdx;
 }
 
-static bool Aeloria_LayersWalkShouldSkipAtCap(CNCObjectListStruct* list, int totalCount, const ObjectClass* object)
+static bool Aeloria_LayersWalkShouldSkipAtCap(int totalCount, const ObjectClass* object)
 {
-	if (!Aeloria_LayersFairTrimEnabled() || totalCount < AELORIA_LAYERS_CLIENT_CAP || !list || !object) {
-		return totalCount >= AELORIA_LAYERS_CLIENT_CAP;
-	}
-	if (Aeloria_LayersSlotRetainPriorityV2(object)) {
+	if (totalCount < AELORIA_LAYERS_CLIENT_CAP) {
 		return false;
 	}
-	int hist[3] = {0, 0, 0};
-	for (int i = 0; i < totalCount && i < AELORIA_LAYERS_CLIENT_CAP; ++i) {
-		const ObjectClass* o = static_cast<const ObjectClass*>(list->Objects[i].CNCInternalObjectPointer);
-		int t = Aeloria_LayersObjectYThirdFromObject(o);
-		++hist[t];
-	}
-	const int objThird = Aeloria_LayersObjectYThirdFromObject(object);
-	const int minTarget = max(8, totalCount / 9);
-	return hist[objThird] >= minTarget;
+	// At cap, non-priority objects compete via replace; skip walk draw only when replace already failed.
+	return !Aeloria_LayersSlotRetainPriorityV2(object);
 }
 
 static int Aeloria_ClampLayersListFair(CNCObjectListStruct* list, int count)
@@ -6307,66 +6272,13 @@ static int Aeloria_ClampLayersListFair(CNCObjectListStruct* list, int count)
 	}
 
 	static CNCObjectStruct s_fairClampScratch[AELORIA_LAYERS_CLIENT_CAP];
-	const int cap = AELORIA_LAYERS_CLIENT_CAP;
-
-	int priOrder[AELORIA_LAYERS_CLIENT_CAP];
-	int priN = 0;
-	int thirdList[3][AELORIA_LAYERS_CLIENT_CAP];
-	int thirdN[3] = {0, 0, 0};
-	int keptByThird[3] = {0, 0, 0};
-	int droppedByThird[3] = {0, 0, 0};
-
-	for (int i = 0; i < count; ++i) {
-		const ObjectClass* obj = static_cast<const ObjectClass*>(list->Objects[i].CNCInternalObjectPointer);
-		if (Aeloria_LayersSlotRetainPriorityV2(obj)) {
-			if (priN < cap) {
-				priOrder[priN++] = i;
-			}
-		} else {
-			int t = Aeloria_LayersObjectYThirdFromSlot(list->Objects[i], obj);
-			if (thirdN[t] < cap) {
-				thirdList[t][thirdN[t]++] = i;
-			}
-		}
-	}
-
-	int writeIdx = 0;
-	for (int p = 0; p < priN && writeIdx < cap; ++p) {
-		s_fairClampScratch[writeIdx++] = list->Objects[priOrder[p]];
-	}
-
-	int cursors[3] = {0, 0, 0};
-	while (writeIdx < cap) {
-		bool progress = false;
-		for (int t = 0; t < 3; ++t) {
-			if (cursors[t] < thirdN[t]) {
-				const int src = thirdList[t][cursors[t]++];
-				s_fairClampScratch[writeIdx++] = list->Objects[src];
-				++keptByThird[t];
-				progress = true;
-				if (writeIdx >= cap) {
-					break;
-				}
-			}
-		}
-		if (!progress) {
-			break;
-		}
-	}
-
-	for (int t = 0; t < 3; ++t) {
-		droppedByThird[t] = thirdN[t] - cursors[t];
-	}
-
+	const int writeIdx = Aeloria_LayersUniformCompactSlots(s_fairClampScratch, list->Objects, count, AELORIA_LAYERS_CLIENT_CAP);
 	memcpy(list->Objects, s_fairClampScratch, (size_t)writeIdx * sizeof(CNCObjectStruct));
-	if (writeIdx < cap) {
-		memset(list->Objects + writeIdx, 0, (size_t)(cap - writeIdx) * sizeof(CNCObjectStruct));
+	if (writeIdx < AELORIA_LAYERS_CLIENT_CAP) {
+		memset(list->Objects + writeIdx, 0, (size_t)(AELORIA_LAYERS_CLIENT_CAP - writeIdx) * sizeof(CNCObjectStruct));
 	}
-
 	const int dropped = count - writeIdx;
-	Aeloria_LogLayersCapDrop("total_clamp_fair", count, 0, dropped);
-	Aeloria_MaybeLogLayersTrimBand(keptByThird, droppedByThird);
-
+	Aeloria_LogLayersCapDrop("total_clamp_uniform", count, 0, dropped);
 	return writeIdx;
 }
 
@@ -6385,54 +6297,12 @@ static bool Aeloria_LayersSlotReplaceEnabled()
 	return cached != 0;
 }
 
-static void Aeloria_BuildLayersThirdHistogram(CNCObjectListStruct* list, int count, int hist[3])
-{
-	hist[0] = hist[1] = hist[2] = 0;
-	if (!list || count <= 0) {
-		return;
-	}
-	const int n = min(count, AELORIA_LAYERS_CLIENT_CAP);
-	for (int i = 0; i < n; ++i) {
-		const ObjectClass* obj = static_cast<const ObjectClass*>(list->Objects[i].CNCInternalObjectPointer);
-		int t = Aeloria_LayersObjectYThirdFromSlot(list->Objects[i], obj);
-		if (t >= 0 && t < 3) {
-			++hist[t];
-		}
-	}
-}
-
-static int Aeloria_FindEvictableSlotIndex(CNCObjectListStruct* list, int count, int incomingThird)
+static int Aeloria_FindEvictableSlotIndex(CNCObjectListStruct* list, int count)
 {
 	if (!list || count <= 0) {
 		return -1;
 	}
-	int hist[3] = {0, 0, 0};
-	Aeloria_BuildLayersThirdHistogram(list, count, hist);
-	int evictThird = 0;
-	for (int t = 1; t < 3; ++t) {
-		if (hist[t] > hist[evictThird]) {
-			evictThird = t;
-		}
-	}
-	if (incomingThird >= 0 && incomingThird < 3 && hist[incomingThird] < hist[evictThird]) {
-		evictThird = 0;
-		for (int t = 0; t < 3; ++t) {
-			if (t != incomingThird && hist[t] > hist[evictThird]) {
-				evictThird = t;
-			}
-		}
-	}
 	const int n = min(count, AELORIA_LAYERS_CLIENT_CAP);
-	for (int i = n - 1; i >= 0; --i) {
-		const ObjectClass* obj = static_cast<const ObjectClass*>(list->Objects[i].CNCInternalObjectPointer);
-		if (Aeloria_LayersSlotRetainPriorityV2(obj)) {
-			continue;
-		}
-		int t = Aeloria_LayersObjectYThirdFromSlot(list->Objects[i], obj);
-		if (t == evictThird) {
-			return i;
-		}
-	}
 	for (int i = n - 1; i >= 0; --i) {
 		const ObjectClass* obj = static_cast<const ObjectClass*>(list->Objects[i].CNCInternalObjectPointer);
 		if (!Aeloria_LayersSlotRetainPriorityV2(obj)) {
@@ -6450,13 +6320,10 @@ static bool Aeloria_TryReplaceLayersSlotAtCap(CNCObjectListStruct* list, int cou
 	if (!Aeloria_GuardLayerPopulateObjectPtr(incoming, "TryReplaceLayersSlotAtCap", "replace_populate")) {
 		return false;
 	}
-	const int inThird = Aeloria_LayersObjectYThirdFromObject(incoming);
-	const int evictIdx = Aeloria_FindEvictableSlotIndex(list, count, inThird);
+	const int evictIdx = Aeloria_FindEvictableSlotIndex(list, count);
 	if (evictIdx < 0) {
 		return false;
 	}
-	const ObjectClass* evicted = static_cast<const ObjectClass*>(list->Objects[evictIdx].CNCInternalObjectPointer);
-	const int outThird = Aeloria_LayersObjectYThirdFromSlot(list->Objects[evictIdx], evicted);
 	Aeloria_PopulateEarlyBulkSlot(list->Objects[evictIdx], incoming, exportLayer);
 	if (list->Objects[evictIdx].CNCInternalObjectPointer != incoming) {
 		memset(&list->Objects[evictIdx], 0, sizeof(CNCObjectStruct));
@@ -6466,8 +6333,7 @@ static bool Aeloria_TryReplaceLayersSlotAtCap(CNCObjectListStruct* list, int cou
 	static unsigned s_lastReplaceLogFrame = 0;
 	if (s_lastReplaceLogFrame != Frame) {
 		s_lastReplaceLogFrame = Frame;
-		Aeloria_Debug_Log("LAYERS_SLOT_REPLACE y_third_in=%d y_third_out=%d idx=%d frame=%u",
-		                  inThird, outThird, evictIdx, Frame);
+		Aeloria_Debug_Log("LAYERS_SLOT_REPLACE idx=%d frame=%u", evictIdx, Frame);
 	}
 	return true;
 }
@@ -6500,13 +6366,10 @@ static bool Aeloria_LayersReplaceDrawIntoSlotAtCap(CNCObjectListStruct* list, in
 	if (!Aeloria_GuardLayerPopulateObjectPtr(object, "LayersReplaceDrawIntoSlotAtCap", "replace_draw")) {
 		return false;
 	}
-	const int inThird = Aeloria_LayersObjectYThirdFromObject(object);
-	const int evictIdx = Aeloria_FindEvictableSlotIndex(list, totalCount, inThird);
+	const int evictIdx = Aeloria_FindEvictableSlotIndex(list, totalCount);
 	if (evictIdx < 0) {
 		return false;
 	}
-	const ObjectClass* evicted = static_cast<const ObjectClass*>(list->Objects[evictIdx].CNCInternalObjectPointer);
-	const int outThird = Aeloria_LayersObjectYThirdFromSlot(list->Objects[evictIdx], evicted);
 	const int savedTotal = totalCount;
 	currentDrawCount = 0;
 	totalCount = evictIdx;
@@ -6518,8 +6381,7 @@ static bool Aeloria_LayersReplaceDrawIntoSlotAtCap(CNCObjectListStruct* list, in
 	static unsigned s_lastReplaceDrawLogFrame = 0;
 	if (s_lastReplaceDrawLogFrame != Frame) {
 		s_lastReplaceDrawLogFrame = Frame;
-		Aeloria_Debug_Log("LAYERS_SLOT_REPLACE y_third_in=%d y_third_out=%d idx=%d mode=draw_it frame=%u",
-		                  inThird, outThird, evictIdx, Frame);
+		Aeloria_Debug_Log("LAYERS_SLOT_REPLACE idx=%d mode=draw_it frame=%u", evictIdx, Frame);
 	}
 	return true;
 }
@@ -6533,59 +6395,11 @@ static void Aeloria_ReshuffleLayersListAtCap(CNCObjectListStruct* list, int coun
 		return;
 	}
 	static CNCObjectStruct s_reshuffleScratch[AELORIA_LAYERS_CLIENT_CAP];
-	const int cap = count;
-
-	int priOrder[AELORIA_LAYERS_CLIENT_CAP];
-	int priN = 0;
-	int thirdList[3][AELORIA_LAYERS_CLIENT_CAP];
-	int thirdN[3] = {0, 0, 0};
-
-	for (int i = 0; i < count; ++i) {
-		const ObjectClass* obj = static_cast<const ObjectClass*>(list->Objects[i].CNCInternalObjectPointer);
-		if (Aeloria_LayersSlotRetainPriorityV2(obj)) {
-			if (priN < cap) {
-				priOrder[priN++] = i;
-			}
-		} else {
-			int t = Aeloria_LayersObjectYThirdFromSlot(list->Objects[i], obj);
-			if (thirdN[t] < cap) {
-				thirdList[t][thirdN[t]++] = i;
-			}
-		}
-	}
-
-	int writeIdx = 0;
-	for (int p = 0; p < priN && writeIdx < cap; ++p) {
-		s_reshuffleScratch[writeIdx++] = list->Objects[priOrder[p]];
-	}
-	int cursors[3] = {0, 0, 0};
-	int keptByThird[3] = {0, 0, 0};
-	while (writeIdx < cap) {
-		bool progress = false;
-		for (int t = 0; t < 3; ++t) {
-			if (cursors[t] < thirdN[t]) {
-				const int src = thirdList[t][cursors[t]++];
-				s_reshuffleScratch[writeIdx++] = list->Objects[src];
-				++keptByThird[t];
-				progress = true;
-				if (writeIdx >= cap) {
-					break;
-				}
-			}
-		}
-		if (!progress) {
-			break;
-		}
-	}
-	if (writeIdx == 0) {
+	const int writeIdx = Aeloria_LayersUniformCompactSlots(s_reshuffleScratch, list->Objects, count, count);
+	if (writeIdx <= 0) {
 		return;
 	}
 	memcpy(list->Objects, s_reshuffleScratch, (size_t)writeIdx * sizeof(CNCObjectStruct));
-	int droppedByThird[3] = {0, 0, 0};
-	for (int t = 0; t < 3; ++t) {
-		droppedByThird[t] = max(0, thirdN[t] - cursors[t]);
-	}
-	Aeloria_MaybeLogLayersTrimBand(keptByThird, droppedByThird);
 }
 
 static void Aeloria_StripUnsafeDrawSlots(CNCObjectListStruct* list, int totalBase, int& drawCount, bool previewLayerWalk)
@@ -6733,79 +6547,12 @@ static void Aeloria_TrimDrawCountPreferRetain(CNCObjectListStruct* list, int tot
 	}
 
 	static CNCObjectStruct s_trimScratch[AELORIA_LAYERS_CLIENT_CAP];
-	const bool nearCap = (totalBase + drawCount >= AELORIA_LAYERS_NEAR_CAP_THRESHOLD);
-
-	int priOrder[AELORIA_LAYERS_CLIENT_CAP];
-	int priN = 0;
-	int thirdList[3][AELORIA_LAYERS_CLIENT_CAP];
-	int thirdN[3] = {0, 0, 0};
-	int keptByThird[3] = {0, 0, 0};
-	int droppedByThird[3] = {0, 0, 0};
-
-	for (int i = 0; i < drawCount; ++i) {
-		CNCObjectStruct& slot = list->Objects[totalBase + i];
-		const ObjectClass* obj = static_cast<const ObjectClass*>(slot.CNCInternalObjectPointer);
-		if (Aeloria_LayersSlotRetainPriorityV2(obj)) {
-			if (priN < cap) {
-				priOrder[priN++] = i;
-			}
-		} else {
-			int t = Aeloria_LayersObjectYThirdFromSlot(slot, obj);
-			if (thirdN[t] < cap) {
-				thirdList[t][thirdN[t]++] = i;
-			}
-		}
-	}
-
-	int writeIdx = 0;
-	for (int p = 0; p < priN && writeIdx < cap; ++p) {
-		s_trimScratch[writeIdx++] = list->Objects[totalBase + priOrder[p]];
-	}
-
-	if (nearCap) {
-		int cursors[3] = {0, 0, 0};
-		while (writeIdx < cap) {
-			bool progress = false;
-			for (int t = 0; t < 3; ++t) {
-				if (cursors[t] < thirdN[t]) {
-					const int src = thirdList[t][cursors[t]++];
-					s_trimScratch[writeIdx++] = list->Objects[totalBase + src];
-					++keptByThird[t];
-					progress = true;
-					if (writeIdx >= cap) {
-						break;
-					}
-				}
-			}
-			if (!progress) {
-				break;
-			}
-		}
-		for (int t = 0; t < 3; ++t) {
-			droppedByThird[t] = thirdN[t] - cursors[t];
-		}
-	} else {
-		for (int i = 0; i < drawCount && writeIdx < cap; ++i) {
-			CNCObjectStruct& slot = list->Objects[totalBase + i];
-			const ObjectClass* obj = static_cast<const ObjectClass*>(slot.CNCInternalObjectPointer);
-			if (Aeloria_LayersSlotRetainPriorityV2(obj)) {
-				continue;
-			}
-			s_trimScratch[writeIdx++] = slot;
-			int t = Aeloria_LayersObjectYThirdFromSlot(slot, obj);
-			++keptByThird[t];
-		}
-		for (int t = 0; t < 3; ++t) {
-			droppedByThird[t] = max(0, thirdN[t] - keptByThird[t]);
-		}
-	}
-
+	const int writeIdx = Aeloria_LayersUniformCompactSlots(s_trimScratch, list->Objects + totalBase, drawCount, cap);
 	memcpy(list->Objects + totalBase, s_trimScratch, (size_t)writeIdx * sizeof(CNCObjectStruct));
 	const int dropped = drawCount - writeIdx;
 	if (dropped > 0) {
 		memset(list->Objects + totalBase + writeIdx, 0, (size_t)dropped * sizeof(CNCObjectStruct));
 		Aeloria_LogLayersCapDrop("layer_walk_trim", totalBase, drawCount, dropped);
-		Aeloria_MaybeLogLayersTrimBand(keptByThird, droppedByThird);
 	}
 	drawCount = writeIdx;
 	if (totalBase + drawCount >= AELORIA_LAYERS_NEAR_CAP_THRESHOLD) {
@@ -7437,6 +7184,8 @@ static void Aeloria_CacheDrawParams(const ObjectClass* object, int shape_number,
 	// (1127 session: barracks rocket troopers AV after ~3 layer exports).
 }
 
+static bool Aeloria_InfantryLayersExportReady(const ObjectClass* obj, const AeloriaObjectStability& stab);
+
 void Aeloria_GraduateTrackedObject(const ObjectClass* obj)
 {
 	if (!obj) return;
@@ -7496,10 +7245,14 @@ void Aeloria_GraduateTrackedObject(const ObjectClass* obj)
 		}
 		if ((rtti == RTTI_INFANTRY || rtti == RTTI_UNIT || rtti == RTTI_AIRCRAFT)
 		    && !Aeloria_HasValidMainDrawCache(obj)) {
-			g_AeloriaObjectLogMask.erase(key);
-			Aeloria_Debug_Log("PRODUCED_TECHNO_GRADUATE_DEFER this=%p owner=%d rtti=%d type_enum=%d frame=%u (retain stab until MAIN cache)",
-			                  (void*)obj, (int)obj->Owner(), (int)rtti, (int)stab.cachedTypeEnum, Frame);
-			return;
+			if (rtti == RTTI_INFANTRY && Aeloria_InfantryLayersExportReady(obj, stab)) {
+				// LAYERS-safe; drop stab maps (MAIN guards remain elsewhere until MAIN cache).
+			} else {
+				g_AeloriaObjectLogMask.erase(key);
+				Aeloria_Debug_Log("PRODUCED_TECHNO_GRADUATE_DEFER this=%p owner=%d rtti=%d type_enum=%d frame=%u (retain stab until MAIN cache)",
+				                  (void*)obj, (int)obj->Owner(), (int)rtti, (int)stab.cachedTypeEnum, Frame);
+				return;
+			}
 		}
 		if (aircraftBulkRetain) {
 			return;
@@ -7754,6 +7507,25 @@ static bool Aeloria_ResolveBulkPixelPos(const ObjectClass* obj, const AeloriaObj
 	}
 
 	return false;
+}
+
+static bool Aeloria_InfantryLayersExportReady(const ObjectClass* obj, const AeloriaObjectStability& stab)
+{
+	if (!obj || obj->What_Am_I() != RTTI_INFANTRY) {
+		return false;
+	}
+	if (!Aeloria_TechnoClassRawIsHealthy(reinterpret_cast<TechnoClass const*>(obj))) {
+		return false;
+	}
+	if (Aeloria_HasValidMainDrawCache(obj)) {
+		return true;
+	}
+	if (!stab.clientListInserted) {
+		return false;
+	}
+	int px = 0;
+	int py = 0;
+	return Aeloria_ResolveBulkPixelPos(obj, &stab, px, py);
 }
 
 static int Aeloria_FindObjectExportIndex(CNCObjectListStruct* list, const void* objPtr)
@@ -8164,10 +7936,14 @@ static bool Aeloria_IsFootLayerSustainCandidate(const ObjectClass* obj)
 	uintptr_t key = reinterpret_cast<uintptr_t>(obj);
 	// Produced war-factory units: defer foot sustain until tactical MAIN draw caches coords (5z-n5).
 	auto sIt = g_AeloriaObjectStability.find(key);
-	if (sIt != g_AeloriaObjectStability.end()
-	    && sIt->second.producedUnitUnlimboSeeded
-	    && !Aeloria_HasValidMainDrawCache(obj)) {
-		return false;
+	if (sIt != g_AeloriaObjectStability.end() && sIt->second.producedUnitUnlimboSeeded) {
+		if (rtti == RTTI_INFANTRY) {
+			if (!Aeloria_InfantryLayersExportReady(obj, sIt->second)) {
+				return false;
+			}
+		} else if (!Aeloria_HasValidMainDrawCache(obj)) {
+			return false;
+		}
 	}
 	// E.2.13i: refinery-spawned harvesters need MAIN cache before foot sustain (90bf63a9).
 	if (Aeloria_IsRepurposedHarvester(obj) && !Aeloria_HasValidMainDrawCache(obj)) {
@@ -8199,6 +7975,13 @@ static void Aeloria_SustainMissingFootLayerObjects(CNCObjectListStruct* list, in
 			return;
 		}
 		if (Aeloria_ObjectAlreadyInExportList(list, baseTotal + footAdded, obj)) {
+			return;
+		}
+		if (baseTotal >= AELORIA_LAYERS_CLIENT_CAP) {
+			if (Aeloria_TryReplaceLayersSlotAtCap(list, baseTotal, obj, exportLayer)) {
+				return;
+			}
+			Aeloria_LogLayersCapDrop("foot_sustain", baseTotal, footAdded, 1, obj);
 			return;
 		}
 		int idx = baseTotal + footAdded;
@@ -8750,7 +8533,7 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 							continue;
 						}
 					}
-					if (!replacedInPlaceAtCap && Aeloria_LayersWalkShouldSkipAtCap(ObjectList, TotalObjectCount, object)) {
+					if (!replacedInPlaceAtCap && Aeloria_LayersWalkShouldSkipAtCap(TotalObjectCount, object)) {
 						Aeloria_LogLayersCapDrop("layer_walk_skip", TotalObjectCount, 0, 1, object);
 						Aeloria_LogLayerExportSkip("Get_Layer_State_walk", "layers_cap_pre_draw", TotalObjectCount);
 						continue;
@@ -9106,7 +8889,9 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 				continue;
 			}
 
-			if (Aeloria_HasValidMainDrawCache(obj) && !aircraftSustainHandoff) {
+			if (!aircraftSustainHandoff
+			    && (Aeloria_HasValidMainDrawCache(obj)
+			        || (obj->What_Am_I() == RTTI_INFANTRY && Aeloria_InfantryLayersExportReady(obj, stab)))) {
 				// E.2.17: never graduate produced bad+8 ground/sea to legacy sustain handoff (07f79f8e).
 				if (!Aeloria_IsProducedBadPlus8Unit(obj) && !Aeloria_IsEternalSafeProducedUnit(obj)) {
 					Aeloria_GraduateTrackedObject(obj);
