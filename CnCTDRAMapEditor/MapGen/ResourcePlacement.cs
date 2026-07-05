@@ -1,5 +1,5 @@
 //
-// Ore / gem / mine placement — large clustered pockets (not single-cell scatter).
+// Ore / gem / mine placement — large clustered pockets (terrain-aware spawn clear).
 //
 using MobiusEditor.Model;
 using MobiusEditor.RedAlert;
@@ -60,11 +60,7 @@ namespace MobiusEditor.MapGen
             var candidates = new List<Point>();
             foreach (var p in EnumerateRect(bounds))
             {
-                if (IsNearAnySpawn(p, spawnTiles, options.SpawnClearRadius))
-                {
-                    continue;
-                }
-                if (!map.Metrics.GetCell(p, out _))
+                if (IsBlockedForPlacement(map, p, spawnTiles, options.SpawnClearRadius))
                 {
                     continue;
                 }
@@ -115,7 +111,7 @@ namespace MobiusEditor.MapGen
             while (oreCells.Count < target && guard++ < target * 4)
             {
                 var seed = candidates[random.Next(candidates.Count)];
-                if (IsNearAnySpawn(seed, spawnTiles, options.SpawnClearRadius))
+                if (IsBlockedForPlacement(map, seed, spawnTiles, options.SpawnClearRadius))
                 {
                     continue;
                 }
@@ -178,7 +174,7 @@ namespace MobiusEditor.MapGen
             while (queue.Count > 0 && placedInPatch < patchGoal && guard++ < 20000)
             {
                 var p = queue.Dequeue();
-                if (IsNearAnySpawn(p, spawnTiles, spawnClearRadius))
+                if (IsBlockedForPlacement(map, p, spawnTiles, spawnClearRadius))
                 {
                     continue;
                 }
@@ -238,7 +234,7 @@ namespace MobiusEditor.MapGen
                 {
                     continue;
                 }
-                if (IsNearAnySpawn(loc, spawnTiles, spawnClearRadius))
+                if (IsBlockedForPlacement(map, loc, spawnTiles, spawnClearRadius))
                 {
                     continue;
                 }
@@ -304,6 +300,20 @@ namespace MobiusEditor.MapGen
                 return;
             }
             map.Overlay[cell] = new Overlay { Type = gemType, Icon = 0 };
+        }
+
+        private static bool IsBlockedForPlacement(
+            Map map,
+            Point p,
+            IReadOnlyList<Point> spawnTiles,
+            int spawnClearRadius)
+        {
+            if (IsNearAnySpawn(p, spawnTiles, spawnClearRadius))
+            {
+                return true;
+            }
+
+            return TerrainPlacement.IsBlockedForResources(map, p);
         }
 
         private static bool IsNearAnySpawn(Point p, IReadOnlyList<Point> spawnTiles, int radius)

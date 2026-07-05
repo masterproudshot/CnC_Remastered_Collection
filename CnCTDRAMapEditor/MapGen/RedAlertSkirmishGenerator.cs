@@ -22,7 +22,7 @@ namespace MobiusEditor.MapGen
         public string SpawnLayout { get; set; } = MapGenSpawnLayouts.Corners8;
         public int Seed { get; set; } = 1;
         public int Players { get; set; } = 4;
-        public int MapSize { get; set; } = 64;
+        public int MapSize { get; set; } = MapGenRecipeValidation.DefaultMapSize;
         public double OreDensity { get; set; } = 0.72;
         public double GemDensity { get; set; } = 0.06;
         public int MineCount { get; set; } = 16;

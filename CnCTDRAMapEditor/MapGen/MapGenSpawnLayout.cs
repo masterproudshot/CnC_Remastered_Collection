@@ -1,5 +1,5 @@
 //
-// Spawn layout names, reference survey cells, and B1 placeholder resolution.
+// Spawn layout names, reference survey cells, and recipe default resolution.
 //
 using System;
 using System.Collections.Generic;
@@ -98,6 +98,22 @@ namespace MobiusEditor.MapGen
 
     public static class MapGenRecipeValidation
     {
+        public const int DefaultMapSize = 64;
+        public const int DefaultMapSize8Players = 126;
+
+        public static void ApplyDefaults(MapGenRecipe recipe)
+        {
+            if (recipe == null)
+            {
+                return;
+            }
+
+            if (recipe.Players == 8 && recipe.MapSize == DefaultMapSize)
+            {
+                recipe.MapSize = DefaultMapSize8Players;
+            }
+        }
+
         public static IList<string> ValidateAndResolve(MapGenRecipe recipe, out SpawnLayoutResolution resolution)
         {
             resolution = null;
@@ -107,6 +123,8 @@ namespace MobiusEditor.MapGen
                 errors.Add("Recipe is null.");
                 return errors;
             }
+
+            ApplyDefaults(recipe);
 
             if (recipe.Players < 2 || recipe.Players > 8)
             {
@@ -169,7 +187,7 @@ namespace MobiusEditor.MapGen
                         WaypointCount = waypointCount,
                         UsesReferenceCells = true,
                         ReferenceCells = MapGenSpawnLayouts.ReferenceOctagonOpen126,
-                        PlacementNote = "B1 placeholder: Octagon (Open) V1.4 reference cells (PR 11 refines)."
+                        PlacementNote = "Octagon (Open) V1.4 catalog cells (CUSTOM-MAPS-CATALOG.md)."
                     };
                 case MapGenSpawnLayouts.MiddleRoad:
                     return new SpawnLayoutResolution
@@ -178,7 +196,7 @@ namespace MobiusEditor.MapGen
                         WaypointCount = waypointCount,
                         UsesReferenceCells = true,
                         ReferenceCells = MapGenSpawnLayouts.ReferenceMiddleRoad126,
-                        PlacementNote = "B1 placeholder: Middle Road 2-6p reference cells (PR 11 refines)."
+                        PlacementNote = "Middle Road 2-6p catalog cells (CUSTOM-MAPS-CATALOG.md)."
                     };
                 default:
                     return new SpawnLayoutResolution

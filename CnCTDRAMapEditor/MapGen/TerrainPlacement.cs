@@ -36,6 +36,39 @@ namespace MobiusEditor.MapGen
             public int SpawnPadRadius { get; set; } = 5;
         }
 
+        /// <summary>True when ore/gems/mines must not be placed (water, cliff, trees, invalid cell).</summary>
+        public static bool IsBlockedForResources(Map map, Point p)
+        {
+            if (!map.Metrics.GetCell(p, out int cell))
+            {
+                return true;
+            }
+
+            var template = map.Templates[p];
+            if (template?.Type != null)
+            {
+                if ((template.Type.Flag & TemplateTypeFlag.Water) != 0)
+                {
+                    return true;
+                }
+
+                var name = template.Type.Name;
+                if (name.Length >= 2 &&
+                    (name.StartsWith("wc", StringComparison.Ordinal) ||
+                     name.StartsWith("rc", StringComparison.Ordinal)))
+                {
+                    return true;
+                }
+            }
+
+            if (map.Technos[cell] != null)
+            {
+                return true;
+            }
+
+            return false;
+        }
+
         public static void Apply(
             Map map,
             Random random,
