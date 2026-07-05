@@ -7720,7 +7720,27 @@ static bool Aeloria_ForceLayerExport(const ObjectClass* object)
 	return false;
 }
 
-// E.2.53/54: preview layer walk — E.2.46 retain only for tracked starting units, not all Map.Layer techno.
+// E.2.55: map-placed buildings in preview (8e4148ec unsafe_layer_obj skips — not in creation tracking).
+static bool Aeloria_IsPreviewMapBuildingLayerPtr(const ObjectClass* obj)
+{
+	if (!obj || !obj->IsActive || obj->IsInLimbo) {
+		return false;
+	}
+	if (!Aeloria_IsLiveSkirmishMapLoaded() || Aeloria_IsExplicitLiveSkirmishMatch()) {
+		return false;
+	}
+	if (obj->What_Am_I() != RTTI_BUILDING) {
+		return false;
+	}
+	uintptr_t key = reinterpret_cast<uintptr_t>(obj);
+	if (key < 0x10000) {
+		return false;
+	}
+	int owner = (int)obj->Owner();
+	return (owner >= 0 && owner < MAX_HOUSES);
+}
+
+// E.2.53/54/55: preview layer walk — tracked units + on-map buildings; never all Map.Layer techno.
 static bool Aeloria_IsPreviewLayerWalkObjectPtr(const ObjectClass* obj)
 {
 	if (!obj || !obj->IsActive || obj->IsInLimbo) {
@@ -7728,6 +7748,9 @@ static bool Aeloria_IsPreviewLayerWalkObjectPtr(const ObjectClass* obj)
 	}
 	if (!Aeloria_IsLiveSkirmishMapLoaded() || Aeloria_IsExplicitLiveSkirmishMatch()) {
 		return Aeloria_IsExportSafeObjectPtr(obj);
+	}
+	if (Aeloria_IsPreviewMapBuildingLayerPtr(obj)) {
+		return true;
 	}
 	uintptr_t key = reinterpret_cast<uintptr_t>(obj);
 	if (Aeloria_PreviewSkirmishTrackingRetain(key)) {
@@ -7772,7 +7795,7 @@ static bool Aeloria_ForcePreviewSkirmishLayerExport(const ObjectClass* object)
 	if (!object->IsActive || object->IsInLimbo) {
 		return false;
 	}
-	if (object->What_Am_I() == RTTI_BUILDING && Aeloria_IsExportSafeObjectPtr(object)) {
+	if (Aeloria_IsPreviewMapBuildingLayerPtr(object)) {
 		return true;
 	}
 	if (Aeloria_IsTrackedStartingUnit(object) || Aeloria_IsHumanDeployedBuilding(object)) {
