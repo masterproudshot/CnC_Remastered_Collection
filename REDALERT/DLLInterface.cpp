@@ -6386,9 +6386,54 @@ static bool Aeloria_LayersReplaceDrawIntoSlotAtCap(CNCObjectListStruct* list, in
 	return true;
 }
 
+// E.2.66: 0 = reshuffle every near-cap export (legacy); N = cadence for 480..511 only.
+static int s_layersLastReshuffleCount = -1;
+
+static int Aeloria_LayersReshuffleCadenceFrames()
+{
+	static int cached = -1;
+	if (cached < 0) {
+		char val[16] = {};
+		cached = 15;
+		if (GetEnvironmentVariableA("AELORIA_LAYERS_RESHUFFLE_CADENCE", val, sizeof(val)) > 0) {
+			cached = atoi(val);
+			if (cached < 0) {
+				cached = 15;
+			}
+		}
+	}
+	return cached;
+}
+
+static bool Aeloria_ShouldReshuffleLayersListAtCap(int count)
+{
+	if (count < AELORIA_LAYERS_NEAR_CAP_THRESHOLD || count > AELORIA_LAYERS_CLIENT_CAP) {
+		return false;
+	}
+	if (count >= AELORIA_LAYERS_CLIENT_CAP) {
+		return true;
+	}
+	const int cadence = Aeloria_LayersReshuffleCadenceFrames();
+	if (cadence == 0) {
+		return true;
+	}
+	if (count > s_layersLastReshuffleCount) {
+		return true;
+	}
+	if (cadence > 0 && (Frame % (unsigned)cadence) == 0) {
+		return true;
+	}
+	static unsigned s_lastReshuffleSkipLogFrame = 0;
+	if (s_lastReshuffleSkipLogFrame + 600 <= Frame) {
+		s_lastReshuffleSkipLogFrame = Frame;
+		Aeloria_Debug_Log("LAYERS_RESHUFFLE_SKIP reason=cadence frame=%u count=%d", Frame, count);
+	}
+	return false;
+}
+
 static void Aeloria_ReshuffleLayersListAtCap(CNCObjectListStruct* list, int count)
 {
-	if (!list || count < AELORIA_LAYERS_NEAR_CAP_THRESHOLD || count > AELORIA_LAYERS_CLIENT_CAP) {
+	if (!list || !Aeloria_ShouldReshuffleLayersListAtCap(count)) {
 		return;
 	}
 	if (!Aeloria_LayersSlotReplaceEnabled() || !Aeloria_LayersFairTrimEnabled()) {
@@ -6400,6 +6445,7 @@ static void Aeloria_ReshuffleLayersListAtCap(CNCObjectListStruct* list, int coun
 		return;
 	}
 	memcpy(list->Objects, s_reshuffleScratch, (size_t)writeIdx * sizeof(CNCObjectStruct));
+	s_layersLastReshuffleCount = count;
 }
 
 static void Aeloria_StripUnsafeDrawSlots(CNCObjectListStruct* list, int totalBase, int& drawCount, bool previewLayerWalk)
@@ -6441,8 +6487,16 @@ static void Aeloria_MaybeLogLayersNearCap(int count, const char* site, int total
 	static unsigned s_lastNearCapFrame = 0;
 	static int s_lastNearCapCount = -1;
 	static unsigned s_lastNearCapPinnedLogFrame = 0;
+	static unsigned s_rampNearCapLogFrame = 0;
 	if (s_lastNearCapFrame == Frame && s_lastNearCapCount == count) {
 		return;
+	}
+	// E.2.66: ramp 480..511 — at most one NEAR_CAP line per logic frame (cuts intercept_inc storms).
+	if (count < AELORIA_LAYERS_CLIENT_CAP) {
+		if (s_rampNearCapLogFrame == Frame) {
+			return;
+		}
+		s_rampNearCapLogFrame = Frame;
 	}
 	// E.2.61: pinned at 512 — log at most once per 600 frames unless count changed.
 	if (count >= AELORIA_LAYERS_CLIENT_CAP && count == s_lastNearCapCount
@@ -8051,6 +8105,35 @@ static bool Aeloria_ObjectNeedsBulkOrSustain(const ObjectClass* obj, AeloriaObje
 	return true;
 }
 
+// E.2.66: skip full sustain scan when no eligible entries (cached ~60 frames).
+static bool Aeloria_AnySustainReinsertPending()
+{
+	if (!Aeloria_MatchLayerExportAllowed() || g_AeloriaObjectStability.empty()) {
+		return false;
+	}
+	static size_t s_sustainCacheStabSize = 0;
+	static unsigned s_sustainCacheFrame = 0;
+	static bool s_sustainCachePending = false;
+	const size_t stabSize = g_AeloriaObjectStability.size();
+	if (stabSize == s_sustainCacheStabSize && Frame < s_sustainCacheFrame + 60) {
+		return s_sustainCachePending;
+	}
+	s_sustainCacheStabSize = stabSize;
+	s_sustainCacheFrame = Frame;
+	s_sustainCachePending = false;
+	for (auto& kv : g_AeloriaObjectStability) {
+		if (!Aeloria_IsObjectTrackingKeyUsable(kv.first)) {
+			continue;
+		}
+		const AeloriaObjectStability& stab = kv.second;
+		if (stab.earlySafeClientRegistered && stab.clientListInserted && !stab.sustainRetired) {
+			s_sustainCachePending = true;
+			break;
+		}
+	}
+	return s_sustainCachePending;
+}
+
 static bool Aeloria_AnyBulkWorkPending()
 {
 	if (!Aeloria_MatchLayerExportAllowed()) {
@@ -8843,7 +8926,7 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 		int sustainAdded = 0;
 		int sustainSkippedNormal = 0;
 		int sustainSkippedInactive = 0;
-		if (liveBulkExport) {
+		if (liveBulkExport && Aeloria_AnySustainReinsertPending()) {
 		const bool sustainCapReached = (_export_count >= AELORIA_SUSTAIN_MAX_LAYER_EXPORTS);
 		for (auto& kv : g_AeloriaObjectStability) {
 			uintptr_t k = kv.first;
