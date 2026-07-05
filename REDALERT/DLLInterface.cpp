@@ -779,6 +779,7 @@ static bool Aeloria_IsCriticalLogMessage(const char *fmt)
 		"DEAD_TRACKING_PRUNED",
 		"LAYERS_NEAR_CAP",
 		"LAYERS_CAP_DROP",
+		"LAYERS_TRIM_BAND",
 		"LAYER_EXPORT_SKIP",
 		"PREVIEW_SAFE_LAYER_EMIT",
 		"FACTORY_PROD_ASSET_FALLBACK",
@@ -6164,12 +6165,191 @@ static bool Aeloria_ProducedRotorMayBulkWithoutMainCache(const ObjectClass* obj,
 static const int AELORIA_LAYERS_CLIENT_CAP = 512;
 static const int AELORIA_LAYERS_NEAR_CAP_THRESHOLD = 480;
 
+static void Aeloria_LogLayersCapDrop(const char* site, int total, int draw, int dropped, const void* obj = nullptr);
+
 static bool Aeloria_LayersSlotRetainPriority(const ObjectClass* obj)
 {
 	if (!obj) {
 		return false;
 	}
 	return Aeloria_IsTrackedStartingUnit(obj) || Aeloria_IsHumanDeployedBuilding(obj);
+}
+
+// E.2.59: fair geographic trim under 512 cap (default on; AELORIA_LAYERS_FAIR_TRIM=0 reverts to E.2.49 trim).
+static bool Aeloria_LayersFairTrimEnabled()
+{
+	static int cached = -1;
+	if (cached < 0) {
+		char val[8] = {};
+		if (GetEnvironmentVariableA("AELORIA_LAYERS_FAIR_TRIM", val, sizeof(val)) > 0 && val[0] == '0') {
+			cached = 0;
+		} else {
+			cached = 1;
+		}
+	}
+	return cached != 0;
+}
+
+static int Aeloria_LayersObjectYThirdFromObject(const ObjectClass* obj)
+{
+	if (!obj) {
+		return 1;
+	}
+	CELL cell = Coord_Cell(obj->Render_Coord());
+	int relY = Cell_Y(cell) - Map.MapCellY;
+	int h = Map.MapCellHeight;
+	if (h < 1) {
+		h = 1;
+	}
+	if (relY < 0) {
+		relY = 0;
+	}
+	int third = (relY * 3) / h;
+	if (third > 2) {
+		third = 2;
+	}
+	return third;
+}
+
+static int Aeloria_LayersObjectYThirdFromSlot(const CNCObjectStruct& slot, const ObjectClass* obj)
+{
+	int relY = (int)slot.CellY - Map.MapCellY;
+	int h = Map.MapCellHeight;
+	if (h < 1) {
+		h = 1;
+	}
+	if (relY < 0) {
+		relY = 0;
+	}
+	int third = (relY * 3) / h;
+	if (third > 2) {
+		third = 2;
+	}
+	if (obj && third == 1 && slot.CellY == 0 && slot.CellX == 0) {
+		return Aeloria_LayersObjectYThirdFromObject(obj);
+	}
+	return third;
+}
+
+static bool Aeloria_LayersSlotRetainPriorityV2(const ObjectClass* obj)
+{
+	if (Aeloria_LayersSlotRetainPriority(obj)) {
+		return true;
+	}
+	if (!obj || !obj->IsActive || obj->IsInLimbo) {
+		return false;
+	}
+	if (g_HumanPlayerHouse != HOUSE_NONE && obj->Is_Techno() && obj->Owner() == g_HumanPlayerHouse) {
+		return true;
+	}
+	return false;
+}
+
+static void Aeloria_MaybeLogLayersTrimBand(const int keptByThird[3], const int droppedByThird[3])
+{
+	static unsigned s_lastBandFrame = 0;
+	if (s_lastBandFrame == Frame) {
+		return;
+	}
+	s_lastBandFrame = Frame;
+	for (int t = 0; t < 3; ++t) {
+		if (keptByThird[t] > 0 || droppedByThird[t] > 0) {
+			Aeloria_Debug_Log("LAYERS_TRIM_BAND y_third=%d kept=%d dropped=%d frame=%u",
+			                  t, keptByThird[t], droppedByThird[t], Frame);
+		}
+	}
+}
+
+static bool Aeloria_LayersWalkShouldSkipAtCap(CNCObjectListStruct* list, int totalCount, const ObjectClass* object)
+{
+	if (!Aeloria_LayersFairTrimEnabled() || totalCount < AELORIA_LAYERS_CLIENT_CAP || !list || !object) {
+		return totalCount >= AELORIA_LAYERS_CLIENT_CAP;
+	}
+	if (Aeloria_LayersSlotRetainPriorityV2(object)) {
+		return false;
+	}
+	int hist[3] = {0, 0, 0};
+	for (int i = 0; i < totalCount && i < AELORIA_LAYERS_CLIENT_CAP; ++i) {
+		const ObjectClass* o = static_cast<const ObjectClass*>(list->Objects[i].CNCInternalObjectPointer);
+		int t = Aeloria_LayersObjectYThirdFromObject(o);
+		++hist[t];
+	}
+	const int objThird = Aeloria_LayersObjectYThirdFromObject(object);
+	const int minTarget = max(8, totalCount / 9);
+	return hist[objThird] >= minTarget;
+}
+
+static int Aeloria_ClampLayersListFair(CNCObjectListStruct* list, int count)
+{
+	if (!list || count <= AELORIA_LAYERS_CLIENT_CAP) {
+		return count;
+	}
+	if (!Aeloria_LayersFairTrimEnabled()) {
+		return AELORIA_LAYERS_CLIENT_CAP;
+	}
+
+	static CNCObjectStruct s_fairClampScratch[AELORIA_LAYERS_CLIENT_CAP];
+	const int cap = AELORIA_LAYERS_CLIENT_CAP;
+
+	int priOrder[AELORIA_LAYERS_CLIENT_CAP];
+	int priN = 0;
+	int thirdList[3][AELORIA_LAYERS_CLIENT_CAP];
+	int thirdN[3] = {0, 0, 0};
+	int keptByThird[3] = {0, 0, 0};
+	int droppedByThird[3] = {0, 0, 0};
+
+	for (int i = 0; i < count; ++i) {
+		const ObjectClass* obj = static_cast<const ObjectClass*>(list->Objects[i].CNCInternalObjectPointer);
+		if (Aeloria_LayersSlotRetainPriorityV2(obj)) {
+			if (priN < cap) {
+				priOrder[priN++] = i;
+			}
+		} else {
+			int t = Aeloria_LayersObjectYThirdFromSlot(list->Objects[i], obj);
+			if (thirdN[t] < cap) {
+				thirdList[t][thirdN[t]++] = i;
+			}
+		}
+	}
+
+	int writeIdx = 0;
+	for (int p = 0; p < priN && writeIdx < cap; ++p) {
+		s_fairClampScratch[writeIdx++] = list->Objects[priOrder[p]];
+	}
+
+	int cursors[3] = {0, 0, 0};
+	while (writeIdx < cap) {
+		bool progress = false;
+		for (int t = 0; t < 3; ++t) {
+			if (cursors[t] < thirdN[t]) {
+				const int src = thirdList[t][cursors[t]++];
+				s_fairClampScratch[writeIdx++] = list->Objects[src];
+				++keptByThird[t];
+				progress = true;
+				if (writeIdx >= cap) {
+					break;
+				}
+			}
+		}
+		if (!progress) {
+			break;
+		}
+	}
+
+	for (int t = 0; t < 3; ++t) {
+		droppedByThird[t] = thirdN[t] - cursors[t];
+	}
+
+	memcpy(list->Objects, s_fairClampScratch, (size_t)writeIdx * sizeof(CNCObjectStruct));
+	if (writeIdx < cap) {
+		memset(list->Objects + writeIdx, 0, (size_t)(cap - writeIdx) * sizeof(CNCObjectStruct));
+	}
+
+	const int dropped = count - writeIdx;
+	Aeloria_LogLayersCapDrop("total_clamp_fair", count, 0, dropped);
+	Aeloria_MaybeLogLayersTrimBand(keptByThird, droppedByThird);
+
+	return writeIdx;
 }
 
 static void Aeloria_MaybeLogLayersNearCap(int count, const char* site, int total, int draw)
@@ -6188,7 +6368,7 @@ static void Aeloria_MaybeLogLayersNearCap(int count, const char* site, int total
 	                  count, site, total, draw, Frame);
 }
 
-static void Aeloria_LogLayersCapDrop(const char* site, int total, int draw, int dropped, const void* obj = nullptr)
+static void Aeloria_LogLayersCapDrop(const char* site, int total, int draw, int dropped, const void* obj)
 {
 	static unsigned s_lastDropFrame = 0;
 	static const char* s_lastDropSite = nullptr;
@@ -6206,23 +6386,8 @@ static void Aeloria_LogLayersCapDrop(const char* site, int total, int draw, int 
 	}
 }
 
-static void Aeloria_TrimDrawCountPreferRetain(CNCObjectListStruct* list, int totalBase, int& drawCount)
+static void Aeloria_TrimDrawCountPreferRetain_Legacy(CNCObjectListStruct* list, int totalBase, int& drawCount, int cap)
 {
-	const int cap = AELORIA_LAYERS_CLIENT_CAP - totalBase;
-	if (drawCount <= cap) {
-		if (totalBase + drawCount >= AELORIA_LAYERS_NEAR_CAP_THRESHOLD) {
-			Aeloria_MaybeLogLayersNearCap(totalBase + drawCount, "layer_walk_trim", totalBase, drawCount);
-		}
-		return;
-	}
-
-	if (!list) {
-		const int dropped = drawCount - cap;
-		Aeloria_LogLayersCapDrop("layer_walk_trim", totalBase, drawCount, dropped);
-		drawCount = cap;
-		return;
-	}
-
 	int writeIdx = 0;
 	for (int i = 0; i < drawCount && writeIdx < cap; ++i) {
 		CNCObjectStruct& slot = list->Objects[totalBase + i];
@@ -6246,11 +6411,113 @@ static void Aeloria_TrimDrawCountPreferRetain(CNCObjectListStruct* list, int tot
 		}
 		++writeIdx;
 	}
-
 	const int dropped = drawCount - writeIdx;
 	if (dropped > 0) {
-		memset(list->Objects + totalBase + writeIdx, 0, dropped * sizeof(CNCObjectStruct));
+		memset(list->Objects + totalBase + writeIdx, 0, (size_t)dropped * sizeof(CNCObjectStruct));
 		Aeloria_LogLayersCapDrop("layer_walk_trim", totalBase, drawCount, dropped);
+	}
+	drawCount = writeIdx;
+}
+
+static void Aeloria_TrimDrawCountPreferRetain(CNCObjectListStruct* list, int totalBase, int& drawCount)
+{
+	const int cap = AELORIA_LAYERS_CLIENT_CAP - totalBase;
+	if (drawCount <= cap) {
+		if (totalBase + drawCount >= AELORIA_LAYERS_NEAR_CAP_THRESHOLD) {
+			Aeloria_MaybeLogLayersNearCap(totalBase + drawCount, "layer_walk_trim", totalBase, drawCount);
+		}
+		return;
+	}
+
+	if (!list) {
+		const int dropped = drawCount - cap;
+		Aeloria_LogLayersCapDrop("layer_walk_trim", totalBase, drawCount, dropped);
+		drawCount = cap;
+		return;
+	}
+
+	if (!Aeloria_LayersFairTrimEnabled()) {
+		Aeloria_TrimDrawCountPreferRetain_Legacy(list, totalBase, drawCount, cap);
+		if (totalBase + drawCount >= AELORIA_LAYERS_NEAR_CAP_THRESHOLD) {
+			Aeloria_MaybeLogLayersNearCap(totalBase + drawCount, "layer_walk_trim", totalBase, drawCount);
+		}
+		return;
+	}
+
+	static CNCObjectStruct s_trimScratch[AELORIA_LAYERS_CLIENT_CAP];
+	const bool nearCap = (totalBase + drawCount >= AELORIA_LAYERS_NEAR_CAP_THRESHOLD);
+
+	int priOrder[AELORIA_LAYERS_CLIENT_CAP];
+	int priN = 0;
+	int thirdList[3][AELORIA_LAYERS_CLIENT_CAP];
+	int thirdN[3] = {0, 0, 0};
+	int keptByThird[3] = {0, 0, 0};
+	int droppedByThird[3] = {0, 0, 0};
+
+	for (int i = 0; i < drawCount; ++i) {
+		CNCObjectStruct& slot = list->Objects[totalBase + i];
+		const ObjectClass* obj = static_cast<const ObjectClass*>(slot.CNCInternalObjectPointer);
+		if (Aeloria_LayersSlotRetainPriorityV2(obj)) {
+			if (priN < cap) {
+				priOrder[priN++] = i;
+			}
+		} else {
+			int t = Aeloria_LayersObjectYThirdFromSlot(slot, obj);
+			if (thirdN[t] < cap) {
+				thirdList[t][thirdN[t]++] = i;
+			}
+		}
+	}
+
+	int writeIdx = 0;
+	for (int p = 0; p < priN && writeIdx < cap; ++p) {
+		s_trimScratch[writeIdx++] = list->Objects[totalBase + priOrder[p]];
+	}
+
+	if (nearCap) {
+		int cursors[3] = {0, 0, 0};
+		while (writeIdx < cap) {
+			bool progress = false;
+			for (int t = 0; t < 3; ++t) {
+				if (cursors[t] < thirdN[t]) {
+					const int src = thirdList[t][cursors[t]++];
+					s_trimScratch[writeIdx++] = list->Objects[totalBase + src];
+					++keptByThird[t];
+					progress = true;
+					if (writeIdx >= cap) {
+						break;
+					}
+				}
+			}
+			if (!progress) {
+				break;
+			}
+		}
+		for (int t = 0; t < 3; ++t) {
+			droppedByThird[t] = thirdN[t] - cursors[t];
+		}
+	} else {
+		for (int i = 0; i < drawCount && writeIdx < cap; ++i) {
+			CNCObjectStruct& slot = list->Objects[totalBase + i];
+			const ObjectClass* obj = static_cast<const ObjectClass*>(slot.CNCInternalObjectPointer);
+			if (Aeloria_LayersSlotRetainPriorityV2(obj)) {
+				continue;
+			}
+			s_trimScratch[writeIdx++] = slot;
+			int t = Aeloria_LayersObjectYThirdFromSlot(slot, obj);
+			++keptByThird[t];
+		}
+		for (int t = 0; t < 3; ++t) {
+			droppedByThird[t] = max(0, thirdN[t] - keptByThird[t]);
+		}
+	}
+
+	memcpy(list->Objects + totalBase, s_trimScratch, (size_t)writeIdx * sizeof(CNCObjectStruct));
+	const int dropped = drawCount - writeIdx;
+	if (dropped > 0) {
+		memset(list->Objects + totalBase + writeIdx, 0, (size_t)dropped * sizeof(CNCObjectStruct));
+		Aeloria_LogLayersCapDrop("layer_walk_trim", totalBase, drawCount, dropped);
+		Aeloria_MaybeLogLayersTrimBand(keptByThird, droppedByThird);
 	}
 	drawCount = writeIdx;
 	if (totalBase + drawCount >= AELORIA_LAYERS_NEAR_CAP_THRESHOLD) {
@@ -8183,7 +8450,7 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 					/*
 					** Call to Draw_It can result in multiple callbacks to the draw intercept.
 					*/
-					if (TotalObjectCount >= AELORIA_LAYERS_CLIENT_CAP) {
+					if (Aeloria_LayersWalkShouldSkipAtCap(ObjectList, TotalObjectCount, object)) {
 						Aeloria_LogLayersCapDrop("layer_walk_skip", TotalObjectCount, 0, 1, object);
 						Aeloria_LogLayerExportSkip("Get_Layer_State_walk", "layers_cap_pre_draw", TotalObjectCount);
 						continue;
@@ -8607,9 +8874,13 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 	Aeloria_SustainMissingFootLayerObjects(ObjectList, TotalObjectCount, LAYER_GROUND);
 
 	if (TotalObjectCount > AELORIA_LAYERS_CLIENT_CAP) {
-		const int dropped = TotalObjectCount - AELORIA_LAYERS_CLIENT_CAP;
-		Aeloria_LogLayersCapDrop("total_clamp", AELORIA_LAYERS_CLIENT_CAP, 0, dropped);
-		TotalObjectCount = AELORIA_LAYERS_CLIENT_CAP;
+		if (Aeloria_LayersFairTrimEnabled()) {
+			TotalObjectCount = Aeloria_ClampLayersListFair(ObjectList, TotalObjectCount);
+		} else {
+			const int dropped = TotalObjectCount - AELORIA_LAYERS_CLIENT_CAP;
+			Aeloria_LogLayersCapDrop("total_clamp", AELORIA_LAYERS_CLIENT_CAP, 0, dropped);
+			TotalObjectCount = AELORIA_LAYERS_CLIENT_CAP;
+		}
 	} else if (TotalObjectCount >= AELORIA_LAYERS_NEAR_CAP_THRESHOLD) {
 		Aeloria_MaybeLogLayersNearCap(TotalObjectCount, "total_finalize", TotalObjectCount, 0);
 	}
