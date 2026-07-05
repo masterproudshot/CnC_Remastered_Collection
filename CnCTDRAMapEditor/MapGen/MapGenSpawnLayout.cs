@@ -65,6 +65,13 @@ namespace MobiusEditor.MapGen
             2321, 2367, 2413, 8083, 8172, 13842, 13887, 13933
         };
 
+        /// <summary>CLI / recipe aliases accepted by TryNormalize (B4).</summary>
+        private static readonly Dictionary<string, string> Aliases = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            { "octagon8", OctagonOpen },
+            { "middle-road", MiddleRoad },
+        };
+
         public static bool TryNormalize(string value, out string normalized, out string error)
         {
             normalized = null;
@@ -76,10 +83,17 @@ namespace MobiusEditor.MapGen
             }
 
             var trimmed = value.Trim();
+            if (Aliases.TryGetValue(trimmed, out string alias))
+            {
+                normalized = alias;
+                return true;
+            }
+
             normalized = Known.FirstOrDefault(k => string.Equals(k, trimmed, StringComparison.OrdinalIgnoreCase));
             if (normalized == null)
             {
-                error = "Unknown SpawnLayout '" + value + "'. Known: " + string.Join(", ", Known) + ".";
+                error = "Unknown SpawnLayout '" + value + "'. Known: " + string.Join(", ", Known) +
+                        "; aliases: octagon8, middle-road.";
                 return false;
             }
 
