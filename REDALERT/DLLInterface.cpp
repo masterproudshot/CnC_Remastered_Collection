@@ -2224,11 +2224,14 @@ static bool Aeloria_IsObjectTrackingKeyUsable(uintptr_t key)
 static unsigned s_lateGameAvGuardLogBudget = 32;
 // E.2.53: layer-export visibility skips (do not consume AV guard budget).
 static unsigned s_layerExportSkipLogBudget = 48;
+// E.2.54: cap preview placeholder emits per Get_Layer_State (1a02369b frame-0 flood crash).
+static unsigned s_previewSafeEmitBudget = 64;
 
 static void Aeloria_ResetLayerExportDiagBudgets(void)
 {
 	s_lateGameAvGuardLogBudget = 32;
 	s_layerExportSkipLogBudget = 48;
+	s_previewSafeEmitBudget = 64;
 }
 
 static void Aeloria_LogLayerExportSkip(const char* site, const char* reason, uintptr_t key = 0)
@@ -7717,7 +7720,7 @@ static bool Aeloria_ForceLayerExport(const ObjectClass* object)
 	return false;
 }
 
-// E.2.53: preview layer walk — retain active techno on map without plausible Class* (E.2.46).
+// E.2.53/54: preview layer walk — E.2.46 retain only for tracked starting units, not all Map.Layer techno.
 static bool Aeloria_IsPreviewLayerWalkObjectPtr(const ObjectClass* obj)
 {
 	if (!obj || !obj->IsActive || obj->IsInLimbo) {
@@ -7726,10 +7729,35 @@ static bool Aeloria_IsPreviewLayerWalkObjectPtr(const ObjectClass* obj)
 	if (!Aeloria_IsLiveSkirmishMapLoaded() || Aeloria_IsExplicitLiveSkirmishMatch()) {
 		return Aeloria_IsExportSafeObjectPtr(obj);
 	}
-	if (obj->Is_Techno()) {
+	uintptr_t key = reinterpret_cast<uintptr_t>(obj);
+	if (Aeloria_PreviewSkirmishTrackingRetain(key)) {
 		return true;
 	}
-	return Is_Plausible_Class_Pointer(reinterpret_cast<uintptr_t>(obj));
+	return Aeloria_IsExportSafeObjectPtr(obj);
+}
+
+static bool Aeloria_IsPreviewSafeEmitCandidate(const ObjectClass* obj)
+{
+	if (!Aeloria_GuardExportObjectPtr(obj, "PreviewSafeEmit", "emit_candidate")) {
+		return false;
+	}
+	uintptr_t key = reinterpret_cast<uintptr_t>(obj);
+	if (Aeloria_PreviewSkirmishTrackingRetain(key)) {
+		return true;
+	}
+	if (Aeloria_IsTrackedStartingUnit(obj) || Aeloria_IsHumanDeployedBuilding(obj)) {
+		return true;
+	}
+	if (g_AeloriaObjectCreationFrame.find(key) != g_AeloriaObjectCreationFrame.end()) {
+		return true;
+	}
+	auto stabIt = g_AeloriaObjectStability.find(key);
+	if (stabIt != g_AeloriaObjectStability.end()) {
+		if (stabIt->second.scenarioStartUnlimbo || stabIt->second.producedUnitUnlimboSeeded) {
+			return true;
+		}
+	}
+	return false;
 }
 
 // E.2.53: loaded skirmish preview — export when IsDown flickers (MARK_UP) or tracked/production objects.
@@ -7744,7 +7772,7 @@ static bool Aeloria_ForcePreviewSkirmishLayerExport(const ObjectClass* object)
 	if (!object->IsActive || object->IsInLimbo) {
 		return false;
 	}
-	if (object->What_Am_I() == RTTI_BUILDING) {
+	if (object->What_Am_I() == RTTI_BUILDING && Aeloria_IsExportSafeObjectPtr(object)) {
 		return true;
 	}
 	if (Aeloria_IsTrackedStartingUnit(object) || Aeloria_IsHumanDeployedBuilding(object)) {
@@ -7776,7 +7804,10 @@ static bool Aeloria_TryAppendPreviewSafeLayerSlot(CNCObjectListStruct* list, int
 	if (!Aeloria_IsLiveSkirmishMapLoaded() || Aeloria_IsExplicitLiveSkirmishMatch()) {
 		return false;
 	}
-	if (!obj->IsActive || obj->IsInLimbo) {
+	if (s_previewSafeEmitBudget == 0) {
+		return false;
+	}
+	if (!Aeloria_IsPreviewSafeEmitCandidate(obj)) {
 		return false;
 	}
 	if (totalCount >= AELORIA_LAYERS_CLIENT_CAP) {
@@ -7795,14 +7826,24 @@ static bool Aeloria_TryAppendPreviewSafeLayerSlot(CNCObjectListStruct* list, int
 	}
 	CNCObjectStruct& slot = list->Objects[totalCount];
 	Aeloria_PopulateEarlyBulkSlot(slot, obj, exportLayer);
-	if (!Aeloria_IsValidBulkPixelPos(slot.PositionX, slot.PositionY)) {
+	if (slot.Type == UNKNOWN || slot.CNCInternalObjectPointer != obj) {
 		memset(&slot, 0, sizeof(slot));
 		return false;
 	}
+	if (slot.Owner < 0 || slot.Owner >= MAX_HOUSES) {
+		memset(&slot, 0, sizeof(slot));
+		return false;
+	}
+	if (!Aeloria_IsValidBulkPixelPos(slot.PositionX, slot.PositionY)
+	    || (slot.PositionX == 0 && slot.PositionY == 0)) {
+		memset(&slot, 0, sizeof(slot));
+		return false;
+	}
+	s_previewSafeEmitBudget--;
 	totalCount++;
 	list->Count = totalCount;
 	Aeloria_Debug_Log("PREVIEW_SAFE_LAYER_EMIT this=%p owner=%d reason=%s idx=%d pos=(%d,%d) frame=%u",
-	                  (void*)obj, (int)obj->Owner(), reason ? reason : "?", totalCount - 1,
+	                  (void*)obj, (int)slot.Owner, reason ? reason : "?", totalCount - 1,
 	                  (int)slot.PositionX, (int)slot.PositionY, Frame);
 	return true;
 }
@@ -7987,12 +8028,6 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 			                               ? Aeloria_IsPreviewLayerWalkObjectPtr(object)
 			                               : Aeloria_IsExportSafeObjectPtr(object);
 			if (!layerWalkSafe) {
-				if (object && previewLayerWalk && object->IsActive && !object->IsInLimbo) {
-					if (Aeloria_TryAppendPreviewSafeLayerSlot(ObjectList, TotalObjectCount, object, ExportLayer,
-					                                          buffer_size, "unsafe_layer_obj")) {
-						continue;
-					}
-				}
 				if (object) {
 					Aeloria_LogLayerExportSkip("Get_Layer_State_walk", "unsafe_layer_obj",
 					                           reinterpret_cast<uintptr_t>(object));
