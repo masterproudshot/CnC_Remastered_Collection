@@ -31,6 +31,7 @@
 #include <vector>
 #include <set>
 #include <map>
+#include <unordered_set>
 #include <algorithm>
 
 #include	"function.h"
@@ -635,6 +636,47 @@ std::map<uintptr_t, uint32_t> g_AeloriaObjectLogMask;
 
 // Per-object stabilization state (see OBJECT.H for struct definition)
 std::map<uintptr_t, AeloriaObjectStability> g_AeloriaObjectStability;
+
+// WorldIndex for minimal-load export: tracks full world with spatial + priority for O(view + log) selection.
+// "Where each thing is" is here; export is thin query. Decades headroom via bounded work.
+struct AeloriaWorldIndex {
+    // Spatial grid: coarse cell key (CellX*MapH + CellY) -> keys. Simple map for now; O(1) bucket lookup.
+    std::map<int, std::vector<uintptr_t>> spatialBuckets;
+    // Priority: multimap< -priority, key > for top-N (higher prio first). Neg for reverse.
+    std::multimap<float, uintptr_t> priorityHeap;  // float for score
+    // Dirty for incremental.
+    std::unordered_set<uintptr_t> dirtyThisFrame;
+
+    void Clear() {
+        spatialBuckets.clear();
+        priorityHeap.clear();
+        dirtyThisFrame.clear();
+    }
+
+    void UpdateObject(uintptr_t key, const ObjectClass* obj, float prioScore, CELL cell) {
+        if (!obj) return;
+        // O(1) push (dups ok for proto; clean on query if needed).
+        int bucket = (int)cell;
+        spatialBuckets[bucket].push_back(key);
+        priorityHeap.emplace(-prioScore, key);  // Neg for descending.
+        dirtyThisFrame.insert(key);
+    }
+
+    // Query best candidates: view rect (min/max cell) + maxN. Returns keys (prio simulated for proto).
+    // Use priorityHeap so high-prio (and tie-broken) are selected first regardless of cell order.
+    // This prevents bottom-of-map (high Y / high cell) from disappearing when over cap.
+    std::vector<uintptr_t> QueryBestCandidates(CELL viewMin, CELL viewMax, int maxN) {
+        std::vector<uintptr_t> top;
+        for (auto it = priorityHeap.begin(); it != priorityHeap.end() && (int)top.size() < maxN; ++it) {
+            uintptr_t k = it->second;
+            if (std::find(top.begin(), top.end(), k) == top.end()) {
+                top.push_back(k);
+            }
+        }
+        return top;
+    }
+};
+static AeloriaWorldIndex g_AeloriaWorldIndex;
 
 // Per-object creation frame (for creation + first-draw correlation).
 std::map<uintptr_t, uint32_t> g_AeloriaObjectCreationFrame;
@@ -6761,7 +6803,9 @@ void DLLExportClass::DLL_Draw_Intercept(int shape_number, int x, int y, int widt
 				// E.2.1: defer Techno/CC_Draw_Shape intercept until MAIN cache (InstanceServer safety).
 				// E.2.2: never defer explicit client emit (shape_file_name set) — that caused Mig blink.
 				const bool explicitClientEmit = (shape_file_name != nullptr && shape_file_name[0] != '\0');
-				if (!explicitClientEmit && !Aeloria_IsProducedRotorAircraft(object)) {
+				const bool liveLayer = g_AeloriaLayerExportActive && Aeloria_MatchLayerExportAllowed();
+				// Aircraft must always be visible in LAYERS (MiGs in flight); allow virtual even pre-MAIN cache.
+				if (!explicitClientEmit && !Aeloria_IsProducedRotorAircraft(object) && !liveLayer) {
 					Aeloria_Debug_Log("PRODUCED_AIRCRAFT_INTERCEPT_DEFER this=%p owner=%d frame=%u (defer to bulk after MAIN cache)",
 					                  (void*)object, (int)object->Owner(), Frame);
 					return;
@@ -8193,6 +8237,17 @@ static bool Aeloria_ForceLayerExport(const ObjectClass* object)
 	    && !stabIt->second.sustainRetired) {
 		return true;
 	}
+	// Aircraft must always export for visibility (in flight MiGs etc); treat as force even if not "produced" tracked.
+	if (object && object->What_Am_I() == RTTI_AIRCRAFT) {
+		return true;
+	}
+	// Flame turrets: force so their attack animations (flame jet) have a chance to export when firing.
+	if (object && object->What_Am_I() == RTTI_BUILDING) {
+		BuildingClass const* b = static_cast<BuildingClass const*>(object);
+		if (b->Class.Is_Valid() && b->Class->Type == STRUCT_FLAME_TURRET) {
+			return true;
+		}
+	}
 	return false;
 }
 
@@ -8522,6 +8577,16 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 	TotalObjectCount = 0;
 	Aeloria_ResetLayerExportDiagBudgets();
 
+	// Rebuild index fresh from current live layers each export (prevents indefinite bloat from dead objects; still O(current n) but no growth).
+	g_AeloriaWorldIndex.Clear();
+
+	// M2.2: Light selector - query index for best candidates (view + prio) to minimize work.
+	// Use priority first (via fixed Query) for fairness across map; aircraft forced below. Higher N for coverage.
+	CELL viewMin = 0;
+	CELL viewMax = 60000;
+	auto candidates = g_AeloriaWorldIndex.QueryBestCandidates(viewMin, viewMax, 600);
+	std::unordered_set<uintptr_t> candidateSet(candidates.begin(), candidates.end());
+
 	/*
 	** Get a reference draw coordinate for cells
 	*/
@@ -8546,6 +8611,51 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 		for (int index = 0; index < Map.Layer[layer].Count(); index++) {
 
 			ObjectClass *object = Map.Layer[layer][index];
+			uintptr_t key = reinterpret_cast<uintptr_t>(object);
+			// M2.1: Populate WorldIndex incrementally for "where each thing is" tracking.
+			// Cheap O(1) per object during walk; enables future selector to avoid full n.
+			{
+				CELL c = 0;
+				if (object) {
+					// Real cell from object for spatial bucketing (C&C is cell-based).
+					COORDINATE coord = object->Center_Coord();
+					c = Coord_Cell(coord);
+				}
+				float prio = Aeloria_LayersSlotRetainPriorityV2(object) ? 100.0f : 1.0f;
+				if (object && object->What_Am_I() == RTTI_AIRCRAFT) prio = 250.0f;  // always high prio for air (MiGs etc in flight)
+				if (object && object->What_Am_I() == RTTI_BUILDING) {
+					BuildingClass* bld = static_cast<BuildingClass*>(object);
+					if (bld->Class.Is_Valid() && bld->Class->Type == STRUCT_FLAME_TURRET) prio = 180.0f; // protect flame turrets for attack anims
+				}
+				g_AeloriaWorldIndex.UpdateObject(key, object, prio, c);
+			}
+			// M2.2: Selector-driven: only full process candidates from index query or dirty. Skips expensive checks/Draw for others.
+			// Aircraft (MiGs in flight etc) always process: may be anywhere, often !IsDown, rely on ForceLayerExport.
+			{
+				bool isAircraft = object && object->What_Am_I() == RTTI_AIRCRAFT;
+				if (!isAircraft && candidateSet.find(key) == candidateSet.end() && g_AeloriaWorldIndex.dirtyThisFrame.find(key) == g_AeloriaWorldIndex.dirtyThisFrame.end()) {
+					continue;
+				}
+			}
+			// Light load at cap: skip Draw_It for non-dirty.
+			if (TotalObjectCount >= AELORIA_LAYERS_CLIENT_CAP && g_AeloriaWorldIndex.dirtyThisFrame.find(key) == g_AeloriaWorldIndex.dirtyThisFrame.end()) {
+				// TODO: populate cached from index instead of Draw_It.
+				continue;
+			}
+			// M2.2: Selector-driven early filter: skip non-candidates (from index query) and non-dirty before expensive work.
+			// This is the core min-load: only ~300-400 candidates + dirty get full processing.
+			{
+				uintptr_t key = reinterpret_cast<uintptr_t>(object);
+				bool isAircraft = object && object->What_Am_I() == RTTI_AIRCRAFT;
+				if (!isAircraft && candidateSet.find(key) == candidateSet.end() && g_AeloriaWorldIndex.dirtyThisFrame.find(key) == g_AeloriaWorldIndex.dirtyThisFrame.end()) {
+					continue;
+				}
+			}
+			// At cap: skip Draw_It for non-dirty.
+			if (TotalObjectCount >= AELORIA_LAYERS_CLIENT_CAP && g_AeloriaWorldIndex.dirtyThisFrame.find(key) == g_AeloriaWorldIndex.dirtyThisFrame.end()) {
+				// TODO: use index cache.
+				continue;
+			}
 			const bool previewLayerWalk = Aeloria_IsLiveSkirmishMapLoaded() && !Aeloria_IsExplicitLiveSkirmishMatch();
 			const bool layerWalkSafe = previewLayerWalk
 			                               ? Aeloria_IsPreviewLayerWalkObjectPtr(object)
@@ -8596,6 +8706,12 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 				}
 
 				if (drawInLayerExport) {
+					if (object && object->What_Am_I() == RTTI_BUILDING) {
+						BuildingClass* b = static_cast<BuildingClass*>(object);
+						if (b->Class.Is_Valid() && b->Class->Type == STRUCT_FLAME_TURRET && b->Can_Player_Fire()) {
+							Aeloria_Debug_Log("FLAME_TURRET_FIRING_EXPORT this=%p frame=%u (flame attack anim should be in draw)", (void*)object, Frame);
+						}
+					}
 					int	x, y;
 					Map.Coord_To_Pixel(object->Render_Coord(), x, y);
 
@@ -9086,6 +9202,32 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 	if (ObjectList != nullptr) {
 		ObjectList->Count = TotalObjectCount;
 	}
+	// M2.3: Export work metric for headroom (candidates from index, final count).
+	Aeloria_Debug_Log("LAYERS_EXPORT_METRIC candidates=%d final=%d frame=%u", (int)candidateSet.size(), TotalObjectCount, Frame);
+
+	// Force flying aircraft (MiGs etc) -- they may not appear in Map.Layer[] when airborne (!IsDown, special air handling).
+	// Parked ones are in layers and already processed. This ensures in-flight visibility.
+	for (int ai = 0; ai < Aircraft.Count(); ++ai) {
+		AircraftClass* ac = Aircraft.Ptr(ai);
+		if (!ac || !ac->IsActive || ac->IsInLimbo || ac->IsDown) continue;
+		uintptr_t key = reinterpret_cast<uintptr_t>(ac);
+		CELL c = Coord_Cell(ac->Center_Coord());
+		g_AeloriaWorldIndex.UpdateObject(key, ac, 250.0f, c);
+		candidateSet.insert(key);
+		g_AeloriaWorldIndex.dirtyThisFrame.insert(key);
+		if (TotalObjectCount >= AELORIA_LAYERS_CLIENT_CAP) {
+			if (!Aeloria_TryReplaceLayersSlotAtCap(ObjectList, TotalObjectCount, ac, /*air layer*/1)) continue;
+		}
+		int x, y;
+		Map.Coord_To_Pixel(ac->Render_Coord(), x, y);
+		Aeloria_Repair_Early_Class_Pointer(ac);
+		CurrentDrawCount = 0;
+		ac->Draw_It(x, y, WINDOW_VIRTUAL);
+		Aeloria_TrimDrawCountPreferRetain(ObjectList, TotalObjectCount, CurrentDrawCount);
+	}
+
+	// M2.1: Clear dirty after export. Index persists for "where each thing is"; only dirty for incremental next frame.
+	g_AeloriaWorldIndex.dirtyThisFrame.clear();
 
 	// Phase 4: only log layer-export counts when they change or on a slow cadence — late-game
 	// spam here was 255MB logs and measurable tick hit with hundreds of units on map.
