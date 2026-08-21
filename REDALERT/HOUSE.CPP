@@ -6704,21 +6704,44 @@ void HouseClass::Tracking_Remove(TechnoClass const * techno)
 
 	int type;
 
+	/*
+	**	Every case below reads the type from Class_Of(), which dereferences the live Class. This runs
+	**	when objects are destroyed or sold -- including units killed mid-production, whose +8 is not
+	**	yet settled. Repair first, the way the draw paths do, then resolve the TYPE through
+	**	Aeloria_Safe_Techno_Type rather than skipping the bookkeeping.
+	**
+	**	Skipping was the original approach here and in Tracking_Add, and it was a mistake: these
+	**	counts are not cosmetic. They drive CurBuildings/BQuantity and, via Tracking_Add, the BScan
+	**	prerequisite mask that Can_Build() tests. Dropping either side also makes the two drift apart,
+	**	so a house can accumulate phantom inventory it can never clear.
+	*/
+	if (techno == NULL) return;
+	Aeloria_Repair_Early_Class_Pointer(const_cast<TechnoClass*>(techno));
+	TechnoTypeClass const * safeType = Aeloria_Safe_Techno_Type(techno);
+	if (safeType == NULL) {
+		if (Aeloria_ShouldLogOncePerObject(techno, AEL_LOG_REFUND_NO_HOUSE)) {
+			Aeloria_Debug_Log("TRACKING_REMOVE_SKIPPED this=%p RTTI=%d frame=%u (no safe type available)",
+			                  (void*)techno, (int)techno->What_Am_I(), Frame);
+		}
+		return;
+	}
+	ObjectTypeClass const & otype = *safeType;
+
 	switch (techno->What_Am_I()) {
 		case RTTI_BUILDING:
 			CurBuildings--;
-			BQuantity[((BuildingTypeClass const &)techno->Class_Of()).Type]--;
+			BQuantity[((BuildingTypeClass const &)otype).Type]--;
 			break;
 
 		case RTTI_AIRCRAFT:
 			CurAircraft--;
-			AQuantity[((AircraftTypeClass const &)techno->Class_Of()).Type]--;
+			AQuantity[((AircraftTypeClass const &)otype).Type]--;
 			break;
 
 		case RTTI_INFANTRY:
 			CurInfantry--;
 			if (!((InfantryClass *)techno)->IsTechnician) {
-				type = ((InfantryTypeClass const &)techno->Class_Of()).Type;
+				type = ((InfantryTypeClass const &)otype).Type;
 #ifdef FIXIT_CSII	//	checked - ajw 9/28/98
 				if (type >= INFANTRY_RA_COUNT) type -= INFANTRY_RA_COUNT;
 #endif
@@ -6728,7 +6751,7 @@ void HouseClass::Tracking_Remove(TechnoClass const * techno)
 
 		case RTTI_UNIT:
 			CurUnits--;
-			type = ((UnitTypeClass const &)techno->Class_Of()).Type;
+			type = ((UnitTypeClass const &)otype).Type;
 #ifdef FIXIT_CSII	//	checked - ajw 9/28/98
 			if (type >= UNIT_RA_COUNT) type -= UNIT_RA_COUNT;
 #endif
@@ -6737,7 +6760,7 @@ void HouseClass::Tracking_Remove(TechnoClass const * techno)
 
 		case RTTI_VESSEL:
 			CurVessels--;
-			type = ((VesselTypeClass const &)techno->Class_Of()).Type;
+			type = ((VesselTypeClass const &)otype).Type;
 #ifdef FIXIT_CSII	//	checked - ajw 9/28/98
 			if (type >= VESSEL_RA_COUNT) type -= VESSEL_RA_COUNT;
 #endif
@@ -6777,30 +6800,68 @@ void HouseClass::Tracking_Add(TechnoClass const * techno)
 	VesselType vessel;
 	int quant;
 
+	// Same hazard as Tracking_Remove: Class_Of() on a freshly unlimboed object with an unsettled +8.
+	if (techno == NULL) return;
+	Aeloria_Repair_Early_Class_Pointer(const_cast<TechnoClass*>(techno));
+	/*
+	**	This used to RETURN when the live Class was untrustworthy. That was wrong in a way that had
+	**	nothing to do with drawing: bailing out here removes the object from the house's inventory
+	**	entirely -- no CurBuildings/CurUnits, no BQuantity, and critically no BScan bit.
+	**
+	**	BScan is what HouseClass::Can_Build() tests for prerequisites (ActiveBScan for humans,
+	**	OldBScan for the AI, see the flags setup in Can_Build). Every human-placed building carries a
+	**	bad +8 (LEGACY_PLACE logs bad_at8=1 for all of them), so those buildings never registered --
+	**	the AI could not satisfy a single prerequisite and stopped constructing anything, and refinery
+	**	presence checks failed for harvester logic. 20 objects were dropped this way during scenario
+	**	setup alone (TRACKING_ADD_SKIPPED in the 16:21 log).
+	**
+	**	The fix is the same one used everywhere else in this fork: resolve the TYPE through
+	**	Aeloria_Safe_Techno_Type instead of dereferencing the live Class, and carry on. Only the
+	**	unsafe dereference needed avoiding, never the accounting.
+	*/
+	TechnoTypeClass const * safeType = Aeloria_Safe_Techno_Type(techno);
+	if (safeType == NULL) {
+		if (Aeloria_ShouldLogOncePerObject(techno, AEL_LOG_REFUND_NO_HOUSE)) {
+			Aeloria_Debug_Log("TRACKING_ADD_SKIPPED this=%p RTTI=%d frame=%u (no safe type available)",
+			                  (void*)techno, (int)techno->What_Am_I(), Frame);
+		}
+		return;
+	}
+	ObjectTypeClass const & otype = *safeType;
+
 	switch (techno->What_Am_I()) {
 		case RTTI_BUILDING:
 			CurBuildings++;
-			building = ((BuildingTypeClass const &)techno->Class_Of()).Type;
+			building = ((BuildingTypeClass const &)otype).Type;
 			BQuantity[building]++;
-			BScan |= (1L << building);
+			/*
+			**	BScan is a 32-bit unsigned long but StructType has 89 entries. Shifting by >= 32 is
+			**	undefined behaviour, and on x86 the count is masked to (building & 31) — so building a
+			**	Fake War Factory (index 32) set bit 0, which is STRUCTF_ADVANCED_TECH, falsely marking
+			**	the Tech Center as present and corrupting prerequisite checks. Walls and civilian
+			**	structures (37-78) alias onto other flags the same way.
+			*/
+			if ((unsigned)building < 32) {
+				BScan |= (1L << building);
+			}
 			if (Session.Type == GAME_INTERNET) {
-				BuildingTotals->Increment_Unit_Total(techno->Class_Of().ID);
+				BuildingTotals->Increment_Unit_Total(otype.ID);
 			}
 			break;
 
 		case RTTI_AIRCRAFT:
 			CurAircraft++;
-			aircraft = ((AircraftTypeClass const &)techno->Class_Of()).Type;
+			aircraft = ((AircraftTypeClass const &)otype).Type;
 			AQuantity[aircraft]++;
 			AScan |= (1L << aircraft);
 			if (Session.Type == GAME_INTERNET) {
-				AircraftTotals->Increment_Unit_Total(techno->Class_Of().ID);
+				AircraftTotals->Increment_Unit_Total(otype.ID);
 			}
 			break;
 
 		case RTTI_INFANTRY:
 			CurInfantry++;
-			infantry = ((InfantryTypeClass const &)techno->Class_Of()).Type;
+			infantry = ((InfantryTypeClass const &)otype).Type;
 			if (!((InfantryClass *)techno)->IsTechnician) {
 #ifdef FIXIT_CSII	//	checked - ajw 9/28/98
 				quant = infantry;
@@ -6809,8 +6870,8 @@ void HouseClass::Tracking_Add(TechnoClass const * techno)
 #else
 				IQuantity[infantry]++;
 #endif
-				if (!((InfantryTypeClass const &)techno->Class_Of()).IsCivilian && Session.Type == GAME_INTERNET) {
-					InfantryTotals->Increment_Unit_Total(techno->Class_Of().ID);
+				if (!((InfantryTypeClass const &)otype).IsCivilian && Session.Type == GAME_INTERNET) {
+					InfantryTotals->Increment_Unit_Total(otype.ID);
 				}
 				IScan |= (1L << infantry);
 			}
@@ -6818,7 +6879,7 @@ void HouseClass::Tracking_Add(TechnoClass const * techno)
 
 		case RTTI_UNIT:
 			CurUnits++;
-			unit = ((UnitTypeClass const &)techno->Class_Of()).Type;
+			unit = ((UnitTypeClass const &)otype).Type;
 #ifdef FIXIT_CSII	//	checked - ajw 9/28/98
 			quant = unit;
 			if (quant >= UNIT_RA_COUNT) quant -= UNIT_RA_COUNT;
@@ -6828,13 +6889,13 @@ void HouseClass::Tracking_Add(TechnoClass const * techno)
 #endif
 			UScan |= (1L << unit);
 			if (Session.Type == GAME_INTERNET) {
-				UnitTotals->Increment_Unit_Total(techno->Class_Of().ID);
+				UnitTotals->Increment_Unit_Total(otype.ID);
 			}
 			break;
 
 		case RTTI_VESSEL:
 			CurVessels++;
-			vessel = ((VesselTypeClass const &)techno->Class_Of()).Type;
+			vessel = ((VesselTypeClass const &)otype).Type;
 #ifdef FIXIT_CSII	//	checked - ajw 9/28/98
 			quant = vessel;
 			if (quant >= VESSEL_RA_COUNT) quant -= VESSEL_RA_COUNT;
@@ -6844,7 +6905,7 @@ void HouseClass::Tracking_Add(TechnoClass const * techno)
 #endif
 			VScan |= (1L << vessel);
 			if (Session.Type == GAME_INTERNET) {
-				VesselTotals->Increment_Unit_Total(techno->Class_Of().ID);
+				VesselTotals->Increment_Unit_Total(otype.ID);
 			}
 			break;
 

@@ -2385,10 +2385,17 @@ bool CellClass::Goodie_Check(FootClass * object)
 			**	If the powerup is money but there is insufficient money to build a refinery but there is a construction
 			**	yard available, then force the money to be enough to rebuild the refinery.
 			*/
-			if (powerup == CRATE_MONEY && (object->House->BScan & (STRUCTF_CONST|STRUCTF_REFINERY)) == STRUCTF_CONST &&
-						object->House->Available_Money() < BuildingTypeClass::As_Reference(STRUCT_REFINERY).Cost * object->House->CostBias) {
+			/*
+			**	Resolve House once instead of dereferencing the CCPtr four times across a
+			**	short-circuit chain. operator-> yields NULL for a stale id (the Release bounds
+			**	assert is compiled out), and the optimizer is free to hoist the CostBias load
+			**	above the BScan test, so a bad House faults here at offsetof(CostBias) == 0x1E.
+			*/
+			HouseClass * ohouse = object->House;
+			if (powerup == CRATE_MONEY && ohouse != NULL && (ohouse->BScan & (STRUCTF_CONST|STRUCTF_REFINERY)) == STRUCTF_CONST &&
+						ohouse->Available_Money() < BuildingTypeClass::As_Reference(STRUCT_REFINERY).Cost * ohouse->CostBias) {
 
-				force_money = BuildingTypeClass::As_Reference(STRUCT_REFINERY).Cost * object->House->CostBias;
+				force_money = BuildingTypeClass::As_Reference(STRUCT_REFINERY).Cost * ohouse->CostBias;
 			}
 
 			/*

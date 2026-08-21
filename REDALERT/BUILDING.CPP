@@ -533,8 +533,21 @@ void BuildingClass::Draw_It(int x, int y, WindowNumberType window) const
 	/*
 	**	Early-out if the Class pointer is not yet valid (can happen very early
 	**	during scenario load before TypeClasses are fully constructed).
+	**
+	**	Inlined from Is_Drawable() so the shape pointer is fetched ONCE. This is the same test in the
+	**	same order (Class_Is_Valid first, then a non-null image), but Draw_It used to call
+	**	Get_Image_Data() four times -- here, in Aeloria_ClientDrawDims, in Aeloria_ClampClientShape and
+	**	again for the shapefile. It is not a cheap accessor: each call is a virtual dispatch that runs
+	**	Is_Techno(), Aeloria_LiveClassTrustworthy() (another virtual plus the +8 probe), possibly
+	**	Aeloria_Safe_Techno_Type() with its map lookups, and finally a virtual Class_Of().
+	**
+	**	An ETW profile put ObjectClass::Get_Image_Data at ~24% of the whole layer walk, and
+	**	BuildingClass::Draw_It at 2379 samples -- more than units, infantry, vessels and aircraft
+	**	combined. The value cannot change mid-draw, so fetching it once is free correctness.
 	*/
-	if (!Is_Drawable(this)) return;
+	if (!Class_Is_Valid()) return;
+	void const * const cached_image_data = Get_Image_Data();
+	if (cached_image_data == NULL) return;
 
 	uintptr_t at_plus_8 = *(uintptr_t*)((const char*)this + 8);
 	const bool bad_plus_8 = !Is_Plausible_Class_Pointer(at_plus_8);
@@ -554,7 +567,12 @@ void BuildingClass::Draw_It(int x, int y, WindowNumberType window) const
 			if (drawW <= 0) drawW = 48;
 			if (drawH <= 0) drawH = 48;
 		}
-		int shapenum = Shape_Number();
+		// Buildings were the one class my ClientDrawDims sweep missed. Dimensions() is the tile
+		// footprint, not the sprite — roof overhangs and smoke stacks get clipped without this.
+		Aeloria_ClientDrawDims(cached_image_data, drawW, drawH);
+		// Clamp against the sprite's real frame count: an index past the end is dropped by the
+		// client, which shows up as a building that is exported but never rendered.
+		int shapenum = Aeloria_ClampClientShape(this, cached_image_data, Shape_Number());
 		DLL_Draw_Intercept(shapenum, x, y, drawW, drawH, AELORIA_CLIENT_DRAW_FLAGS_CENTER, const_cast<BuildingClass*>(this), DIR_N, 0x100, nullptr, (char)Owner());
 		// 5z-l: WEAP2 roof/door overlay — legacy path skipped for human MCV / safe buildings.
 		if (BState != BSTATE_CONSTRUCTION
@@ -578,8 +596,7 @@ void BuildingClass::Draw_It(int x, int y, WindowNumberType window) const
 		**	The shape file to use for rendering depends on whether the building
 		**	is undergoing construction or not.
 		*/
-		void const * shapefile = Get_Image_Data();
-		if (shapefile == NULL) return;
+		void const * shapefile = cached_image_data;
 
 		/*
 		**	Actually draw the building shape.
@@ -6192,10 +6209,18 @@ void const * BuildingClass::Get_Image_Data(void) const
 	if (BState == BSTATE_CONSTRUCTION) {
 		Aeloria_Repair_Early_Class_Pointer(const_cast<BuildingClass*>(this));
 		BuildingTypeClass const* safe = Aeloria_Building_Safe_Type(this);
-		if (safe) {
-			return safe->Get_Buildup_Data();
+		/*
+		**	Structures without buildup art (walls, civilian buildings) return NULL here, which makes
+		**	Is_Drawable() fail and the building undrawable for the whole construction phase. Fall
+		**	through to the normal image instead of handing NULL back.
+		*/
+		void const * buildup = safe ? safe->Get_Buildup_Data() : NULL;
+		if (buildup == NULL && Class.Is_Valid()) {
+			buildup = Class->Get_Buildup_Data();
 		}
-		return Class->Get_Buildup_Data();
+		if (buildup != NULL) {
+			return buildup;
+		}
 	}
 	return(TechnoClass::Get_Image_Data());
 }

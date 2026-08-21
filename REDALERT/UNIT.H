@@ -157,10 +157,10 @@ class UnitClass :	public DriveClass
 		*/
 		virtual ObjectTypeClass const & Class_Of(void) const;
 		bool Class_Is_Valid(void) const override {
-			if (!Class.Is_Valid() || Class.Raw() <= 0) return false;
+			if (!Class.Is_Valid() || Class.Raw() < 0) return false;
 			const UnitTypeClass* t = Class;
 			if (!t) return false;
-			if (t->RTTI != RTTI_UNITTYPE || t->MaxStrength <= 0) return false;
+			if (t->RTTI != RTTI_UNITTYPE) return false;
 
 			/*
 			**	Project Aeloria — TEMPORARY BAND-AID (see Is_Plausible_Class_Pointer in OBJECT.H

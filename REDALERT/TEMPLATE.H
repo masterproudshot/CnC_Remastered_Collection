@@ -61,7 +61,12 @@ class TemplateClass : public ObjectClass
 		TemplateClass(TemplateType type, CELL pos=-1);
 		TemplateClass(NoInitClass const & x) : ObjectClass(x), Class(x) {};
 		virtual ~TemplateClass(void) {if (GameActive) TemplateClass::Limbo();Class=0;};
-		operator TemplateType(void) const {return Class->Type;};
+		// Null-safe like UnitClass/VesselClass: a raw Class->Type deref makes every caller
+		// (Shape_Number, draw guards) unsafe on an object with an unsettled +8.
+		operator TemplateType(void) const {
+			TemplateTypeClass const* t = Class;
+			return t ? t->Type : TEMPLATE_NONE;
+		};
 
 		static void Init(void);
 

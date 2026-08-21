@@ -60,7 +60,12 @@ class OverlayClass : public ObjectClass
 		OverlayClass(OverlayType type, CELL pos=-1, HousesType = HOUSE_NONE);
 		OverlayClass(NoInitClass const & x) : ObjectClass(x), Class(x) {};
 		virtual ~OverlayClass(void) {if (GameActive) OverlayClass::Limbo();Class=0;};
-		operator OverlayType(void) const {return Class->Type;};
+		// Null-safe like UnitClass/VesselClass: a raw Class->Type deref makes every caller
+		// (Shape_Number, draw guards) unsafe on an object with an unsettled +8.
+		operator OverlayType(void) const {
+			OverlayTypeClass const* t = Class;
+			return t ? t->Type : OVERLAY_NONE;
+		};
 
 		static void Init(void);
 

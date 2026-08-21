@@ -61,7 +61,12 @@ class SmudgeClass : public ObjectClass
 		static void operator delete(void *ptr);
 		SmudgeClass(SmudgeType type, COORDINATE pos=0xFFFFFFFFUL, HousesType house = HOUSE_NONE);
 		SmudgeClass(NoInitClass const & x) : ObjectClass(x), Class(x) {};
-		operator SmudgeType(void) const {return Class->Type;};
+		// Null-safe like UnitClass/VesselClass: a raw Class->Type deref makes every caller
+		// (Shape_Number, draw guards) unsafe on an object with an unsettled +8.
+		operator SmudgeType(void) const {
+			SmudgeTypeClass const* t = Class;
+			return t ? t->Type : SMUDGE_NONE;
+		};
 		virtual ~SmudgeClass(void) {if (GameActive) SmudgeClass::Limbo();Class=0;};
 
 		static void Init(void);

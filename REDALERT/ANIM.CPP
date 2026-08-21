@@ -253,9 +253,14 @@ void AnimClass::Draw_It(int x, int y, WindowNumberType window) const
 	*/
 	if (!Is_Drawable(this)) return;
 
-	Aeloria_Debug_Log("Anim guard passed this=%p Class.Raw=%ld - proceeding to draw", (void*)this, Class.Raw());
-
-	Aeloria_Debug_Log("Anim about to access Class->VirtualAnim this=%p Class.Raw=%ld", (void*)this, Class.Raw());
+	// These fired unconditionally for EVERY animation EVERY frame, and Aeloria_Debug_Log flushes
+	// per line — thousands of synchronous writes per second during any sizeable battle.
+	if (g_AeloriaEnableVerboseDrawLogs && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_GUARD_PASSED)) {
+		Aeloria_Debug_Log("Anim guard passed this=%p Class.Raw=%ld - proceeding to draw", (void*)this, Class.Raw());
+	}
+	if (g_AeloriaEnableVerboseDrawLogs && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_GET_IMAGE_DATA)) {
+		Aeloria_Debug_Log("Anim about to access Class->VirtualAnim this=%p Class.Raw=%ld", (void*)this, Class.Raw());
+	}
 	bool render_legacy = !IsInvisible && (Class->VirtualAnim == ANIM_NONE || window != WINDOW_VIRTUAL);
 	bool render_virtual = Target_Legal(VirtualAnimTarget) && window == WINDOW_VIRTUAL;
 

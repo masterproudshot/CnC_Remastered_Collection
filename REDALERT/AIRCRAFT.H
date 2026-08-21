@@ -57,7 +57,12 @@ class AircraftClass : public FootClass, public FlyClass
 		static void * operator new(size_t);
 		static void * operator new(size_t, void * ptr) {return(ptr);};
 		static void operator delete(void *);
-		operator AircraftType(void) const {return Class->Type;};
+		// Null-safe like UnitClass/VesselClass: a raw Class->Type deref makes every caller
+		// (Shape_Number, draw guards) unsafe on an object with an unsettled +8.
+		operator AircraftType(void) const {
+			AircraftTypeClass const* t = Class;
+			return t ? t->Type : AIRCRAFT_NONE;
+		};
 		AircraftClass(AircraftType classid, HousesType house);
 		AircraftClass(NoInitClass const & x) : FootClass(x), FlyClass(x), Class(x), SecondaryFacing(x), SightTimer(x) {};
 		virtual ~AircraftClass(void);
@@ -90,10 +95,10 @@ class AircraftClass : public FootClass, public FlyClass
 		virtual MoveType Can_Enter_Cell(CELL cell, FacingType facing=FACING_NONE) const;
 		virtual ObjectTypeClass const & Class_Of(void) const {return *Class;};
 		bool Class_Is_Valid(void) const override {
-			if (!Class.Is_Valid() || Class.Raw() <= 0) return false;
+			if (!Class.Is_Valid() || Class.Raw() < 0) return false;
 			const AircraftTypeClass* t = Class;
 			if (!t) return false;
-			if (t->RTTI != RTTI_AIRCRAFTTYPE || t->MaxStrength <= 0) return false;
+			if (t->RTTI != RTTI_AIRCRAFTTYPE) return false;
 
 			/*
 			**	Project Aeloria — TEMPORARY BAND-AID (see Is_Plausible_Class_Pointer in OBJECT.H
@@ -107,7 +112,11 @@ class AircraftClass : public FootClass, public FlyClass
 				sprintf(_buf, "REJECTED Class_Is_Valid this=%p RTTI=%d Class.Raw=%d at+8=0x%08X\r\n",
 				        this, What_Am_I(), Class.Raw(), (unsigned)effective);
 				OutputDebugStringA(_buf);
-				return false;
+				// Tactical relaxation, matching UnitClass and BuildingClass. Is_Drawable() calls this,
+				// and Draw_It bails on its first line when it fails — so returning false here made any
+				// aircraft with a stale +8 peek undrawable outright: no export, no radar, nothing. The
+				// checks above already validate the real type through the CCPtr heap id.
+				return true;
 			}
 
 			return true;

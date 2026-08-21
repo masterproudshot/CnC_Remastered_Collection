@@ -390,6 +390,23 @@ extern std::map<uintptr_t, uint32_t> g_AeloriaObjectCreationFrame;
 // stats line fully intact.
 // Default true so diagnosis builds stay chatty; set to false for clean play.
 extern bool g_AeloriaEnableVerboseDrawLogs;
+// Per-export Best_Object_Action call count, reported on the EXPORT_CENSUS diagnostic line.
+extern long g_AeloriaBestActionCalls;
+/*
+**	Projectile/animation export probe. Bullets and anims reach the layer walk healthy
+**	(EXPORT_CENSUS: seen=12 eligible=12 noimage=0) yet produce ZERO type=6/type=7 rows, so the draw
+**	is dropped somewhere between BulletClass/AnimClass::Draw_It and DLL_Draw_Intercept. Every
+**	per-object log on that path is suppressed by Aeloria_ShouldLogVerbose after frame 600, so these
+**	unsuppressed counters record which exit is taken. Reset and reported per export.
+*/
+extern long g_AeloriaFxProbeEnter;        // CC_Draw_Shape entered with a bullet or anim
+extern long g_AeloriaFxProbeGraceDrop;    // dropped by the early-load-grace bad-shape guard
+extern long g_AeloriaFxProbePlus8Drop;    // dropped by the +8 plausible-pointer hard reject
+extern long g_AeloriaFxProbeIntercept;    // reached DLL_Draw_Intercept (i.e. actually exported)
+// Time spent inside DLL_Draw_Intercept per export, reported on the EXPORT_CENSUS line.
+extern long long g_AeloriaInterceptTicks;
+extern long g_AeloriaInterceptCalls;
+
 // infantry-scale Phase 2: skip stability/creation maps for healthy barracks-produced infantry.
 extern bool g_AeloriaZeroMapProducedInfantry;
 // infantry-scale Phase 3b: stateless client intercept for untracked techno with healthy Class.Raw().
@@ -419,6 +436,8 @@ enum AeloriaLogTag {
 	AEL_LOG_ACCESSORY_DRAW  = 18,     // Phase 5z-l: once per accessory sub-draw (WEAP2, turrets)
 	AEL_LOG_PLACEHOLDER_ENTER = 19,   // Phase 5z-n9 PR4: once per DrawSafePlaceholder entry
 	AEL_LOG_PLACEHOLDER_MARKER = 20,  // Phase 5z-n9 PR4: once per yellow visibility marker log
+	AEL_LOG_REFUND_NO_HOUSE = 21,     // once per object: Refund_Amount hit an unresolvable House
+	AEL_LOG_SHAPENUM_OUT_OF_RANGE = 22, // once per object: frame index past the shape file's frame count
 	// Room for more
 	AEL_LOG_MAX = 31
 };
@@ -737,6 +756,26 @@ void Aeloria_DrawAccessoryIntercept(const ObjectClass* obj, int shapenum, int x,
 **	signature. Uses Is_ prefix per project STYLE.H convention for boolean queries.
 **	Placed here (not TechnoClass) for full coverage including TerrainClass.
 */
+/*
+**	Project Aeloria — STRICT counterpart to Class_Is_Valid().
+**
+**	Class_Is_Valid() is deliberately RELAXED: all eight overrides return true even when the runtime
+**	+8 peek is implausible, so that Is_Drawable() lets a suspect object through to the guarded draw
+**	paths instead of making it silently undrawable. That makes it a DRAWABILITY gate and nothing
+**	more — it does NOT mean the live Class member is safe to dereference.
+**
+**	Use this instead anywhere the decision is "can I touch Class_Of() / the live Class?". Mixing the
+**	two is what put a corrupt-+8 destroyer into Class_Of() and produced a call through a null vtable
+**	slot (EIP=0, ECX=the vessel).
+*/
+inline bool Aeloria_LiveClassTrustworthy(const ObjectClass * obj)
+{
+	if (obj == NULL) return false;
+	if (!obj->Class_Is_Valid()) return false;
+	uintptr_t const effective = *(uintptr_t*)((const char*)obj + 8);
+	return Is_Plausible_Class_Pointer(effective);
+}
+
 template<class T>
 inline bool Is_Drawable(const T * obj)
 {

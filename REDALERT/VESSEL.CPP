@@ -368,9 +368,15 @@ int VesselClass::Shape_Number(void) const
 static int Aeloria_GuardedVesselShapeNumber(const VesselClass* vessel)
 {
 	if (!vessel) {
-		return UnitClass::BodyShape[16];
+		return UnitClass::BodyShape[Dir_To_16((DirType)0) * 2] >> 1;
 	}
-	return UnitClass::BodyShape[Dir_To_32(vessel->PrimaryFacing)];
+	/*
+	**	Must match VesselClass::Shape_Number's quantization. Hulls have SIXTEEN facings
+	**	(BodyShape[Dir_To_16(...)*2] >> 1); using the 32-facing form produced a frame index up to
+	**	twice too high, so a guarded vessel drew the wrong hull facing. Turrets are separate and DO
+	**	use 32 facings — do not unify them.
+	*/
+	return UnitClass::BodyShape[Dir_To_16(vessel->PrimaryFacing) * 2] >> 1;
 }
 
 static void Aeloria_LogProducedVesselFirstDrawIfNeeded(const VesselClass* vessel, WindowNumberType window,
@@ -466,7 +472,10 @@ void VesselClass::Draw_It(int x, int y, WindowNumberType window) const
 	**	Early-out if the Class pointer is not yet valid (can happen very early
 	**	during scenario load before TypeClasses are fully constructed).
 	*/
-	if (!Is_Drawable(this)) return;
+	// Inlined from Is_Drawable() to fetch the shape pointer once -- see BuildingClass::Draw_It.
+	if (!Class_Is_Valid()) return;
+	void const * const cached_image_data = Get_Image_Data();
+	if (cached_image_data == NULL) return;
 
 	VesselTypeClass const* vessel_type = static_cast<VesselTypeClass const*>(Aeloria_Safe_Techno_Type(this));
 	if (vessel_type == nullptr) return;
@@ -476,6 +485,9 @@ void VesselClass::Draw_It(int x, int y, WindowNumberType window) const
 	vessel_type->Dimensions(drawW, drawH);
 	if (drawW <= 0) drawW = 48;
 	if (drawH <= 0) drawH = 48;
+	// Real frame size for the client rect — Dimensions() is the selection box and leaves ships
+	// small enough to read as missing.
+	Aeloria_ClientDrawDims(cached_image_data, drawW, drawH);
 
 	uintptr_t at_plus_8 = *(uintptr_t*)((const char*)this + 8);
 	bool bad_plus_8 = !Is_Plausible_Class_Pointer(at_plus_8);
@@ -491,15 +503,35 @@ void VesselClass::Draw_It(int x, int y, WindowNumberType window) const
 
 	if (window == WINDOW_VIRTUAL) {
 		Aeloria_LogProducedVesselFirstDrawIfNeeded(this, window, guardedFlag, bad_plus_8 ? 1 : 0);
-		int virtualShape = 0;
-		if (producedTracked) {
-			virtualShape = 0;
-		} else if (producedBadPlus8 || needsMainGuard) {
+		/*
+		**	The live-Class check must win over producedTracked. The shape-0 rule exists to match the
+		**	WF/shipyard unlimbo seed, but it never expires — a shipyard-built destroyer kept
+		**	exporting ShapeIndex 0 for its whole life, which is why ships were invisible even once
+		**	they were correctly typed and sized in the client list (confirmed in EXPORT_OBJ:
+		**	name='DD' asset='DD' w=72 h=72 ... shape=0). Shape 0 is only right while the object is
+		**	untrustworthy, which is what Aeloria_LiveClassTrustworthy() tests (NOT Class_Is_Valid(),
+		**	which is only a drawability gate — see the note in OBJECT.H).
+		*/
+		/*
+		**	With operator VesselType() now null-safe (VESSEL.H:81), Shape_Number() touches no raw Class
+		**	pointer — everything else it reads is instance data. So call it unconditionally, exactly as
+		**	UnitClass::Draw_It does. The old gate sent any bad-+8 vessel to virtualShape = 0, and frame
+		**	0 is north: the hull stayed pointing north/south while the ship sailed east/west.
+		*/
+		int virtualShape = Shape_Number();
+		if (virtualShape <= 0 && (producedBadPlus8 || needsMainGuard)) {
 			virtualShape = Aeloria_GuardedVesselShapeNumber(this);
 		}
 		DLL_Draw_Intercept(virtualShape, x, y, drawW, drawH, AELORIA_CLIENT_DRAW_FLAGS_CENTER,
 		                   const_cast<VesselClass*>(this), DIR_N, 0x100, nullptr, (char)Owner());
 		Aeloria_DrawGuardedVesselTurret(this, vessel_type, PrimaryFacing, SecondaryFacing, x, y, drawW, drawH);
+		// Pips come from TechnoClass::Draw_It, which this early return skips.
+		{
+			int pipW = 0;
+			int pipH = 0;
+			vessel_type->Dimensions(pipW, pipH);
+			Draw_Pips((x - pipW / 2) + 5, y + pipH / 2 - 3, window);
+		}
 		return;
 	}
 
@@ -514,7 +546,9 @@ void VesselClass::Draw_It(int x, int y, WindowNumberType window) const
 		if (drawW > 0 && drawH > 0 && producedTracked) {
 			Aeloria_TryNotifyProducedUnitMainDrawCache(selfObj, shapenum, drawW, drawH, x, y, bad_plus_8);
 		}
-		int interceptShape = producedTracked ? 0 : shapenum;
+		// Same shape-0 latch as the VIRTUAL branch: producedTracked never clears, so a shipyard
+		// vessel exported ShapeIndex 0 from MAIN for its whole life as well.
+		int interceptShape = (producedTracked && !Aeloria_LiveClassTrustworthy(selfObj)) ? 0 : shapenum;
 		DLL_Draw_Intercept(interceptShape, x, y, drawW, drawH, AELORIA_CLIENT_DRAW_FLAGS_CENTER,
 		                   const_cast<VesselClass*>(this), DIR_N, 0x100, nullptr, (char)Owner());
 		Aeloria_DrawGuardedVesselTurret(this, vessel_type, PrimaryFacing, SecondaryFacing, x, y, drawW, drawH);
@@ -531,7 +565,7 @@ void VesselClass::Draw_It(int x, int y, WindowNumberType window) const
 	/*
 	**	Verify the legality of the unit class.
 	*/
-	void const * shapefile = Get_Image_Data();
+	void const * shapefile = cached_image_data;
 	if (shapefile == NULL) return;
 
 	/*
@@ -2406,6 +2440,19 @@ void VesselClass::Rotation_AI(void)
 		if (Class->IsTurretEquipped) {
 			SecondaryFacing.Set_Desired(dir);
 		}
+	} else if (Class->IsTurretEquipped && !IsRotating) {
+		/*
+		**	With no target, SecondaryFacing was never touched — so a newly built vessel's turrets sat
+		**	at DIR_N for its entire life. The turret sprite index is BodyShape[Dir_To_32(SecondaryFacing)],
+		**	so every TURR/SSAM/MGUN sub-object exported ShapeIndex 0: guns permanently aimed north,
+		**	looking correct only while the hull sailed north/south and 90 degrees out when it ran
+		**	horizontally (confirmed across 84 consecutive CA turret exports, all shape=0).
+		**
+		**	Units get this via IsTurretLockedDown -> Set_Desired(PrimaryFacing.Current()); vessels had
+		**	no equivalent. Idle turrets now return to the hull axis and still rotate at Class->ROT, so
+		**	they swing round smoothly rather than snapping. Combat still wins via the branch above.
+		*/
+		SecondaryFacing.Set_Desired(PrimaryFacing.Current());
 	}
 
 	IsRotating = false;

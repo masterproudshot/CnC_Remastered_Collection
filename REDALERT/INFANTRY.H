@@ -116,7 +116,12 @@ class InfantryClass : public FootClass
 		InfantryClass(InfantryType classid, HousesType house);
 		InfantryClass(NoInitClass const & x) : FootClass(x), Class(x), Comment(x) {};
 		virtual ~InfantryClass(void);
-		operator InfantryType(void) const {return Class->Type;};
+		// Null-safe like UnitClass/VesselClass: a raw Class->Type deref makes every caller
+		// (Shape_Number, draw guards) unsafe on an object with an unsettled +8.
+		operator InfantryType(void) const {
+			InfantryTypeClass const* t = Class;
+			return t ? t->Type : INFANTRY_NONE;
+		};
 
 		/*---------------------------------------------------------------------
 		**	Member function prototypes.
@@ -133,10 +138,10 @@ class InfantryClass : public FootClass
 		int Shape_Number(WindowNumberType window = WINDOW_MAIN) const;
 		virtual ObjectTypeClass const & Class_Of(void) const;
 		bool Class_Is_Valid(void) const override {
-			if (!Class.Is_Valid() || Class.Raw() <= 0) return false;
+			if (!Class.Is_Valid() || Class.Raw() < 0) return false;
 			const InfantryTypeClass* t = Class;
 			if (!t) return false;
-			if (t->RTTI != RTTI_INFANTRYTYPE || t->MaxStrength <= 0) return false;
+			if (t->RTTI != RTTI_INFANTRYTYPE) return false;
 
 			/*
 			**	Project Aeloria — TEMPORARY BAND-AID (see Is_Plausible_Class_Pointer in OBJECT.H
@@ -150,7 +155,8 @@ class InfantryClass : public FootClass
 				sprintf(_buf, "REJECTED Class_Is_Valid this=%p RTTI=%d Class.Raw=%d at+8=0x%08X\r\n",
 				        this, What_Am_I(), Class.Raw(), (unsigned)effective);
 				OutputDebugStringA(_buf);
-				return false;
+				// Tactical relaxation, matching the other Class_Is_Valid overrides.
+				return true;
 			}
 
 			return true;

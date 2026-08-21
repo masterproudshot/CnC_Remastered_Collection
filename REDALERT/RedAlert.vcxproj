@@ -103,9 +103,22 @@
       <BufferSecurityCheck>false</BufferSecurityCheck>
       <TreatWarningAsError>false</TreatWarningAsError>
       <!-- ForcedIncludeFiles removed as part of Project Aeloria explicit pack(1) fix -->
+      <!--
+        /Oy- : keep frame pointers. /O2 implies /Oy on x86, and without a frame pointer the ETW /
+        VS sampling profiler cannot walk the stack reliably, so samples get attributed to the wrong
+        caller. Costs a percent or two of speed and makes both profiles AND crash-dump stacks
+        trustworthy - this project reads a lot of crash dumps.
+      -->
+      <OmitFramePointers>false</OmitFramePointers>
     </ClCompile>
     <Link>
-      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <!--
+        /OPT:NOICF : COMDAT folding merges identical function bodies to one address, so the profiler
+        (and any stack trace) reports whichever symbol happened to win the fold. That is exactly the
+        "stack traces are unreliable" problem hit earlier in this project. Folding only saves image
+        size, which is not a constraint here.
+      -->
+      <EnableCOMDATFolding>false</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
       <AdditionalDependencies>winmm.lib;Ws2_32.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <GenerateDebugInformation>DebugFull</GenerateDebugInformation>

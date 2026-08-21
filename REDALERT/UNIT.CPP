@@ -2202,7 +2202,12 @@ void UnitClass::Draw_It(int x, int y, WindowNumberType window) const
 	**	Early-out if the Class pointer is not yet valid (can happen very early
 	**	during scenario load before TypeClasses are fully constructed).
 	*/
-	if (!Is_Drawable(this)) return;
+	// Inlined from Is_Drawable() to fetch the shape pointer once -- see the note in
+	// BuildingClass::Draw_It. Get_Image_Data() is a virtual that runs Class_Is_Valid, the +8 probe and
+	// possibly Aeloria_Safe_Techno_Type's map lookups; it was being called three times per draw.
+	if (!Class_Is_Valid()) return;
+	void const * const cached_image_data = Get_Image_Data();
+	if (cached_image_data == NULL) return;
 
 	const UnitTypeClass* unit_type = static_cast<const UnitTypeClass*>(Aeloria_Safe_Techno_Type(this));
 	if (unit_type == nullptr) return;
@@ -2212,6 +2217,9 @@ void UnitClass::Draw_It(int x, int y, WindowNumberType window) const
 	unit_type->Dimensions(drawW, drawH);
 	if (drawW <= 0) drawW = 48;
 	if (drawH <= 0) drawH = 48;
+	// Dimensions() is the logical selection box; the client scales the sprite to this rect, so it
+	// needs the real frame size instead (see Aeloria_ClientDrawDims).
+	Aeloria_ClientDrawDims(cached_image_data, drawW, drawH);
 
 	uintptr_t at_plus_8 = *(uintptr_t*)((const char*)this + 8);
 	const bool bad_plus_8 = !Is_Plausible_Class_Pointer(at_plus_8);
@@ -2236,15 +2244,42 @@ void UnitClass::Draw_It(int x, int y, WindowNumberType window) const
 			Aeloria_Debug_Log("UNIT_VIRTUAL_GUARD this=%p owner=%d frame=%u (safe VIRTUAL draw)",
 			                  (void*)this, (int)Owner(), Frame);
 		}
-		int virtualShape = 0;
-		if (producedTracked) {
-			virtualShape = 0;
-		} else if (repurposedHarvester || producedBadPlus8 || needsMainGuard) {
-			virtualShape = Aeloria_GuardedUnitShapeNumber(this);
+		/*
+		**	This is the frame the client actually renders. Sending 0 for a healthy unit, or the
+		**	static-body helper for a harvester, is why harvesting and dumping never animate:
+		**	Unlike Get_Image_Data(), UnitClass::Shape_Number() never touches the live Class: every
+		**	field it reads comes from Aeloria_Safe_Techno_Type, and operator UnitType() is null-safe
+		**	(UNIT.H:149). So it is safe to call unconditionally.
+		**
+		**	Gating it on the live-Class check froze harvesters on a static facing frame, because the
+		**	dumping and harvesting animations live in frames 32+ and Aeloria_GuardedUnitShapeNumber
+		**	deliberately discards those. Both halves of the draw still agree, since Get_Image_Data()
+		**	resolves through the same safe type.
+		*/
+		int virtualShape = Shape_Number();
+		if (virtualShape <= 0) {
+			if (repurposedHarvester || producedBadPlus8 || needsMainGuard) {
+				virtualShape = Aeloria_GuardedUnitShapeNumber(this);
+			} else if (producedTracked) {
+				// Shape 0 matches the WF unlimbo seed.
+				virtualShape = 0;
+			}
 		}
 		DLL_Draw_Intercept(virtualShape, x, y, drawW, drawH, AELORIA_CLIENT_DRAW_FLAGS_CENTER,
 		                   const_cast<UnitClass*>(this), DIR_N, 0x100, nullptr, (char)Owner());
 		Aeloria_DrawGuardedUnitTurret(this, unit_type, PrimaryFacing, SecondaryFacing, IsInRecoilState, x, y, drawW, drawH);
+		/*
+		**	Pips (cargo, harvester load, ammo) are emitted by TechnoClass::Draw_It, which this early
+		**	return skips — so guarded objects reached the client with no pips at all. Anchor them on
+		**	the logical Dimensions() box the way TechnoClass::Draw_It does, NOT on the sprite frame
+		**	size used for drawW/drawH above.
+		*/
+		{
+			int pipW = 0;
+			int pipH = 0;
+			unit_type->Dimensions(pipW, pipH);
+			Draw_Pips((x - pipW / 2) + 5, y + pipH / 2 - 3, window);
+		}
 		return;
 	}
 
@@ -2263,7 +2298,9 @@ void UnitClass::Draw_It(int x, int y, WindowNumberType window) const
 		if (drawW > 0 && drawH > 0 && producedTracked) {
 			Aeloria_TryNotifyProducedUnitMainDrawCache(selfObj, shapenum, drawW, drawH, x, y, bad_plus_8);
 		}
-		int interceptShape = producedTracked ? 0 : shapenum;
+		// Same shape-0 latch as the VIRTUAL branch and as VesselClass::Draw_It: producedTracked
+		// never clears, so a war-factory vehicle exported ShapeIndex 0 from MAIN for its whole life.
+		int interceptShape = (producedTracked && !Aeloria_LiveClassTrustworthy(selfObj)) ? 0 : shapenum;
 		DLL_Draw_Intercept(interceptShape, x, y, drawW, drawH, AELORIA_CLIENT_DRAW_FLAGS_CENTER,
 		                   const_cast<UnitClass*>(this), DIR_N, 0x100, nullptr, (char)Owner());
 		Aeloria_DrawGuardedUnitTurret(this, unit_type, PrimaryFacing, SecondaryFacing, IsInRecoilState, x, y, drawW, drawH);
@@ -2290,7 +2327,7 @@ void UnitClass::Draw_It(int x, int y, WindowNumberType window) const
 	if (Aeloria_ShouldLogVerbose(this) && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_GET_IMAGE_DATA)) {
 		Aeloria_Debug_Log("Unit about to call Get_Image_Data() this=%p Class.Raw=%ld", (void*)this, Class.Raw());
 	}
-	shapefile = Get_Image_Data();
+	shapefile = cached_image_data;
 	if (shapefile == NULL) return;
 
 	/*

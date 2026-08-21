@@ -79,7 +79,12 @@ class BulletClass :	public ObjectClass,
 		BulletClass(NoInitClass const & x) : ObjectClass(x), Class(x), FlyClass(x), FuseClass(x) {};
 #endif
 		virtual ~BulletClass(void);
-		operator BulletType(void) const {return Class->Type;};
+		// Null-safe like UnitClass/VesselClass: a raw Class->Type deref makes every caller
+		// (Shape_Number, draw guards) unsafe on an object with an unsettled +8.
+		operator BulletType(void) const {
+			BulletTypeClass const* t = Class;
+			return t ? t->Type : BULLET_NONE;
+		};
 
 		/*---------------------------------------------------------------------
 		**	Member function prototypes.
@@ -94,11 +99,30 @@ class BulletClass :	public ObjectClass,
 		virtual void Assign_Target(TARGET target) {TarCom = target;};
 		virtual bool Unlimbo(COORDINATE , DirType facing = DIR_N);
 		virtual ObjectTypeClass const & Class_Of(void) const {return *Class;};
+		/*
+		**	Two conditions were removed here, and the second one made EVERY projectile in the game
+		**	undrawable:
+		**
+		**	  Class.Raw() <= 0   rejected heap index 0, which is a perfectly legal type id (it is simply
+		**	                     the first type allocated). Now < 0, matching CCPtr's own -1 sentinel.
+		**
+		**	  t->MaxStrength <= 0  ObjectTypeClass initialises MaxStrength(0) (OBJECT.CPP) and
+		**	                     BulletTypeClass never overrides it, because a bullet is not damageable.
+		**	                     So this was false for every bullet type, always. Class_Is_Valid()
+		**	                     returned false -> Is_Drawable() false -> BulletClass::Draw_It returned
+		**	                     on its first line -> CC_Draw_Shape was never called.
+		**
+		**	Measured: with combat on screen the export census read
+		**		bullets seen=7 elig=7 noimg=0 | fx enter=0
+		**	i.e. bullets present in the layer, past the IsDown gate, holding valid shape data, and not
+		**	one of them reaching the draw call. Same defect in ANIM.H, which is why explosions and
+		**	muzzle flashes were missing too.
+		*/
 		bool Class_Is_Valid(void) const override {
-			if (!Class.Is_Valid() || Class.Raw() <= 0) return false;
+			if (!Class.Is_Valid() || Class.Raw() < 0) return false;
 			const BulletTypeClass* t = Class;
 			if (!t) return false;
-			if (t->RTTI != RTTI_BULLETTYPE || t->MaxStrength <= 0) return false;
+			if (t->RTTI != RTTI_BULLETTYPE) return false;
 
 			/*
 			**	Project Aeloria — TEMPORARY BAND-AID (see Is_Plausible_Class_Pointer in OBJECT.H
@@ -112,7 +136,10 @@ class BulletClass :	public ObjectClass,
 				sprintf(_buf, "REJECTED Class_Is_Valid this=%p RTTI=%d Class.Raw=%d at+8=0x%08X\r\n",
 				        this, What_Am_I(), Class.Raw(), (unsigned)effective);
 				OutputDebugStringA(_buf);
-				return false;
+				// Tactical relaxation, matching Unit/Building/Aircraft/Vessel. Is_Drawable() gates
+				// Draw_It entirely, so returning false here made projectiles with a stale +8 peek
+				// undrawable outright — no shells or missiles rendered at all.
+				return true;
 			}
 
 			return true;

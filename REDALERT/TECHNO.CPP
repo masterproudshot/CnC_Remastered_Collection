@@ -1133,7 +1133,17 @@ void TechnoClass::Draw_It(int x, int y, WindowNumberType window) const
 			if (height <= 0) height = 48;
 		}
 	} else {
-		Class_Of().Dimensions(width, height);
+		// Class_Of() dereferences the live Class. That is exactly the call that produced a null
+		// vtable dispatch on a corrupt-+8 destroyer, and it runs here for every non-building techno
+		// on the selection-box / health-bar path. Route it through the safe type like the branch above.
+		width = 24;
+		height = 24;
+		TechnoTypeClass const* safe = Aeloria_Safe_Techno_Type(this);
+		if (safe != NULL) {
+			safe->Dimensions(width, height);
+		}
+		if (width <= 0) width = 24;
+		if (height <= 0) height = 24;
 	}
 
 	const bool show_health_bar = (Strength > 0) && !Is_Cloaked(PlayerPtr) && (Is_Selected_By_Player() ||
@@ -4804,6 +4814,27 @@ void TechnoClass::Techno_Draw_Object(void const * shapefile, int shapenum, int x
 		                  would_fail ? 1 : 0, shapefile, shapenum, x, y);
 	}
 
+	/*
+	**	Project Aeloria — widened from "rotated or scaled only" to every techno draw.
+	**
+	**	With UseBigShapeBuffer set, Buffer_Frame_To_Page runs its optimised dispatch: setup_headers
+	**	points ShapeJumpTableAddress at AllFlagsJumpTable (KEYFBUFF.ASM:1338), and the fading block
+	**	then patches an entry at an offset computed against NewShapeJumpTable (KEYFBUFF.ASM:1397).
+	**	Patched off the wrong base, the dispatch selects a routine that does not match the flags
+	**	this call passed, so it reads MASM LOCALs this call never populated — confirmed live with
+	**	EBX=0 (FadingTable) and ECX=0 (FadingNum) inside fade_loop while a valid fading table was
+	**	supplied. Worse, a mis-dispatch can land mid-instruction, which is where the privileged
+	**	instruction (0xC000001D) and the assorted 0x00000000 / 0xFFFFFFFF reads came from.
+	**
+	**	Clearing the flag makes the blitter take use_old_draw (KEYFBUFF.ASM:1314-1325): no header
+	**	setup, no jump-table patching, no header translation of src. This is the engine's own
+	**	remedy — see the note in 2KEYFRAM.CPP:199 that already prescribes it "wherever scale/rotate
+	**	is used (like in Techno_Draw_Object)"; the corruption is not actually specific to scaling.
+	**	SUPERSEDED: CC_Draw_Shape now returns before the legacy blitter for objects on the tactical
+	**	window, so none of that dispatch runs any more and this no longer needs widening. Forcing
+	**	the compressed path on every techno draw also defeats the uncompressed shape cache, which
+	**	is a needless per-frame cost. Restored to the original scale/rotate-only condition.
+	*/
 	if (rotation != DIR_N || scale != 0x0100) {
 		Disable_Uncompressed_Shapes();
 	}
@@ -6474,7 +6505,26 @@ int TechnoClass::Refund_Amount(void) const
 {
 	assert(IsActive);
 
-	int cost = Techno_Type_Class()->Raw_Cost() * House->CostBias;
+	/*
+	**	House is a CCPtr: operator-> returns NULL when ID == -1, and its bounds assert compiles
+	**	out in Release, so a stale id resolves to a NULL HouseClass. Dereferencing that faults at
+	**	offsetof(HouseClass, CostBias) == 0x1E — the crate-pickup crash observed via
+	**	DriveClass::AI -> Start_Of_Move -> Goodie_Check. Resolve once and check, the same way
+	**	Record_The_Kill already guards House before use.
+	*/
+	TechnoTypeClass const* ttype = Aeloria_Safe_Techno_Type(this);
+	int raw = (ttype != NULL) ? ttype->Raw_Cost() : 0;
+
+	HouseClass * hptr = House;
+	if (hptr == NULL) {
+		if (Aeloria_ShouldLogOncePerObject(this, AEL_LOG_REFUND_NO_HOUSE)) {
+			Aeloria_Debug_Log("REFUND_AMOUNT_NO_HOUSE this=%p RTTI=%d House.Raw=%ld raw_cost=%d frame=%u",
+			                  (void*)this, (int)What_Am_I(), House.Raw(), raw, Frame);
+		}
+		return(raw);
+	}
+
+	int cost = raw * hptr->CostBias;
 
 #ifdef TOFIX
 	/*
@@ -6484,7 +6534,7 @@ int TechnoClass::Refund_Amount(void) const
 //	cost += Fixed_To_Cardinal(UnitTypeClass::FULL_LOAD_CREDITS, Tiberium_Load())/2;
 #endif
 
-	if (House->IsHuman) {
+	if (hptr->IsHuman) {
 		cost = cost * Rule.RefundPercent;
 //		cost /= 2;
 	}

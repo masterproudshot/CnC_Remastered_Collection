@@ -636,9 +636,28 @@ std::map<uintptr_t, uint32_t> g_AeloriaObjectCreationFrame;
 // AELORIA_ENABLE_VERBOSE_DRAW_LOGS=1 environment variable to force this to true at runtime
 // (via the read in CNC_Init below). This is what makes "the debugmode flag flips the loggins switch on".
 bool g_AeloriaEnableVerboseDrawLogs = false;
+// Per-export instrumentation for the measured load-scaling slowdown (logic tick fell 33 -> 8 fps as
+// object count rose 129 -> 226). Reported on the EXPORT_CENSUS line and reset each export.
+long g_AeloriaBestActionCalls = 0;
+long g_AeloriaFxProbeEnter = 0;
+long g_AeloriaFxProbeGraceDrop = 0;
+long g_AeloriaFxProbePlus8Drop = 0;
+long g_AeloriaFxProbeIntercept = 0;
+// Time spent inside DLL_Draw_Intercept per export, vs the rest of the Draw_It guard stack.
+long long g_AeloriaInterceptTicks = 0;
+long g_AeloriaInterceptCalls = 0;
 
+// Gates ONLY the per-frame Map.Render() calls -- see the definition near Legacy_Render_Enabled().
+bool Aeloria_LegacyRenderPassEnabled(void);
+// Export cost captured during Get_Layer_State, read by the tick-rate banner on the logic tick.
+double g_AeloriaLastExportWalkMs = 0.0;
+int g_AeloriaLastExportObjectCount = 0;
 // infantry-scale Phase 2: healthy barracks infantry skip per-object tracking maps.
 bool g_AeloriaZeroMapProducedInfantry = true;
+
+// Frames between full client-object-list dumps. 0 = disabled; set via AELORIA_TRACE_EXPORT.
+#define AELORIA_EXPORT_TRACE_DEFAULT_INTERVAL 300
+int g_AeloriaExportTraceInterval = 0;
 // infantry-scale Phase 3b: stateless DLL_Draw_Intercept for untracked techno (all RTTI) on corrupt +8.
 bool g_AeloriaStatelessUntrackedTechno = true;
 
@@ -701,6 +720,14 @@ static bool Aeloria_IsCriticalLogMessage(const char *fmt)
 		"WORST_OFFENDER",
 		"(All tracked objects",
 		"CNC_INIT",
+		/*
+		**	The export census carries the performance timings, and it MUST be readable without -D.
+		**	Verbose logging writes ~236k lines with an fflush per line, much of it from inside
+		**	Draw_It itself, so a -D session measures the logging rather than the draw. Letting these
+		**	two lines through when verbose is off gives an honest baseline: run -TraceExport alone.
+		*/
+		"EXPORT_CENSUS",
+		"EXPORT_SNAPSHOT_BEGIN",
 		"AELORIA: FAILED to open",
 		"BULK_SLOT_STOMP_GUARD",
 		"BULK_SKIP_INVALID_POS",
@@ -1095,32 +1122,6 @@ void Aeloria_RefreshBuildingStabilityOnSeed(BuildingClass* building, bool humanD
 	Aeloria_Repair_Early_Class_Pointer(building);
 
 	uintptr_t key = reinterpret_cast<uintptr_t>(building);
-	auto& stab = g_AeloriaObjectStability[key];
-
-	stab.rtti = (uint8_t)RTTI_BUILDING;
-	stab.stabilityLevel = 0;
-	stab.successfulRealDraws = 0;
-	stab.fallbackUses = 0;
-	stab.earlySafeClientRegistered = true;
-	stab.clientListInserted = false;
-	stab.sustainRetired = false;
-	stab.sustainNormalHits = 0;
-
-	stab.producedUnitUnlimboSeeded = false;
-	stab.producedUnitBadPlus8 = false;
-	stab.producedUnitFirstDrawMask = 0;
-
-	stab.hasCachedMainDraw = false;
-	stab.hasCachedDraw = false;
-	stab.cachedShapeNumber = 0;
-	stab.cachedDrawFlags = 0;
-	stab.cachedRotation = 0;
-	stab.cachedScale = 0x100;
-	stab.cachedDrawX = 0;
-	stab.cachedDrawY = 0;
-	stab.cachedWidth = 0;
-	stab.cachedHeight = 0;
-	stab.cachedAssetName[0] = '\0';
 
 	int16_t typeEnum = -1;
 	if (building->Class.Is_Valid()) {
@@ -1135,11 +1136,63 @@ void Aeloria_RefreshBuildingStabilityOnSeed(BuildingClass* building, bool humanD
 			typeEnum = (int16_t)viaRaw->Type;
 		}
 	}
-	stab.cachedTypeEnum = typeEnum;
 
-	Aeloria_Debug_Log("BUILDING_STAB_REFRESH this=%p owner=%d type_enum=%d human=%d frame=%u",
-	                  (void*)building, (int)building->Owner(), (int)stab.cachedTypeEnum,
-	                  humanDeployed ? 1 : 0, Frame);
+	/*
+	**	The seed helpers fire from many routine call sites (Unlimbo, factory hand-off, per-frame
+	**	house/techno paths), not just at creation — a building sees several calls per frame.
+	**	A blind reset here therefore wipes the draw cache continuously: hasCachedMainDraw can
+	**	never stay set, Aeloria_HasTrustedHumanBuildingMainCache never returns true, and the
+	**	building stays pinned on the safe-client path while clientListInserted=false re-triggers
+	**	bulk insert with zeroed dims/shape every export. That is the invisible-buildings case.
+	**	Only wipe when this really is a different object at a reused heap slot.
+	*/
+	auto existing = g_AeloriaObjectStability.find(key);
+	const bool freshRecord = (existing == g_AeloriaObjectStability.end());
+	const bool reusedSlot = !freshRecord
+	                        && (existing->second.rtti != (uint8_t)RTTI_BUILDING
+	                            || (existing->second.cachedTypeEnum >= 0 && typeEnum >= 0
+	                                && existing->second.cachedTypeEnum != typeEnum));
+
+	auto& stab = g_AeloriaObjectStability[key];
+
+	if (reusedSlot) {
+		stab.stabilityLevel = 0;
+		stab.successfulRealDraws = 0;
+		stab.fallbackUses = 0;
+		stab.clientListInserted = false;
+		stab.sustainRetired = false;
+		stab.sustainNormalHits = 0;
+
+		stab.producedUnitUnlimboSeeded = false;
+		stab.producedUnitBadPlus8 = false;
+		stab.producedUnitFirstDrawMask = 0;
+
+		stab.hasCachedMainDraw = false;
+		stab.hasCachedDraw = false;
+		stab.cachedShapeNumber = 0;
+		stab.cachedDrawFlags = 0;
+		stab.cachedRotation = 0;
+		stab.cachedScale = 0x100;
+		stab.cachedDrawX = 0;
+		stab.cachedDrawY = 0;
+		stab.cachedWidth = 0;
+		stab.cachedHeight = 0;
+		stab.cachedAssetName[0] = '\0';
+	}
+
+	stab.rtti = (uint8_t)RTTI_BUILDING;
+	stab.earlySafeClientRegistered = true;
+	// Never downgrade a known type to -1 on a routine re-seed; that would drop the building off
+	// Aeloria_IsHumanDeployedBuilding mid-match.
+	if (typeEnum >= 0 || stab.cachedTypeEnum < 0) {
+		stab.cachedTypeEnum = typeEnum;
+	}
+
+	if (freshRecord || reusedSlot) {
+		Aeloria_Debug_Log("BUILDING_STAB_REFRESH this=%p owner=%d type_enum=%d human=%d reused=%d frame=%u",
+		                  (void*)building, (int)building->Owner(), (int)stab.cachedTypeEnum,
+		                  humanDeployed ? 1 : 0, reusedSlot ? 1 : 0, Frame);
+	}
 }
 
 void Aeloria_Seed_Building_Creation(BuildingClass* building)
@@ -1731,6 +1784,42 @@ void Aeloria_DrawAccessoryIntercept(const ObjectClass* obj, int shapenum, int x,
 	}
 	if (drawW <= 0) drawW = 48;
 	if (drawH <= 0) drawH = 48;
+
+	/*
+	**	Callers pass the PARENT's dimensions (the hull, the building), but an accessory is a
+	**	different shape file — "TURR"/"SSAM"/"MGUN" for vessel turrets, "WEAP2" for the war
+	**	factory roof. The client centres each sprite inside the w/h it is given (SHAPE_CENTER), so
+	**	sizing a turret by the hull's rect puts the gun off where it belongs. Resolve the
+	**	accessory's own frame size; the parent's value stays as the fallback.
+	*/
+	{
+		/*
+		**	Cached: MFCD::Retrieve is NOT cheap. It strupr's into a _MAX_PATH buffer, computes a CRC
+		**	over the name, then sweeps every registered mixfile doing a binary search in each
+		**	(MIXFILE.CPP MixFileClass::Offset). Calling it per accessory per frame means every vessel
+		**	and unit turret and every war factory roof pays that on every single export.
+		**
+		**	A shape file's address never changes once the mixfiles are registered, so resolve each
+		**	name once and keep it. Negative results are cached too -- a missing asset would otherwise
+		**	pay the full sweep every frame forever.
+		*/
+		static std::map<std::string, void const *> s_accessoryShapeCache;
+		void const * accessory_shape = NULL;
+		auto accIt = s_accessoryShapeCache.find(shape_file_name);
+		if (accIt != s_accessoryShapeCache.end()) {
+			accessory_shape = accIt->second;
+		} else {
+			char shp_name[40];
+			_snprintf(shp_name, sizeof(shp_name), "%s.SHP", shape_file_name);
+			shp_name[sizeof(shp_name) - 1] = '\0';
+			accessory_shape = MFCD::Retrieve(shp_name);
+			s_accessoryShapeCache[shape_file_name] = accessory_shape;
+		}
+		if (accessory_shape != NULL) {
+			Aeloria_ClientDrawDims(accessory_shape, drawW, drawH);
+		}
+	}
+
 	char owner = (override_owner != HOUSE_NONE) ? override_owner : (char)obj->Owner();
 	if (g_AeloriaEnableVerboseDrawLogs && Aeloria_ShouldLogOncePerObject(obj, AEL_LOG_ACCESSORY_DRAW)) {
 		Aeloria_Debug_Log("AELORIA_ACCESSORY_DRAW this=%p RTTI=%d owner=%d asset=%s shapenum=%d frame=%u",
@@ -1760,6 +1849,24 @@ static void Aeloria_PruneStaleTracking()
 		                    && (it->second.stabilityLevel >= 2 || it->second.clientListInserted));
 		// WF-produced bad+8 harvesters must keep stab flags for eternal safe draw (5z-n7).
 		if (!inactive && it->second.producedUnitUnlimboSeeded && it->second.producedUnitBadPlus8) {
+			graduated = false;
+		}
+		/*
+		**	Active aircraft and vessels must keep their stability record for as long as they live.
+		**	Aeloria_IsFootLayerSustainCandidate qualifies a GRADUATED vessel/aircraft on that record
+		**	(graduation already erased the creation record), so pruning it here silently removes the
+		**	only thing that re-inserts a landed helicopter or a resting ship into the client list —
+		**	they would start disappearing again roughly every 150 frames. It also discards
+		**	cachedTypeEnum, which Aeloria_Safe_Techno_Type falls back on.
+		*/
+		if (!inactive && obj != NULL) {
+			/*
+			**	Widened from aircraft/vessel to EVERY living object. Ground vehicles keep their guarded
+			**	draw flags here (producedUnitUnlimboSeeded / producedUnitBadPlus8 / the MAIN draw cache),
+			**	and buildings now qualify for the foot-layer sustain net on this record too — erasing it
+			**	would strand a tech centre exactly the way it stranded ships. Dead objects are still
+			**	pruned by the `inactive` branch, so the maps stay bounded by live object count.
+			*/
 			graduated = false;
 		}
 		if (inactive || graduated) {
@@ -1963,6 +2070,26 @@ extern "C" __declspec(dllexport) void __cdecl CNC_Init(const char *command_line,
 		OutputDebugStringA(zmMsg);
 	}
 
+	/*
+	**	AELORIA_TRACE_EXPORT=<frames> dumps the whole client object list every <frames> frames.
+	**	This is the list the Remastered client actually renders from, so it is the ground truth
+	**	for "is this object exported at all, and with what size / shape / asset". Off unless set;
+	**	a bare "1" means use the default interval, since a per-frame dump would be unreadable.
+	*/
+	{
+		char val[16] = {0};
+		if (GetEnvironmentVariableA("AELORIA_TRACE_EXPORT", val, sizeof(val)) > 0) {
+			int interval = atoi(val);
+			if (interval == 1) interval = AELORIA_EXPORT_TRACE_DEFAULT_INTERVAL;
+			if (interval < 0) interval = 0;
+			g_AeloriaExportTraceInterval = interval;
+		}
+		char etMsg[96];
+		_snprintf(etMsg, sizeof(etMsg), "AELORIA: g_AeloriaExportTraceInterval = %d\n",
+		          g_AeloriaExportTraceInterval);
+		OutputDebugStringA(etMsg);
+	}
+
 	{
 		char val[16] = {0};
 		if (GetEnvironmentVariableA("AELORIA_STATELESS_UNTRACKED_TECHNO", val, sizeof(val)) > 0) {
@@ -2068,6 +2195,17 @@ extern "C" __declspec(dllexport) void __cdecl CNC_Add_Mod_Path(const char *mod_p
 **************************************************************************************************/
 extern "C" __declspec(dllexport) bool __cdecl CNC_Get_Visible_Page(unsigned char *buffer_in, unsigned int &width, unsigned int &height)
 {
+	/*
+	**	NOTE: this is called every frame regardless of the client's graphics mode -- it is NOT a signal
+	**	that the player has toggled "Original Graphics" with SPACE. A warning gated on it fired
+	**	constantly in Remastered mode, so do not use it that way.
+	**
+	**	That mode cannot work in this fork: CC_Draw_Shape deliberately does not run the legacy blitter
+	**	for objects (see the comment in CONQUER.CPP), because the Remastered client composites its view
+	**	from the WINDOW_VIRTUAL object list instead. The legacy page therefore holds terrain but no
+	**	units or buildings, which looks exactly like "everything is invisible" -- health bars and the
+	**	radar keep working because the client draws those from the object list, not from this page.
+	*/
 	if (!DLLExportClass::Legacy_Render_Enabled() || (buffer_in == NULL)) {
 		return false;
 	}
@@ -3378,6 +3516,73 @@ extern "C" __declspec(dllexport) bool __cdecl CNC_Advance_Instance(uint64 player
 	Frame++;
 
 	Aeloria_PruneStaleTracking();
+	/*
+	**	In-game logic tick rate banner. The client renders at 60 FPS regardless, so its FPS readout
+	**	says nothing about how fast the simulation is actually advancing -- this measures Frame delta
+	**	against the wall clock and reports it directly.
+	**
+	**	OFF BY DEFAULT, and deliberately so. The first version of this was raised from inside
+	**	Get_Layer_State, which re-entered the client's EventCallback while it was waiting on that call
+	**	to fill its object buffer, and every unit and building stopped rendering. Moving it to the
+	**	logic tick did not restore them, and the export lists before and after are byte-for-byte
+	**	identical -- so On_Message itself is implicated, not the object data.
+	**
+	**	Until that is understood, the default build must not call into the client at all. Set
+	**	AELORIA_TICK_BANNER=1 to opt in -- the launcher sets it from -ShowTickRate / -F. Note the
+	**	message id is -1 here, matching every other MESSAGE_TYPE_DIRECT caller in this file; the
+	**	earlier version invented a large id, which is one candidate for why the client misbehaved.
+	**
+	**	Sampled over a 30 second window, so the figure is an average across that period rather than an
+	**	instantaneous reading -- long enough to be stable, and infrequent enough not to clutter the
+	**	message list.
+	*/
+	/*
+	**	Original Graphics mode: NO reliable detector, so no warning is raised.
+	**
+	**	Background worth keeping: SPACE toggles the client between Remastered and Original graphics.
+	**	Original mode composites from the legacy software page, which this fork does not populate for
+	**	objects -- CC_Draw_Shape deliberately skips the legacy blitter for them because the client
+	**	renders from the WINDOW_VIRTUAL object list instead. The result is terrain with no units or
+	**	buildings, while health bars and the radar keep working (the client draws those from the object
+	**	list). That is indistinguishable from a rendering bug and cost a long debugging session.
+	**
+	**	I tried gating a warning on CNC_Get_Visible_Page being called, assuming the client only asks
+	**	for the legacy page in that mode. It does not: it calls every frame regardless, so the warning
+	**	fired constantly in Remastered mode. Nothing else in this DLL API distinguishes the two modes,
+	**	so a warning here would be guesswork. Left out rather than shipped wrong.
+	*/
+	static int s_tickBannerEnabled = -1;
+	if (s_tickBannerEnabled < 0) {
+		char val[16] = {0};
+		s_tickBannerEnabled = (GetEnvironmentVariableA("AELORIA_TICK_BANNER", val, sizeof(val)) > 0
+		                       && (val[0] == '1' || _stricmp(val, "true") == 0 || _stricmp(val, "on") == 0)) ? 1 : 0;
+	}
+	if (s_tickBannerEnabled > 0) {
+		static unsigned s_lastTickFrame = 0;
+		static uint64_t s_lastTickTime = 0;
+
+		uint64_t const nowMs = GetTickCount64();
+		if (s_lastTickTime == 0) {
+			s_lastTickTime = nowMs;
+			s_lastTickFrame = Frame;
+		} else if (nowMs >= s_lastTickTime + 30000) {
+			unsigned const dFrames = Frame - s_lastTickFrame;
+			double const dSec = (double)(nowMs - s_lastTickTime) / 1000.0;
+			s_lastTickFrame = Frame;
+			s_lastTickTime = nowMs;
+			char bannerBuf[128];
+			snprintf(bannerBuf, sizeof(bannerBuf),
+			         "Engine Tick Rate: %.1f FPS (Objects: %d | Export: %.1f ms)",
+			         (dSec > 0.0) ? ((double)dFrames / dSec) : 0.0,
+			         g_AeloriaLastExportObjectCount, g_AeloriaLastExportWalkMs);
+			// Qualified: an unqualified On_Message here would bind to the 5-argument DLLExportClass member.
+			::On_Message(bannerBuf, 10.0f, -1);
+		}
+	}
+
+	// The tick rate is also written to the log every export on the EXPORT_CENSUS line, which needs no
+	// client interaction at all and is the safe way to read it.
+
 
 	/*
 	**	Player House exemption timeout driver (Phase B, 18000 frames).
@@ -3553,7 +3758,7 @@ extern "C" __declspec(dllexport) bool __cdecl CNC_Advance_Instance(uint64 player
 		GameActive = false;
 	}
 
-	if (DLLExportClass::Legacy_Render_Enabled()) {
+	if (Aeloria_LegacyRenderPassEnabled()) {
 		Map.Render();
 	}
 
@@ -3628,7 +3833,7 @@ extern "C" __declspec(dllexport) bool __cdecl CNC_Save_Load(bool save, const cha
 		Set_Logic_Page(SeenBuff);
 		VisiblePage.Clear();
 		Map.Flag_To_Redraw(true);
-		if (DLLExportClass::Legacy_Render_Enabled()) {
+		if (Aeloria_LegacyRenderPassEnabled()) {
 			Map.Render();
 		}
 		Set_Palette(GamePalette.Get_Data());
@@ -5021,6 +5226,29 @@ static UnitType Aeloria_Intercept_Unit_Type_Enum(UnitClass const* unit);
 
 void DLLExportClass::DLL_Draw_Intercept(int shape_number, int x, int y, int width, int height, int flags, const ObjectClass *object, DirType rotation, long scale, const char *shape_file_name, char override_owner)
 {
+	/*
+	**	Splits the per-object draw cost into "this export-population function" vs "everything else in
+	**	the Draw_It guard stack". drawit_us already measures the whole of Draw_It; intercept_us is the
+	**	part spent in here, so the difference is the guards. Measure before optimising -- the last two
+	**	performance theories (Best_Object_Action, verbose logging) were both wrong.
+	*/
+	// Gated on the export trace: this runs on every intercept call, and two QueryPerformanceCounter
+	// calls per draw is diagnostic overhead that should not exist during normal play.
+	struct InterceptTimer {
+		LARGE_INTEGER start;
+		bool active;
+		~InterceptTimer() {
+			if (!active) return;
+			LARGE_INTEGER end; QueryPerformanceCounter(&end);
+			g_AeloriaInterceptTicks += (end.QuadPart - start.QuadPart);
+			g_AeloriaInterceptCalls++;
+		}
+	} interceptTimer{};
+	interceptTimer.active = (g_AeloriaExportTraceInterval > 0);
+	if (interceptTimer.active) {
+		QueryPerformanceCounter(&interceptTimer.start);
+	}
+
 	// Phase 2 diagnostic (approved plan): loud entry into the actual client object population code.
 	// This is the moment the Remastered side decides whether to accept the draw for rendering + selection.
 	// We especially care what What_Am_I() returns for early creation objects.
@@ -5116,8 +5344,20 @@ void DLLExportClass::DLL_Draw_Intercept(int shape_number, int x, int y, int widt
 		}
 	}
 
-	// 5z-m7/m11: defer root intercept only until MAIN draw cache exists (pre-cache InstanceServer risk).
-	// After cache, allow intercept so LAYERS export populates the client (m10 replay was invisible: defer + sustain gated off).
+	/*
+	**	5z-m7/m11 deferred the root intercept for a produced aircraft until a MAIN draw cache
+	**	existed, expecting the bulk path to carry it in the meantime. DISABLED: when the bulk path
+	**	does not pick it up — sustain retired, or the stability record already erased — the aircraft
+	**	is simply absent from the client list for that export. It then vanishes from the tactical
+	**	view AND the radar together, which is exactly the reported helicopter flicker (a moving
+	**	helicopter loses and regains its MAIN cache, so it strobes in and out of the list).
+	**	Export snapshots bear it out: 9 aircraft in one snapshot, 2 in the next, same session.
+	**
+	**	Dropping an object from the client list is a worse failure than the pre-cache
+	**	InstanceServer risk this was guarding, and that risk is further reduced now that the legacy
+	**	blitter is no longer called for objects at all. Kept as a diagnostic so we can still see
+	**	when the condition trips.
+	*/
 	if (base_object == NULL && object && object->What_Am_I() == RTTI_AIRCRAFT) {
 		auto acIt = g_AeloriaObjectStability.find(key);
 		if (acIt != g_AeloriaObjectStability.end()
@@ -5125,10 +5365,9 @@ void DLLExportClass::DLL_Draw_Intercept(int shape_number, int x, int y, int widt
 		    && !acIt->second.producedUnitBadPlus8
 		    && !Aeloria_HasValidMainDrawCache(object)) {
 			uintptr_t at8 = *(uintptr_t*)((const char*)object + 8);
-			if (Is_Plausible_Class_Pointer(at8)) {
-				Aeloria_Debug_Log("PRODUCED_AIRCRAFT_INTERCEPT_DEFER this=%p owner=%d frame=%u (defer to bulk after MAIN cache)",
+			if (Is_Plausible_Class_Pointer(at8) && Aeloria_ShouldLogOncePerObject(object, AEL_LOG_PLAYER_CREATION)) {
+				Aeloria_Debug_Log("PRODUCED_AIRCRAFT_INTERCEPT_NODEFER this=%p owner=%d frame=%u (exporting anyway; defer used to drop it)",
 				                  (void*)object, (int)object->Owner(), Frame);
-				return;
 			}
 		}
 	}
@@ -5241,6 +5480,10 @@ void DLLExportClass::DLL_Draw_Intercept(int shape_number, int x, int y, int widt
 				HousesType house = hptr->Class->House;
 				DynamicVectorClass<ObjectClass*>& selected_objects = CurrentObject.Raw(house);
 				if (selected_objects.Count() > 0) {
+					// Counted for the EXPORT_CENSUS line: Best_Object_Action runs per object per human
+					// house against every selected unit, so it is O(objects x selection) per export and a
+					// prime suspect for the measured load-scaling slowdown.
+					g_AeloriaBestActionCalls += selected_objects.Count();
 					Logic_Switch_Player_Context(hptr);
 					Convert_Action_Type(Best_Object_Action(selected_objects, object), (selected_objects.Count() == 1) ? selected_objects[0] : NULL, object->As_Target(), new_object.ActionWithSelected[house]);
 				}
@@ -5394,9 +5637,18 @@ void DLLExportClass::DLL_Draw_Intercept(int shape_number, int x, int y, int widt
 			new_object.RemapColor = -1;
 			new_object.VisibleFlags = anim_object->Get_Visible_Flags();
 
-			const AnimTypeClass& anim_type = static_cast<const AnimTypeClass&>(anim_object->Class_Of());
-			if (anim_type.VirtualName != NULL) {
-				strncpy(new_object.AssetName, anim_type.VirtualName, CNC_OBJECT_ASSET_NAME_LENGTH);
+			/*
+			**	Class_Of() dereferences the live Class. Every other RTTI case here resolves through
+			**	Aeloria_Safe_Techno_Type or a validity check; this one did not, and relaxing
+			**	AnimClass::Class_Is_Valid (so anims with a stale +8 stay drawable) makes it reachable
+			**	for impact and beacon anims during combat. Resolve through the CCPtr instead, which is
+			**	a heap lookup and yields NULL rather than faulting.
+			*/
+			if (Aeloria_LiveClassTrustworthy(object)) {
+				const AnimTypeClass& anim_type = static_cast<const AnimTypeClass&>(anim_object->Class_Of());
+				if (anim_type.VirtualName != NULL) {
+					strncpy(new_object.AssetName, anim_type.VirtualName, CNC_OBJECT_ASSET_NAME_LENGTH);
+				}
 			}
 		}
 		break;
@@ -5569,8 +5821,14 @@ void Aeloria_GraduateTrackedObject(const ObjectClass* obj)
 
 	bool scenarioStart = (creationFrame <= 10);
 	RTTIType rtti = obj->What_Am_I();
-	// 5z-m bulk: produced aircraft graduate to normal MAIN draw but retain stab until sustain handoff.
-	const bool aircraftBulkRetain = (!scenarioStart && rtti == RTTI_AIRCRAFT
+	/*
+	**	5z-m bulk: produced aircraft graduate to normal MAIN draw but retain stab until sustain
+	**	handoff. Vessels need identical treatment: graduation otherwise falls through to
+	**	g_AeloriaObjectStability.erase(key) below, and the foot-layer sustain net qualifies a
+	**	graduated vessel/aircraft ON that stability record — erasing it puts ships straight back to
+	**	appearing in one export and never again.
+	*/
+	const bool aircraftBulkRetain = (!scenarioStart && (rtti == RTTI_AIRCRAFT || rtti == RTTI_VESSEL)
 	                                 && !Aeloria_IsProducedBadPlus8Unit(obj));
 
 	stab.stabilityLevel = 2;
@@ -5582,7 +5840,8 @@ void Aeloria_GraduateTrackedObject(const ObjectClass* obj)
 	// Retain stability until hasCachedMainDraw — virtual-only cache is not enough (1145 session).
 	if (!scenarioStart && !Aeloria_IsHumanDeployedBuilding(obj) && !Aeloria_IsRepurposedHarvester(obj)
 	    && !Aeloria_IsProducedBadPlus8Unit(obj) && !Aeloria_IsEternalSafeProducedUnit(obj)) {
-		if ((rtti == RTTI_INFANTRY || rtti == RTTI_UNIT || rtti == RTTI_AIRCRAFT)
+		// RTTI_VESSEL was missing here, so a ship graduated immediately regardless of MAIN cache.
+		if ((rtti == RTTI_INFANTRY || rtti == RTTI_UNIT || rtti == RTTI_AIRCRAFT || rtti == RTTI_VESSEL)
 		    && !Aeloria_HasValidMainDrawCache(obj)) {
 			g_AeloriaObjectLogMask.erase(key);
 			Aeloria_Debug_Log("PRODUCED_TECHNO_GRADUATE_DEFER this=%p owner=%d rtti=%d type_enum=%d frame=%u (retain stab until MAIN cache)",
@@ -5677,11 +5936,18 @@ static void Aeloria_CopyEarlyDefaultAssetName(char* dest, int destLen, RTTIType 
 			strncpy(dest, ref.Graphic_Name(), destLen);
 			return;
 		}
+		if (rtti == RTTI_VESSEL) {
+			const VesselTypeClass& ref = VesselTypeClass::As_Reference((VesselType)stab->cachedTypeEnum);
+			strncpy(dest, ref.Graphic_Name(), destLen);
+			return;
+		}
 	}
 	if (rtti == RTTI_INFANTRY) strncpy(dest, "E1", destLen);
 	else if (rtti == RTTI_UNIT) strncpy(dest, "JEEP", destLen);
 	else if (rtti == RTTI_BUILDING) strncpy(dest, "FTUR", destLen);
 	else if (rtti == RTTI_AIRCRAFT) strncpy(dest, "MIG", destLen);
+	// Without this a bulk-exported vessel fell through to "ICON", which is not a unit sprite.
+	else if (rtti == RTTI_VESSEL) strncpy(dest, "DD", destLen);
 	else strncpy(dest, "ICON", destLen);
 }
 
@@ -5733,14 +5999,32 @@ static BuildingTypeClass const* Aeloria_Safe_Building_Type(BuildingClass const* 
 
 static bool Aeloria_IsValidBulkPixelPos(int px, int py)
 {
-	return px >= 0 && py >= 0 && px < 8192 && py < 8192;
+	/*
+	**	A NEGATIVE screen coordinate is legitimate, not garbage: DisplayClass::Coord_To_Pixel
+	**	subtracts the tactical origin, so anything off the left or top edge is negative, and it only
+	**	bounds-checks the upper edge before returning true. PositionX/Y are int for exactly this
+	**	reason, and the normal draw path exports negative positions routinely.
+	**
+	**	Rejecting them made Aeloria_ResolveBulkPixelPos discard a perfectly good LIVE coordinate and
+	**	fall back to a stale cached draw coord, or to (0,0) when there was no cache -- so a bulk or
+	**	sustain-exported object that scrolled off the left/top of the view jumped to the corner of
+	**	the tactical map. This check exists only to reject uninitialised/garbage values, so keep the
+	**	magnitude bound and drop the sign requirement.
+	*/
+	return px > -8192 && py > -8192 && px < 8192 && py < 8192;
 }
 
 // Moving foot units leave Map.Layer during MARK_UP; live Coord_To_Pixel can fail while MAIN draw coords are good.
-static bool Aeloria_ResolveBulkPixelPos(const ObjectClass* obj, const AeloriaObjectStability* stab, int& px, int& py)
+// usedLiveCoord reports whether the position came from the live Render_Coord (which is a GROUND
+// position) rather than a cached draw coordinate (which was captured from a draw call and is
+// therefore already lifted by altitude). Callers need the distinction to avoid double-lifting.
+static bool Aeloria_ResolveBulkPixelPos(const ObjectClass* obj, const AeloriaObjectStability* stab, int& px, int& py, bool* usedLiveCoord = nullptr)
 {
 	px = 0;
 	py = 0;
+	if (usedLiveCoord != nullptr) {
+		*usedLiveCoord = false;
+	}
 	if (!obj || !obj->IsActive) {
 		return false;
 	}
@@ -5759,6 +6043,9 @@ static bool Aeloria_ResolveBulkPixelPos(const ObjectClass* obj, const AeloriaObj
 	if (liveOk) {
 		px = livePx;
 		py = livePy;
+		if (usedLiveCoord != nullptr) {
+			*usedLiveCoord = true;
+		}
 		return true;
 	}
 
@@ -5778,12 +6065,19 @@ static bool Aeloria_ResolveBulkPixelPos(const ObjectClass* obj, const AeloriaObj
 	return false;
 }
 
-static int Aeloria_FindObjectExportIndex(CNCObjectListStruct* list, const void* objPtr)
+/*
+**	The client only ever reads Objects[0 .. Count-1]. Everything past Count is last frame's data,
+**	still holding last frame's CNCInternalObjectPointer values, because the buffer is reused and
+**	never cleared. Searching all 512 slots therefore reports objects that are NOT in this export
+**	as present, so `liveCount` bounds the search the same way the client's own read does.
+*/
+static int Aeloria_FindObjectExportIndex(CNCObjectListStruct* list, const void* objPtr, int liveCount)
 {
 	if (!list || !objPtr) {
 		return -1;
 	}
-	for (int i = 0; i < 512; ++i) {
+	if (liveCount > 512) liveCount = 512;
+	for (int i = 0; i < liveCount; ++i) {
 		if (list->Objects[i].CNCInternalObjectPointer == objPtr) {
 			return i;
 		}
@@ -5811,6 +6105,9 @@ static bool Aeloria_PrepareContiguousBulkSlot(CNCObjectListStruct* list, int pro
 // Uses cached virtual-draw params when available (no Class_Of — sustain must not reintroduce +8 AV).
 static void Aeloria_PopulateEarlyBulkSlot(CNCObjectStruct& slot, const ObjectClass* obj, int exportLayer)
 {
+	// Deliberately unused: the layer is derived per-object below, not taken from the caller. See the
+	// comment at the SortOrder assignment for why the caller's value is always wrong here.
+	(void)exportLayer;
 	memset(&slot, 0, sizeof(slot));
 
 	uintptr_t objKey = reinterpret_cast<uintptr_t>(obj);
@@ -5822,11 +6119,24 @@ static void Aeloria_PopulateEarlyBulkSlot(CNCObjectStruct& slot, const ObjectCla
 	else if (rtti == RTTI_UNIT) { slot.Type = UNIT; slot.ID = Units.ID((UnitClass*)obj); }
 	else if (rtti == RTTI_AIRCRAFT) { slot.Type = AIRCRAFT; slot.ID = Aircraft.ID((AircraftClass*)obj); }
 	else if (rtti == RTTI_BUILDING) { slot.Type = BUILDING; slot.ID = Buildings.ID((BuildingClass*)obj); }
+	// RTTI_VESSEL was missing here: the slot is memset above, so any vessel routed through the
+	// bulk/sustain path was exported as Type=UNKNOWN(0) with ID=0, which the client cannot render
+	// or select. Convert_Type has always handled vessels; only this path did not.
+	else if (rtti == RTTI_VESSEL) { slot.Type = VESSEL; slot.ID = Vessels.ID((VesselClass*)obj); }
 
 	slot.Owner = (char)obj->Owner();
 	const bool hasCachedDims = stab && (stab->hasCachedDraw || stab->hasCachedMainDraw);
-	slot.Width = (hasCachedDims && stab->cachedWidth > 0) ? stab->cachedWidth : 32;
-	slot.Height = (hasCachedDims && stab->cachedHeight > 0) ? stab->cachedHeight : 32;
+	/*
+	**	The 32x32 fallback is why a bulk-exported object renders at the wrong scale — a tech centre
+	**	is nothing like 32 pixels square. The draw paths all size the client rect from the real
+	**	sprite frame (Aeloria_ClientDrawDims); this one never did, so an object that reached the
+	**	client through bulk/sustain instead of a draw intercept came out miniature.
+	*/
+	int bulkW = (hasCachedDims && stab->cachedWidth > 0) ? stab->cachedWidth : 32;
+	int bulkH = (hasCachedDims && stab->cachedHeight > 0) ? stab->cachedHeight : 32;
+	Aeloria_ClientDrawDims(obj->Get_Image_Data(), bulkW, bulkH);
+	slot.Width = bulkW;
+	slot.Height = bulkH;
 	slot.IsSelectable = true;
 	slot.DimensionX = 16; slot.DimensionY = 16;
 
@@ -5841,12 +6151,25 @@ static void Aeloria_PopulateEarlyBulkSlot(CNCObjectStruct& slot, const ObjectCla
 
 	int px = 0;
 	int py = 0;
-	Aeloria_ResolveBulkPixelPos(obj, stab, px, py);
+	bool usedLiveCoord = false;
+	Aeloria_ResolveBulkPixelPos(obj, stab, px, py, &usedLiveCoord);
+	/*
+	**	The draw path pre-lifts an airborne object by its altitude (TechnoClass::Techno_Draw_Object
+	**	does `y -= Lepton_To_Pixel(Height)`), and the cached draw coordinates above inherit that lift
+	**	because they were captured from a draw call. The LIVE Render_Coord does not. Exporting an
+	**	unlifted body while Draw_Rotors emits a lifted rotor is what makes a taking-off helicopter's
+	**	rotor snap between the right place and ~24px too high as it alternates between the normal
+	**	layer walk and this bulk/sustain path.
+	*/
+	if (usedLiveCoord && obj->Height > 0) {
+		py -= Lepton_To_Pixel(obj->Height);
+	}
 	slot.PositionX = px;
 	slot.PositionY = py;
 
 	short realStr = 0;
-	if (rtti == RTTI_INFANTRY || rtti == RTTI_UNIT || rtti == RTTI_BUILDING || rtti == RTTI_AIRCRAFT) {
+	if (rtti == RTTI_INFANTRY || rtti == RTTI_UNIT || rtti == RTTI_BUILDING || rtti == RTTI_AIRCRAFT
+	    || rtti == RTTI_VESSEL) {
 		realStr = (short)((TechnoClass*)const_cast<ObjectClass*>(obj))->Strength;
 	}
 	slot.MaxStrength = (slot.Type == INFANTRY ? 50 : (slot.Type == UNIT ? 100 : (slot.Type == AIRCRAFT ? 100 : 400)));
@@ -5854,11 +6177,14 @@ static void Aeloria_PopulateEarlyBulkSlot(CNCObjectStruct& slot, const ObjectCla
 	if (slot.Strength > slot.MaxStrength) slot.Strength = slot.MaxStrength;
 	if (slot.Strength <= 0) slot.Strength = slot.MaxStrength;
 
-	const char* tn = (slot.Type == INFANTRY ? "E1" : (slot.Type == UNIT ? "UNIT" : "OBJ"));
+	const char* tn = (slot.Type == INFANTRY ? "E1" : (slot.Type == UNIT ? "UNIT" : (slot.Type == VESSEL ? "DD" : "OBJ")));
 	strncpy(slot.TypeName, tn, CNC_OBJECT_ASSET_NAME_LENGTH);
 	Aeloria_CopyEarlyDefaultAssetName(slot.AssetName, CNC_OBJECT_ASSET_NAME_LENGTH, rtti, stab);
 
-	if (rtti == RTTI_UNIT || rtti == RTTI_INFANTRY || rtti == RTTI_BUILDING || rtti == RTTI_AIRCRAFT) {
+	// RTTI_VESSEL was omitted here too, so a bulk-exported ship never picked up its real asset
+	// name, type name, dimensions, MaxStrength or IsSelectable from its TypeClass.
+	if (rtti == RTTI_UNIT || rtti == RTTI_INFANTRY || rtti == RTTI_BUILDING || rtti == RTTI_AIRCRAFT
+	    || rtti == RTTI_VESSEL) {
 		TechnoClass* tc = const_cast<TechnoClass*>(static_cast<TechnoClass const*>(obj));
 		Aeloria_Repair_Early_Class_Pointer(tc);
 		TechnoTypeClass const* ttype = Aeloria_Safe_Techno_Type(tc);
@@ -5913,40 +6239,172 @@ static void Aeloria_PopulateEarlyBulkSlot(CNCObjectStruct& slot, const ObjectCla
 		slot.Scale = 0x100;
 	}
 
-	slot.SortOrder = (exportLayer << 29) + (obj->Sort_Y() >> 3);
+	// exportLayer is DLLExportClass::ExportLayer, which every caller reads AFTER the layer walk has
+	// finished — so it is always left at DLL_LAYER_COUNT-1 (LAYER_TOP), never the object's own layer.
+	// A bulk/sustain-inserted building or ship therefore landed in the aircraft/bullet sort bucket
+	// while the same building coming through a draw intercept landed in LAYER_GROUND. That is the
+	// tech centre "flashes in and out": it is in the export list every single frame (verified in the
+	// EXPORT_OBJ snapshots), but sorted into a layer the ground pass does not composite from.
+	//
+	// Call the base ObjectClass implementation explicitly rather than the virtual: AircraftClass's
+	// override reads Class->IsFixedWing, and the whole point of this path is objects whose live Class
+	// is not safe to dereference. The base version reads Height only.
+	int const objectLayer = (int)obj->ObjectClass::In_Which_Layer();
+	slot.SortOrder = (objectLayer << 29) + (obj->Sort_Y() >> 3);
 	slot.CNCInternalObjectPointer = (void*)obj;
 	slot.VisibleFlags = CNCObjectStruct::VISIBLE_FLAGS_ALL;
 	slot.IsTheaterSpecific = false;
 	slot.FlashingFlags = 0;
+	// Hardcoding this stripped submarines of their submerged state when they came through the bulk
+	// path, exposing them on the tactical map and radar.
 	slot.Cloak = UNCLOAKED;
-	slot.SpiedByFlags = 0U;
-	slot.IsSelectedMask = 0U;
-	slot.RecentlyCreated = true;
+	if (obj->Is_Techno()) {
+		TechnoClass* techno = (TechnoClass*)const_cast<ObjectClass*>(obj);
+		slot.Cloak = techno->Cloak;
+		// Both were pinned at 0: a bulk-exported object never flashed when ordered or targeted, and
+		// never reported that a spy had revealed it. Both are plain reads off the object.
+		slot.FlashingFlags = techno->Get_Flashing_Flags();
+		slot.SpiedByFlags = techno->Spied_By();
+	}
+	// Pinned at 0, so a bulk-exported object could never render as selected: no selection brackets,
+	// no health bar, for any player. The normal path reads it straight off the object.
+	slot.IsSelectedMask = obj->IsSelectedMask;
+	// Was hardcoded true, which is how bulk-exported objects were identifiable in the export trace,
+	// but it is still a lie to the client. Report what the object actually says.
+	slot.RecentlyCreated = obj->IsRecentlyCreated;
 	slot.NumLines = 0;
 	slot.NumPips = 0;
 	slot.MaxPips = 0;
-	slot.OccupyListLength = 0;
+	// NOT reset here: the RTTI_BUILDING block above fills OccupyList/OccupyListLength from the
+	// building's Occupy_List(), and this line used to wipe the length again ~45 lines later, so every
+	// bulk-inserted building reached the client with occupy=0 while draw-intercept buildings had 4-9.
+	// The memset at the top of this function already zeroes the field for the non-building cases.
 	slot.SubObject = 0;
 	slot.BaseObjectID = 0;
 	slot.BaseObjectType = UNKNOWN;
 	slot.SimLeptonX = 0;
 	slot.SimLeptonY = 0;
+	/*
+	**	Everything below was a hardcoded constant, so a bulk/sustain-exported object reported the same
+	**	capabilities no matter what it actually was. Two of them were actively false rather than merely
+	**	absent: IsNominal=true made the client show the generic civilian name instead of the real one,
+	**	and IsAntiGround=true claimed every object could attack ground -- including unarmed buildings
+	**	and harvesters -- while IsAntiAircraft=false denied it for SAM sites and AA guns.
+	**
+	**	These all mirror DLL_Draw_Intercept's normal population, resolved through Aeloria_Safe_Techno_Type
+	**	so nothing here dereferences the live Class pointer.
+	*/
 	slot.MaxSpeed = 0;
 	slot.IsALoaner = false;
 	slot.IsFactory = false;
 	slot.IsPrimaryFactory = false;
-	slot.IsNominal = true;
+	slot.IsNominal = false;
 	slot.IsDog = false;
 	slot.IsIronCurtain = false;
-	slot.IsAntiGround = true;
+	slot.IsAntiGround = false;
 	slot.IsAntiAircraft = false;
 	slot.IsSubSurface = false;
 	slot.IsFake = false;
+	slot.IsRepairing = false;
+	slot.IsDumping = false;
+
+	if (obj->Is_Techno()) {
+		const TechnoClass* techno = static_cast<const TechnoClass*>(obj);
+		const TechnoTypeClass* ttype = Aeloria_Safe_Techno_Type(techno);
+		if (ttype != NULL) {
+			slot.MaxSpeed = (unsigned char)ttype->MaxSpeed;
+			slot.IsNominal = ttype->IsNominal;
+			slot.MaxPips = ttype->Max_Pips();
+			const BulletTypeClass* bullet = (ttype->PrimaryWeapon != NULL) ? ttype->PrimaryWeapon->Bullet : NULL;
+			if (bullet != NULL) {
+				slot.IsAntiGround = bullet->IsAntiGround;
+				slot.IsAntiAircraft = bullet->IsAntiAircraft;
+				slot.IsSubSurface = bullet->IsSubSurface;
+			}
+			/*
+			**	An IsInvisible type (camouflaged pillbox) was fully visible to every player when it came
+			**	through this path, because VisibleFlags was left at VISIBLE_FLAGS_ALL.
+			*/
+			if (ttype->IsInvisible) {
+				HouseClass* owner = HouseClass::As_Pointer(obj->Owner());
+				if (owner != NULL) {
+					for (int i = 0; i < Houses.Count(); ++i) {
+						HouseClass* hptr = Houses.Ptr(i);
+						if ((hptr != NULL) && hptr->IsActive && !owner->Is_Ally(hptr)) {
+							slot.VisibleFlags &= ~(1 << hptr->Class->House);
+						}
+					}
+				}
+			}
+		}
+		slot.IsALoaner = techno->IsALoaner;
+		slot.IsIronCurtain = techno->IronCurtainCountDown > 0;
+	}
+
+	if (rtti == RTTI_BUILDING) {
+		const BuildingClass* bld = static_cast<const BuildingClass*>(obj);
+		BuildingTypeClass const* bt = static_cast<BuildingTypeClass const*>(Aeloria_Safe_Techno_Type(bld));
+		slot.IsRepairing = bld->IsRepairing;
+		slot.IsPrimaryFactory = bld->IsLeader;
+		if (bt != NULL && bt->RTTI == RTTI_BUILDINGTYPE) {
+			slot.IsFactory = bt->Is_Factory();
+			slot.IsFake = bt->IsFake;
+		}
+	} else if (rtti == RTTI_INFANTRY) {
+		const InfantryClass* inf = static_cast<const InfantryClass*>(obj);
+		InfantryTypeClass const* it = static_cast<InfantryTypeClass const*>(Aeloria_Safe_Techno_Type(inf));
+		if (it != NULL && it->RTTI == RTTI_INFANTRYTYPE) {
+			slot.IsDog = it->IsDog;
+			slot.CanPlaceBombs = it->IsBomber;
+		}
+	} else if (rtti == RTTI_UNIT) {
+		const UnitClass* unit = static_cast<const UnitClass*>(obj);
+		slot.IsDumping = unit->IsDumping;
+		if (Aeloria_Intercept_Unit_Type_Enum(unit) == UNIT_HARVESTER) {
+			slot.CanHarvest = true;
+		}
+	}
+	/*
+	**	The client greys out the sell and repair cursors from these three flags. Hardcoding them
+	**	false told it that NOTHING exported through bulk/sustain could be sold or repaired -- and for
+	**	a building whose only export route is this path (the tech centre: recent=1 on every export
+	**	row, so it never once came through the normal draw intercept) that means the sell cursor
+	**	never engages, even though BuildingClass::Can_Demolish() returns true for it.
+	**
+	**	Derive them from the SAFE type rather than calling Can_Demolish()/Can_Repair() directly:
+	**	those read the live Class pointer, which is exactly what this path exists to avoid. Every
+	**	other input (BState, Mission, Strength, radio contact) lives on the object, not the type.
+	*/
 	slot.CanRepair = false;
 	slot.CanDemolish = false;
 	slot.CanDemolishUnit = false;
-	slot.CanHarvest = false;
-	slot.CanPlaceBombs = false;
+	if (rtti == RTTI_BUILDING) {
+		const BuildingClass* building = static_cast<const BuildingClass*>(obj);
+		BuildingTypeClass const* btype = static_cast<BuildingTypeClass const*>(Aeloria_Safe_Techno_Type(building));
+		if (btype != NULL && btype->RTTI == RTTI_BUILDINGTYPE) {
+			const bool settled = (building->BState != BSTATE_CONSTRUCTION)
+			                     && (building->Mission != MISSION_CONSTRUCTION)
+			                     && (building->Mission != MISSION_DECONSTRUCTION);
+
+			// Mirrors BuildingClass::Can_Demolish, including the refinery-with-harvester exception.
+			slot.CanDemolish = !btype->IsUnsellable
+			                   && btype->Get_Buildup_Data() != NULL
+			                   && settled
+			                   && !(btype->Type == STRUCT_REFINERY
+			                        && const_cast<BuildingClass*>(building)->Is_Something_Attached());
+
+			// Mirrors TechnoClass::Can_Repair.
+			slot.CanRepair = btype->IsRepairable && (building->Strength != btype->MaxStrength);
+
+			// Mirrors BuildingClass::Can_Demolish_Unit.
+			slot.CanDemolishUnit = (btype->Type == STRUCT_REPAIR || btype->Type == STRUCT_AIRSTRIP)
+			                       && const_cast<BuildingClass*>(building)->In_Radio_Contact()
+			                       && const_cast<BuildingClass*>(building)->Distance(
+			                              const_cast<BuildingClass*>(building)->Contact_With_Whom()) < 0x0080;
+		}
+	}
+	// CanHarvest / CanPlaceBombs are set by the per-RTTI blocks above; the memset at the top of this
+	// function already zeroes them, and re-clearing them here would undo those assignments.
 	slot.IsFixedWingedAircraft = false;
 	if (rtti == RTTI_AIRCRAFT) {
 		const AircraftClass* aircraft = static_cast<const AircraftClass*>(obj);
@@ -5955,7 +6413,17 @@ static void Aeloria_PopulateEarlyBulkSlot(CNCObjectStruct& slot, const ObjectCla
 			slot.IsFixedWingedAircraft = atype->IsFixedWing;
 		}
 	}
+	/*
+	**	ControlGroup was left at the memset's 0, which the client reads as "in control group 0" rather
+	**	than "ungrouped" -- the normal path defaults it to -1. Foot objects then carry the real group.
+	*/
+	slot.ControlGroup = (unsigned char)(-1);
 	slot.IsInFormation = false;
+	if (obj->Is_Foot()) {
+		const FootClass* foot = static_cast<const FootClass*>(obj);
+		slot.ControlGroup = foot->Group;
+		slot.IsInFormation = foot->XFormOffset != 0x80000000UL;
+	}
 	slot.ProductionAssetName[0] = '\0';
 	slot.OverrideDisplayName = "\0";
 
@@ -5972,10 +6440,38 @@ static void Aeloria_PopulateEarlyBulkSlot(CNCObjectStruct& slot, const ObjectCla
 	memset(slot.CanMove, 0, sizeof(slot.CanMove));
 	memset(slot.CanFire, 0, sizeof(slot.CanFire));
 	memset(slot.ActionWithSelected, DAT_NONE, sizeof(slot.ActionWithSelected));
+	/*
+	**	Buildings were being told they could MOVE. The normal path asks Can_Player_Move() per house;
+	**	that needs a player-context switch and is not safe to run from here, so approximate it the way
+	**	the rest of this function does -- but a structure is never mobile, and DAT_MOVE on a selected
+	**	building gives the client a move cursor for an order the engine will reject.
+	*/
 	if (slot.Owner >= 0 && slot.Owner < MAX_HOUSES) {
-		slot.CanMove[slot.Owner] = true;
-		slot.CanFire[slot.Owner] = true;
-		slot.ActionWithSelected[slot.Owner] = DAT_MOVE;
+		const bool mobile = (rtti != RTTI_BUILDING);
+		slot.CanMove[slot.Owner] = mobile;
+		slot.CanFire[slot.Owner] = slot.IsAntiGround || slot.IsAntiAircraft;
+		slot.ActionWithSelected[slot.Owner] = mobile ? DAT_MOVE : DAT_SELECT;
+
+		/*
+		**	Only the owner's entry was ever filled, leaving every other house on DAT_NONE. The
+		**	normal export path asks Best_Object_Action per human house, but that needs a player
+		**	context switch which is not safe from here -- so approximate it the way the rest of
+		**	this function does: an object of a house you are at war with takes the attack cursor,
+		**	anything else stays selectable. Without this a hostile unit or structure that reached
+		**	the client through the bulk or sustain path gave no attack cursor at all.
+		**
+		**	NOTE: this cannot account for what the hovering player currently has selected, so a
+		**	non-combat selection still sees the attack cursor over an enemy. Fixing that properly
+		**	needs Best_Object_Action, i.e. the context switch this path cannot make.
+		*/
+		for (int h = 0; h < MAX_HOUSES; ++h) {
+			if (h == slot.Owner) continue;
+			bool hostile = true;
+			if (owner_house != nullptr) {
+				hostile = !owner_house->Is_Ally((HousesType)h);
+			}
+			slot.ActionWithSelected[h] = hostile ? DAT_ATTACK : DAT_SELECT;
+		}
 	}
 }
 
@@ -5984,9 +6480,15 @@ static bool Aeloria_ObjectAlreadyInExportList(CNCObjectListStruct* list, int cou
 	if (!list || !objPtr) {
 		return false;
 	}
-	if (Aeloria_FindObjectExportIndex(list, objPtr) >= 0) {
-		return true;
-	}
+	/*
+	**	This used to pre-check Aeloria_FindObjectExportIndex over all 512 slots, which defeated the
+	**	`count` parameter entirely: a STALE entry left beyond Count by an earlier, longer export made
+	**	this report "already present" for an object that is not in this frame's list at all. The foot
+	**	sustain net then skipped its only client-list insert, so a tech centre whose sole export route
+	**	is that net vanished on every frame where the list happened to be shorter than the index its
+	**	stale copy sat at -- and came back when the list grew past it and overwrote the slot. That is
+	**	the slow, irregular visible/invisible cycle, on the tactical view and the radar together.
+	*/
 	for (int i = 0; i < count; ++i) {
 		if (list->Objects[i].CNCInternalObjectPointer == objPtr) {
 			return true;
@@ -6001,14 +6503,31 @@ static bool Aeloria_IsFootLayerSustainCandidate(const ObjectClass* obj)
 	if (!obj || !obj->IsActive || obj->IsInLimbo || !obj->Is_Techno()) {
 		return false;
 	}
+	/*
+	**	This is the net that re-inserts objects the engine removed from Map.Layer on MARK_UP. It
+	**	accepted only infantry and units, so a vessel or aircraft that left the layer had nothing to
+	**	put it back: export snapshots showed each ship appearing in exactly ONE snapshot and never
+	**	again (vessels in 3 of 47, aircraft in 8 of 47), absent from the tactical view and the radar
+	**	together even though the entry was correct whenever it did appear.
+	*/
 	RTTIType rtti = obj->What_Am_I();
-	if (rtti != RTTI_INFANTRY && rtti != RTTI_UNIT) {
+	if (rtti != RTTI_INFANTRY && rtti != RTTI_UNIT && rtti != RTTI_VESSEL && rtti != RTTI_AIRCRAFT
+	    && rtti != RTTI_BUILDING) {
 		return false;
 	}
 	uintptr_t key = reinterpret_cast<uintptr_t>(obj);
-	// Produced war-factory units: defer foot sustain until tactical MAIN draw caches coords (5z-n5).
 	auto sIt = g_AeloriaObjectStability.find(key);
-	if (sIt != g_AeloriaObjectStability.end()
+	/*
+	**	Buildings need this net too. A tech centre placed with a corrupt +8 was bulk-inserted exactly
+	**	ONCE (GET_LAYER_BULK_HASCREATION_INSERT at idx=158, frame 13586) and never re-inserted, while
+	**	the normal layer walk never carried it — so it was absent from all 72 export snapshots and
+	**	invisible for the rest of the match, despite CONSTRUCTION_COMPLETE firing normally.
+	*/
+	// Produced war-factory units: defer foot sustain until tactical MAIN draw caches coords (5z-n5).
+	// Not applied to vessels/aircraft/buildings: a landed helicopter or a static structure stops
+	// being drawn on MAIN, so demanding a live MAIN cache is precisely what strands it.
+	if (rtti != RTTI_VESSEL && rtti != RTTI_AIRCRAFT && rtti != RTTI_BUILDING
+	    && sIt != g_AeloriaObjectStability.end()
 	    && sIt->second.producedUnitUnlimboSeeded
 	    && !Aeloria_HasValidMainDrawCache(obj)) {
 		return false;
@@ -6016,7 +6535,13 @@ static bool Aeloria_IsFootLayerSustainCandidate(const ObjectClass* obj)
 	if (g_AeloriaStatelessInfantryHotList.find(key) != g_AeloriaStatelessInfantryHotList.end()) {
 		return true;
 	}
-	return g_AeloriaObjectCreationFrame.find(key) != g_AeloriaObjectCreationFrame.end();
+	if (g_AeloriaObjectCreationFrame.find(key) != g_AeloriaObjectCreationFrame.end()) {
+		return true;
+	}
+	// Graduation erases the creation record, so vessels/aircraft/buildings must be able to qualify on
+	// the stability record alone or they drop out permanently the moment they graduate.
+	return (rtti == RTTI_VESSEL || rtti == RTTI_AIRCRAFT || rtti == RTTI_BUILDING)
+	       && sIt != g_AeloriaObjectStability.end();
 }
 
 static void Aeloria_SustainMissingFootLayerObjects(CNCObjectListStruct* list, int& totalCount, int exportLayer)
@@ -6048,6 +6573,12 @@ static void Aeloria_SustainMissingFootLayerObjects(CNCObjectListStruct* list, in
 	}
 	for (auto& cp : g_AeloriaObjectCreationFrame) {
 		tryInsert(reinterpret_cast<const ObjectClass*>(cp.first));
+	}
+	// Graduated vessels/aircraft are no longer in the creation map, so walk the stability records
+	// too. Aeloria_IsFootLayerSustainCandidate rejects everything else, and tryInsert already
+	// de-duplicates against the current export, so this cannot double-add.
+	for (auto& sp : g_AeloriaObjectStability) {
+		tryInsert(reinterpret_cast<const ObjectClass*>(sp.first));
 	}
 
 	if (footAdded > 0) {
@@ -6113,6 +6644,21 @@ static bool Aeloria_ForceLayerExport(const ObjectClass* object)
 	if (!GameActive || !object || !object->IsActive || object->IsInLimbo) {
 		return false;
 	}
+	/*
+	**	The caller only consults this when IsDown is false, and IsDown goes stale for anything the
+	**	engine stops Mark()ing: AircraftClass::AI does not Mark() once the aircraft is landed in
+	**	LAYER_GROUND, so a landed helicopter falls out of the normal layer walk and never returns.
+	**	Vessels at rest hit the same latch.
+	**
+	**	Deliberately narrower than "any techno": infantry, ground units and buildings currently
+	**	export correctly, and widening this would change their behaviour for no reason. Objects
+	**	tethered to a transport are already skipped by the caller before this point, and IsActive /
+	**	IsInLimbo are rejected above, so this cannot resurrect a genuinely absent object.
+	*/
+	RTTIType const rtti = object->What_Am_I();
+	if (rtti == RTTI_AIRCRAFT || rtti == RTTI_VESSEL) {
+		return true;
+	}
 	if (Aeloria_IsTrackedStartingUnit(object)) {
 		return true;
 	}
@@ -6159,7 +6705,32 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 	}
 
 	SortOrder = 0;
-
+	/*
+	**	Aeloria census — bullets and anims are absent from EVERY export snapshot (0 rows of type=6
+	**	and type=7 across whole sessions), but the per-object draw logs that would say WHY are all
+	**	suppressed: Aeloria_ShouldLogVerbose returns false for any non-player-exempt object once
+	**	Frame >= 600, and projectiles are never player-exempt. So this counts them directly and
+	**	reports once per export-trace interval, unguarded.
+	**
+	**	Reading it: seen = present in Map.Layer at all; eligible = passed the IsDown/IsInLimbo gate
+	**	the layer walk uses; noimage = Get_Image_Data() was NULL, which makes Is_Drawable() fail and
+	**	Draw_It return on its first line. Whichever number collapses to zero is the stage at fault.
+	*/
+	int censusBulletSeen = 0, censusBulletEligible = 0, censusBulletNoImage = 0;
+	int censusAnimSeen = 0, censusAnimEligible = 0, censusAnimNoImage = 0;
+	g_AeloriaBestActionCalls = 0;
+	g_AeloriaFxProbeEnter = 0;
+	g_AeloriaFxProbeGraceDrop = 0;
+	g_AeloriaFxProbePlus8Drop = 0;
+	g_AeloriaFxProbeIntercept = 0;
+	g_AeloriaInterceptTicks = 0;
+	g_AeloriaInterceptCalls = 0;
+	LARGE_INTEGER censusT0; QueryPerformanceCounter(&censusT0);
+	LARGE_INTEGER censusTWalk = censusT0;
+	long long censusDrawItTicks = 0;
+	int censusDrawItCount = 0;
+	// Only pay for the per-object timers when the export trace is actually collecting.
+	const bool censusTimingOn = (g_AeloriaExportTraceInterval > 0);
 	/*
 	**	Get the ground layer first and then followed by all the layers in increasing altitude.
 	*/
@@ -6197,6 +6768,20 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 				}
 
 				bool drawInLayerExport = (Debug_Map || Debug_Unshroud || (object->IsDown && !object->IsInLimbo));
+				{
+					RTTIType censusRtti = object->What_Am_I();
+					if (censusRtti == RTTI_BULLET || censusRtti == RTTI_ANIM) {
+						const bool isBullet = (censusRtti == RTTI_BULLET);
+						if (isBullet) censusBulletSeen++; else censusAnimSeen++;
+						if (drawInLayerExport) {
+							if (isBullet) censusBulletEligible++; else censusAnimEligible++;
+							if (object->Get_Image_Data() == NULL) {
+								if (isBullet) censusBulletNoImage++; else censusAnimNoImage++;
+							}
+						}
+					}
+				}
+
 				if (!drawInLayerExport && GameActive && Aeloria_ForceLayerExport(object)) {
 					drawInLayerExport = true;
 				}
@@ -6214,7 +6799,18 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 					** Call to Draw_It can result in multiple callbacks to the draw intercept.
 					*/
 					CurrentDrawCount = 0;
-					object->Draw_It(x, y, WINDOW_VIRTUAL);
+					// Splits the layer walk into Draw_It vs the guards around it. Gated on the export
+					// trace: two QueryPerformanceCounter calls per object per frame is diagnostic
+					// overhead nobody should pay during normal play.
+					if (censusTimingOn) {
+						LARGE_INTEGER dtA; QueryPerformanceCounter(&dtA);
+						object->Draw_It(x, y, WINDOW_VIRTUAL);
+						LARGE_INTEGER dtB; QueryPerformanceCounter(&dtB);
+						censusDrawItTicks += (dtB.QuadPart - dtA.QuadPart);
+						censusDrawItCount++;
+					} else {
+						object->Draw_It(x, y, WINDOW_VIRTUAL);
+					}
 
 					/*
 					** If the root object is a factory, then the last base object is the object in production (rendered after infiltrated buildings when selected).
@@ -6282,6 +6878,24 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 		}
 	}
 
+	// Splits the export into "normal layer walk" vs "Aeloria bulk/sustain tail" for the census line.
+	QueryPerformanceCounter(&censusTWalk);
+	/*
+	**	Export cost is stashed for the tick-rate banner, which is emitted from the game logic tick.
+	**	The banner must NOT be raised from here: On_Message calls straight into the client's
+	**	EventCallback, and doing that from the middle of Get_Layer_State re-enters the client while it
+	**	is waiting on this very call to fill its object buffer. That stopped every building and unit
+	**	from rendering, and the banner never appeared either.
+	*/
+	{
+		LARGE_INTEGER bannerFreq;
+		QueryPerformanceFrequency(&bannerFreq);
+		g_AeloriaLastExportWalkMs = bannerFreq.QuadPart
+		                            ? ((double)(censusTWalk.QuadPart - censusT0.QuadPart) * 1000.0 / (double)bannerFreq.QuadPart)
+		                            : 0.0;
+		g_AeloriaLastExportObjectCount = TotalObjectCount;
+	}
+
 	// === Complementary bulk registration for hasCreation objects (team-synthesized P0 from north star gap analysis) ===
 	// Runs *after* the normal layer walk but *before* the client consumes the buffer (ObjectList->Count).
 	// When the client finally provides a real ObjectList (in Get_Game_State for GAME_STATE_LAYERS, after CNC_Start_Custom_Instance returns),
@@ -6318,7 +6932,9 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 			int listCountSoFar = normalTotal + bulkAdded;
 			if (Aeloria_ObjectAlreadyInExportList(ObjectList, listCountSoFar, obj)) continue;
 
-			int existingIdx = Aeloria_FindObjectExportIndex(ObjectList, obj);
+			// Bounded to the live range: reusing a STALE slot at an index >= the live count would write
+			// the object outside [0, Count) and skip the bulkAdded increment, so it would never be seen.
+			int existingIdx = Aeloria_FindObjectExportIndex(ObjectList, obj, listCountSoFar);
 			int proposedIdx = (existingIdx >= 0) ? existingIdx : (normalTotal + bulkAdded);
 			if (proposedIdx < 0 || proposedIdx >= 512) continue;
 			if (existingIdx < 0 && !Aeloria_PrepareContiguousBulkSlot(ObjectList, proposedIdx, obj)) continue;
@@ -6357,13 +6973,39 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 		int sustainSkippedNormal = 0;
 		int sustainSkippedInactive = 0;
 		const bool sustainCapReached = (_export_count >= AELORIA_SUSTAIN_MAX_LAYER_EXPORTS);
+		/*
+		**	Aeloria_GraduateTrackedObject() can reach g_AeloriaObjectStability.erase(key) on its
+		**	non-retain path, and the loop below is iterating that very map. Erasing the node the
+		**	range-for is standing on frees it; the loop's next ++ then walks a dead node. The two
+		**	direct erases in this loop were already removed for exactly this reason -- the call
+		**	through Graduate is the same hazard one level down. Queue the keys and drain the queue
+		**	after the loop has finished, which leaves Graduate's semantics untouched.
+		*/
+		std::vector<const ObjectClass*> deferredGraduations;
 		for (auto& kv : g_AeloriaObjectStability) {
 			uintptr_t k = kv.first;
 			auto& stab = kv.second;
-			if (!stab.earlySafeClientRegistered || !stab.clientListInserted || stab.sustainRetired) continue;
+			if (!stab.earlySafeClientRegistered || !stab.clientListInserted) continue;
 
 			const ObjectClass* obj = reinterpret_cast<const ObjectClass*>(k);
 			if (!obj || !obj->IsActive || obj->IsInLimbo) { sustainSkippedInactive++; continue; }
+
+			/*
+			**	sustainRetired was a one-way latch: once the normal layer walk had carried an
+			**	object three times we stopped sustaining it forever. That is wrong for anything
+			**	that can LEAVE the layer walk again — a helicopter drops out when it lands, and
+			**	with nothing re-adding it the object simply disappears from the client list, from
+			**	the tactical view and the radar alike. Matches the observed behaviour exactly: a
+			**	newly arrived helicopter stays visible, then goes invisible after it has moved and
+			**	landed again. Re-arm instead of latching.
+			*/
+			if (stab.sustainRetired) {
+				if (normalTotal > 0 && Aeloria_ObjectAlreadyInExportList(ObjectList, normalTotal, obj)) {
+					continue;
+				}
+				stab.sustainRetired = false;
+				stab.sustainNormalHits = 0;
+			}
 			// Produced war-factory units: defer sustain until MAIN draw caches coords (5z-n5).
 			if (stab.producedUnitUnlimboSeeded && !Aeloria_HasValidMainDrawCache(obj)) continue;
 
@@ -6373,13 +7015,12 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 			                                   && !stab.sustainRetired);
 
 			if (sustainCapReached) {
+				// NB: never erase from g_AeloriaObjectStability here — this loop is iterating it.
 				if (aircraftSustainHandoff && stab.sustainNormalHits >= 3) {
 					stab.sustainRetired = true;
-					g_AeloriaObjectStability.erase(k);
-					g_AeloriaObjectLogMask.erase(k);
 				} else if (!aircraftSustainHandoff) {
 					if (Aeloria_HasValidMainDrawCache(obj)) {
-						Aeloria_GraduateTrackedObject(obj);
+						deferredGraduations.push_back(obj);
 					} else {
 						stab.sustainRetired = true;
 						g_AeloriaObjectCreationFrame.erase(k);
@@ -6389,7 +7030,7 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 			}
 
 			if (Aeloria_HasValidMainDrawCache(obj) && !aircraftSustainHandoff) {
-				Aeloria_GraduateTrackedObject(obj);
+				deferredGraduations.push_back(obj);
 				continue;
 			}
 
@@ -6399,11 +7040,10 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 			if (normalTotal > 0 && Aeloria_ObjectAlreadyInExportList(ObjectList, normalTotal, obj)) {
 				if (stab.sustainNormalHits < 255) stab.sustainNormalHits++;
 				if (stab.sustainNormalHits >= 3) {
+					// Retire only. Erasing here was both a use-after-free on `stab` and an
+					// iterator invalidation on the map this loop is walking, and it threw away
+					// the record that lets sustain re-arm when the object leaves the layer walk.
 					stab.sustainRetired = true;
-					if (obj->What_Am_I() == RTTI_AIRCRAFT && !Aeloria_IsProducedBadPlus8Unit(obj)) {
-						g_AeloriaObjectStability.erase(k);
-						g_AeloriaObjectLogMask.erase(k);
-					}
 				}
 				sustainSkippedNormal++;
 				continue;
@@ -6413,7 +7053,8 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 			int listCountSoFar = normalTotal + bulkAdded + sustainAdded;
 			if (Aeloria_ObjectAlreadyInExportList(ObjectList, listCountSoFar, obj)) continue;
 
-			int existingIdx = Aeloria_FindObjectExportIndex(ObjectList, obj);
+			// Bounded for the same reason as the bulk block above.
+			int existingIdx = Aeloria_FindObjectExportIndex(ObjectList, obj, listCountSoFar);
 			int proposedIdx = (existingIdx >= 0) ? existingIdx : (normalTotal + bulkAdded + sustainAdded);
 			if (proposedIdx < 0 || proposedIdx >= 512) continue;
 			if (existingIdx < 0 && !Aeloria_PrepareContiguousBulkSlot(ObjectList, proposedIdx, obj)) continue;
@@ -6433,6 +7074,10 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 			                  (void*)obj, (int)obj->Owner(), proposedIdx, (int)slot.PositionX, (int)slot.PositionY,
 			                  (int)slot.Strength, (int)slot.MaxStrength, Frame);
 		}
+		for (const ObjectClass* gradObj : deferredGraduations) {
+			Aeloria_GraduateTrackedObject(gradObj);
+		}
+		deferredGraduations.clear();
 		if (sustainAdded > 0) {
 			Aeloria_Debug_Log("SUSTAIN_BULK_COUNT N=%d normal=%d first_bulk=%d proposed_end=%d human=%d frame=%d",
 			                  sustainAdded, normalTotal, bulkAdded, normalTotal + bulkAdded + sustainAdded,
@@ -6475,6 +7120,67 @@ bool DLLExportClass::Get_Layer_State(uint64 player_id, unsigned char *buffer_in,
 		                  g_AeloriaObjectStability.size(), g_AeloriaObjectCreationFrame.size(), Frame);
 		s_lastBulkPostLogCount = TotalObjectCount;
 		s_lastBulkPostLogFrame = Frame;
+	}
+
+	/*
+	**	AELORIA_TRACE_EXPORT — dump the finished client object list.
+	**
+	**	Everything else in this file logs from the DRAW side and infers what the client received.
+	**	This logs what it actually received. One line per exported object; read it for:
+	**	  missing object   -> it is simply not in the list (client-list membership problem)
+	**	  wrong scale      -> w/h is the selection box (14x20 infantry) not the frame size
+	**	  invisible/flicker-> shape=0, empty asset, or VisibleFlags/selectable clear
+	**	  wrong sprite     -> asset name does not match the type name
+	**	Deliberately opt-in: this is O(objects) per dump with an fflush per line.
+	*/
+	if (g_AeloriaExportTraceInterval > 0 && ObjectList != nullptr) {
+		static long s_lastExportTraceFrame = 0;
+		/*
+		**	The static survives a restart or a save load, but Frame does not. Without the regression
+		**	test a session that reached frame 30000 and then restarted would emit nothing for the
+		**	next 30000 frames, which reads exactly like the trace being broken.
+		*/
+		if (Frame == 0 || (long)Frame < s_lastExportTraceFrame
+		    || (long)Frame >= s_lastExportTraceFrame + (long)g_AeloriaExportTraceInterval) {
+			s_lastExportTraceFrame = (long)Frame;
+			int const count = (int)ObjectList->Count;
+			LARGE_INTEGER censusT1, censusFreq;
+			QueryPerformanceCounter(&censusT1);
+			QueryPerformanceFrequency(&censusFreq);
+			double const usTotal = censusFreq.QuadPart ? ((double)(censusT1.QuadPart - censusT0.QuadPart) * 1000000.0 / (double)censusFreq.QuadPart) : 0.0;
+			double const usWalk = censusFreq.QuadPart ? ((double)(censusTWalk.QuadPart - censusT0.QuadPart) * 1000000.0 / (double)censusFreq.QuadPart) : 0.0;
+			double const usDrawIt = censusFreq.QuadPart ? ((double)censusDrawItTicks * 1000000.0 / (double)censusFreq.QuadPart) : 0.0;
+			double const usIntercept = censusFreq.QuadPart ? ((double)g_AeloriaInterceptTicks * 1000000.0 / (double)censusFreq.QuadPart) : 0.0;
+			Aeloria_Debug_Log("EXPORT_CENSUS bullets seen=%d elig=%d | anims seen=%d elig=%d | noimg b=%d a=%d | fx enter=%ld grace_drop=%ld plus8_drop=%ld intercept=%ld | count=%d best_action=%ld drawit_us=%.0f drawit_n=%d icept_us=%.0f icept_n=%ld walk_us=%.0f total_us=%.0f frame=%u",
+			                  censusBulletSeen, censusBulletEligible,
+			                  censusAnimSeen, censusAnimEligible,
+			                  censusBulletNoImage, censusAnimNoImage,
+			                  g_AeloriaFxProbeEnter, g_AeloriaFxProbeGraceDrop,
+			                  g_AeloriaFxProbePlus8Drop, g_AeloriaFxProbeIntercept,
+			                  count, g_AeloriaBestActionCalls, usDrawIt, censusDrawItCount,
+			                  usIntercept, g_AeloriaInterceptCalls, usWalk, usTotal, Frame);
+			Aeloria_Debug_Log("EXPORT_SNAPSHOT_BEGIN count=%d human_house=%d frame=%u",
+			                  count, (int)g_HumanPlayerHouse, Frame);
+			for (int i = 0; i < count && i < 512; ++i) {
+				CNCObjectStruct const & o = ObjectList->Objects[i];
+				Aeloria_Debug_Log("EXPORT_OBJ i=%d ptr=%p type=%d id=%d owner=%d name='%s' asset='%s' shape=%u w=%d h=%d pos=(%d,%d) cell=(%u,%u) dim=(%u,%u) flags=0x%08x rot=%u scale=0x%lx str=%d/%d sel=%d vis=0x%08x occupy=%d sub=%d alt=%d sort=0x%08x base=%d/%d recent=%d cloak=%d selmask=0x%08x",
+				                  i, o.CNCInternalObjectPointer, (int)o.Type, (int)o.ID, (int)o.Owner,
+				                  o.TypeName, o.AssetName, (unsigned)o.ShapeIndex,
+				                  (int)o.Width, (int)o.Height,
+				                  (int)o.PositionX, (int)o.PositionY,
+				                  (unsigned)o.CellX, (unsigned)o.CellY,
+				                  (unsigned)o.DimensionX, (unsigned)o.DimensionY,
+				                  (unsigned)o.DrawFlags, (unsigned)o.Rotation, (unsigned long)o.Scale,
+				                  (int)o.Strength, (int)o.MaxStrength,
+				                  o.IsSelectable ? 1 : 0, (unsigned)o.VisibleFlags,
+				                  (int)o.OccupyListLength, (int)o.SubObject,
+				                  (int)o.Altitude, (unsigned)o.SortOrder,
+				                  (int)o.BaseObjectID, (int)o.BaseObjectType,
+				                  o.RecentlyCreated ? 1 : 0, (int)o.Cloak,
+				                  (unsigned)o.IsSelectedMask);
+			}
+			Aeloria_Debug_Log("EXPORT_SNAPSHOT_END count=%d frame=%u", count, Frame);
+		}
 	}
 
 	// === DEBUG STEPPING HOOK (addresses user's direct request: run in VS debug mode / step CLI debugger at failure point) ===
@@ -11190,8 +11896,69 @@ void DLLExportClass::Debug_Heal_Unit(int x, int y)
 *
 * History: 4/15/2019 5:46PM - ST
 **************************************************************************************************/
+
+/*
+**	Should the legacy software render pass (Map.Render) actually run this frame?
+**
+**	Separate from Legacy_Render_Enabled() on purpose. That predicate ALSO gates building placement
+**	and beacon availability, so flipping it to skip the render would silently change those too.
+**	This one is consulted only at the two Map.Render() call sites.
+**
+**	An ETW profile of a slow session attributed 61% of all DLL CPU to GScreenClass::Render, of which
+**	DisplayClass::Redraw_OIcons alone was 54% of the total (CNC_Get_Game_State was 26%, game logic
+**	3%). That pass paints the legacy offscreen page, which only "Original Graphics" mode reads -- and
+**	that mode cannot work in this fork anyway, because CC_Draw_Shape skips the legacy blitter for
+**	objects. So the work is discarded.
+**
+**	Opt-in via AELORIA_SKIP_LEGACY_RENDER=1 (launcher: -SkipLegacyRender / -SLR) because the
+**	WINDOW_MAIN draws it performs are what populate the Aeloria MAIN draw caches
+**	(hasCachedMainDraw / cachedDrawX), which ~22 sites consult to gate graduation, bulk registration
+**	and sustain handoff. The one-shot Map.Render() calls in the CNC_Start_* arming blocks are NOT
+**	gated here, so first-render grace and initial cache seeding still happen.
+*/
+bool Aeloria_LegacyRenderPassEnabled(void)
+{
+	static int s_skipLegacyRender = -1;
+	if (s_skipLegacyRender < 0) {
+		char val[16] = {0};
+		s_skipLegacyRender = (GetEnvironmentVariableA("AELORIA_SKIP_LEGACY_RENDER", val, sizeof(val)) > 0
+		                      && (val[0] == '1' || _stricmp(val, "true") == 0 || _stricmp(val, "on") == 0)) ? 1 : 0;
+		Aeloria_Debug_Log("CNC_INIT legacy_render_skip=%d (AELORIA_SKIP_LEGACY_RENDER)", s_skipLegacyRender);
+	}
+	if (s_skipLegacyRender > 0) {
+		return false;
+	}
+	return DLLExportClass::Legacy_Render_Enabled();
+}
+
 bool DLLExportClass::Legacy_Render_Enabled(void)
 {
+	/*
+	**	NOTE: this predicate means more than "does the legacy renderer run". It also gates building
+	**	placement (Manual_Place vs Unselect_All) and beacon availability. Do NOT repurpose it to skip
+	**	the render pass -- use Aeloria_LegacyRenderPassEnabled() for that, which is checked only at the
+	**	two Map.Render() call sites.
+	**
+	**	Why: an ETW sampling profile of a slow session attributed 61% of all time inside this DLL to
+	**	GScreenClass::Render (Map.Render), of which DisplayClass::Redraw_OIcons alone was 54% of the
+	**	total. That pass paints the legacy offscreen page, which ONLY "Original Graphics" mode
+	**	consumes -- and that mode cannot work in this fork anyway, because CC_Draw_Shape deliberately
+	**	skips the legacy blitter for objects (the Remastered client composites from the
+	**	WINDOW_VIRTUAL object list instead). So the majority of engine time produces a surface that is
+	**	discarded, and would be broken if it were not.
+	**
+	**	For comparison, the whole CNC_Get_Game_State export was 26% and game logic 3%.
+	**
+	**	Why it is OPT-IN rather than simply removed: the WINDOW_MAIN draws that happen during
+	**	Map.Render are what populate the Aeloria MAIN draw caches (hasCachedMainDraw / cachedDrawX),
+	**	and ~22 sites consult Aeloria_HasValidMainDrawCache to gate graduation, bulk registration and
+	**	sustain handoff. With the pass off those caches stay permanently empty. That may be harmless
+	**	-- sustain simply keeps carrying the object -- but it is exactly the machinery behind the
+	**	helicopter/vessel flicker fixes, so it needs verifying in game rather than assuming.
+	**
+	**	Encouraging precedent: the multiplayer branch below already returns false with 2+ humans, so
+	**	the engine is known to run without this pass.
+	*/
 	if (GAME_TO_PLAY == GAME_GLYPHX_MULTIPLAYER) {
 		unsigned int num_humans = 0U;
 		for (int i = 0; i < MULTIPLAYER_COUNT; ++i) {

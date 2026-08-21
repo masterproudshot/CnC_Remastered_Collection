@@ -3451,6 +3451,12 @@ static void DrawSafePlayerPlaceholder(const ObjectClass* object,
 
 void CC_Draw_Shape(const ObjectClass *object, void const * shapefile, int shapenum, int x, int y, WindowNumberType window, ShapeFlags_Type flags, void const * fadingdata, void const * ghostdata, DirType rotation, long virtualscale, int width, int height)
 {
+	// FX export probe (see OBJECT.H) — records which exit swallows bullets and anims. Declared at
+	// function scope because the DLL_Draw_Intercept call sits outside the `if (object)` block below.
+	bool const fxProbe = object && (window == WINDOW_VIRTUAL)
+	                     && (object->What_Am_I() == RTTI_BULLET || object->What_Am_I() == RTTI_ANIM);
+	if (fxProbe) g_AeloriaFxProbeEnter++;
+
 	if (object) {
 		// Build 1 diagnostic: only log for player objects or the very first 10 seconds (throttled after stability)
 		uintptr_t at_plus_8 = *(uintptr_t*)((const char*)object + 8);
@@ -3544,6 +3550,7 @@ void CC_Draw_Shape(const ObjectClass *object, void const * shapefile, int shapen
 					Aeloria_Debug_Log("GRACE FRAME SKIP BAD SHAPE: this=%p RTTI=%d owner=%d shape=%p num=%d w=%d h=%d -- suppressing draw to avoid blitter AV",
 					                  (void*)object, object->What_Am_I(), (int)owner, shapefile, shapenum, width, height);
 				}
+				if (fxProbe) g_AeloriaFxProbeGraceDrop++;
 				return;
 			}
 			if (g_AeloriaEnableVerboseDrawLogs && Is_Player_Exempt(object) && Aeloria_ShouldLogOncePerObject(object, AEL_LOG_PLAYER_EXEMPT_BYPASS)) {
@@ -3561,7 +3568,23 @@ void CC_Draw_Shape(const ObjectClass *object, void const * shapefile, int shapen
 		**	See Is_Plausible_Class_Pointer in OBJECT.H and plan.md Expert Panel section.
 		**	Now also exempts player House objects (via timeout) so they reach the blitter.
 		*/
-		if (!Is_Plausible_Class_Pointer(at_plus_8)) {
+		/*
+		**	The +8 probe is a TECHNO heuristic. It was derived from TechnoClass layouts where a corrupt
+		**	value there correlated with a Class pointer the legacy blitter would fault on. BulletClass
+		**	and AnimClass hold ordinary data at +8 (Height, TarCom, stage counters), so the test fails
+		**	for essentially every projectile and animation -- and the block below then falls through to
+		**	its `return`, silently dropping the draw.
+		**
+		**	That is why export snapshots carried ZERO type=6 and type=7 rows for entire sessions while
+		**	the EXPORT_CENSUS shows bullets and anims reaching this point perfectly healthy
+		**	(seen=12 eligible=12 noimage=0): no cruiser shells, no muzzle flashes, no explosions.
+		**
+		**	On WINDOW_VIRTUAL there is no blitter to protect -- the path only fills a CNCObjectStruct --
+		**	so for a non-techno the guard has nothing to guard and everything to lose. Techno behaviour
+		**	and the MAIN path are deliberately left untouched.
+		*/
+		bool const skipPlus8Guard = (window == WINDOW_VIRTUAL) && !object->Is_Techno();
+		if (!skipPlus8Guard && !Is_Plausible_Class_Pointer(at_plus_8)) {
 			if (Aeloria_TryStatelessTechnoDraw(object, shapenum, x, y, rotation, virtualscale, NULL, HOUSE_NONE)) {
 				return;
 			}
@@ -3592,6 +3615,7 @@ void CC_Draw_Shape(const ObjectClass *object, void const * shapefile, int shapen
 				Aeloria_Debug_Log("HARD_REJECT this=%p RTTI=%d at8=0x%08lx reason=plausible_ptr age=%d fallbacks=%d",
 				                  (void*)object, object->What_Am_I(), (unsigned long)at_plus_8, age, fb);
 			}
+			if (fxProbe) g_AeloriaFxProbePlus8Drop++;
 			return;
 		}
 
@@ -3643,6 +3667,7 @@ void CC_Draw_Shape(const ObjectClass *object, void const * shapefile, int shapen
 			return;
 		}
 
+		if (fxProbe) g_AeloriaFxProbeIntercept++;
 		DLL_Draw_Intercept(shapenum, x, y, width, height, (int)flags, object, rotation, virtualscale, NULL, HOUSE_NONE);
 		return;
 	}
@@ -3749,6 +3774,26 @@ void CC_Draw_Shape(const ObjectClass *object, void const * shapefile, int shapen
 		}
 		return;
 	}
+	/*
+	**	shapenum was only bounded from below. Callers derive the frame index and the shape file
+	**	from two different sources — Shape_Number() goes through Aeloria_Safe_Techno_Type (which
+	**	may hand back a cached or fallback type) while Get_Image_Data() uses the live Class — so a
+	**	disagreement yields an in-range-looking index that is past the end of this file's frame
+	**	table. Build_Frame then walks off the offsets and Buffer_Frame_To_Page dereferences the
+	**	garbage (observed: AV reading 0xFFFFFFFF from UnitClass::Draw_It's ghost/fade path).
+	*/
+	int const frame_count = Get_Build_Frame_Count(shapefile);
+	if (frame_count <= 0 || shapenum >= frame_count) {
+		if (object && Aeloria_ShouldLogOncePerObject(object, AEL_LOG_SHAPENUM_OUT_OF_RANGE)) {
+			Aeloria_Debug_Log("SHAPENUM_OUT_OF_RANGE this=%p RTTI=%d owner=%d shapenum=%d frames=%d w=%d h=%d frame=%u",
+			                  (void*)object, (int)object->What_Am_I(), (int)object->Owner(),
+			                  shapenum, frame_count, width, height, Frame);
+		}
+		if (object && (Is_Player_Exempt(object) || Aeloria_NeedsSafeMainDrawGuard(object))) {
+			DrawSafePlayerPlaceholder(object, x, y, (int)flags, rotation, virtualscale);
+		}
+		return;
+	}
 	if (width <= 0) width = Get_Build_Frame_Width(shapefile);
 	if (height <= 0) height = Get_Build_Frame_Height(shapefile);
 	if (width <= 0 || height <= 0) {
@@ -3765,6 +3810,34 @@ void CC_Draw_Shape(const ObjectClass *object, void const * shapefile, int shapen
 
 	if (window != WINDOW_VIRTUAL && object && shapenum > 0 && width > 0 && height > 0) {
 		Aeloria_NotifyMainDrawCache(object, shapenum, width, height, x, y);
+	}
+
+	/*
+	**	Project Aeloria — do not run the legacy blitter for objects on the tactical window.
+	**
+	**	In the Remastered DLL the player never sees this surface. The client composites its view
+	**	from the object list built by DLL_Draw_Intercept during the WINDOW_VIRTUAL pass; the MAIN
+	**	render exists only to drive the original engine's own offscreen page. That is why objects
+	**	the guards divert away from MAIN (placeholders, eternal-safe produced units) still show up
+	**	in game at all — their pixels never went through here either.
+	**
+	**	What MAIN legitimately contributes is the draw-parameter cache, and that is captured just
+	**	above, before this point. Everything after it is pixels nobody reads.
+	**
+	**	Those unread pixels have been the sole source of six consecutive crashes, every one inside
+	**	Buffer_Frame_To_Page: reads of 0x00000000, 0xFFFFFFFF, 0x16546810, 0x00000075, and a
+	**	privileged-instruction fault from a mis-dispatch landing mid-instruction. The final dump
+	**	settled that the arguments were never at fault — src and dest matched the known-good
+	**	BLITTER_GF_SAMPLE exactly (ESI inside src, EDI == dest_off), the flags decoded correctly
+	**	against the assembler's own equates, and a valid fading table still arrived in the routine
+	**	as EBX=0 with FadingNum wrong too. The blitter's internal state is inconsistent with its
+	**	arguments, and it is 5000 lines of hand-written MASM with self-patching dispatch that
+	**	cannot be repaired safely from here. So stop feeding it.
+	**
+	**	Shape data for objects still flows to the client unchanged via the VIRTUAL pass.
+	*/
+	if (window != WINDOW_VIRTUAL && object != NULL) {
+		return;
 	}
 
 	CC_Draw_Shape(shapefile, shapenum, x, y, window, flags, fadingdata, ghostdata, rotation);
@@ -4041,6 +4114,23 @@ void CC_Draw_Shape(const ObjectClass *object, const char *shape_file_name, void 
 		}
 	}
 
+	/*
+	**	Same rule as the other object overload: the legacy blitter is never called for an object on
+	**	the tactical window. The player does not see that surface — the client composites from the
+	**	object list built during the WINDOW_VIRTUAL pass — and the blitter's self-patching dispatch
+	**	is what produced this entire family of faults.
+	**
+	**	This overload was missed when that guard went in, and it is reached by a different route:
+	**	Techno_Draw_Object_Virtual, which vessels and buildings use to draw accessories by explicit
+	**	shape name (turrets, the WEAP2 roof). Hence the crash still arriving through
+	**	VesselClass::Draw_It even after objects stopped reaching the other path.
+	**
+	**	The draw-parameter cache above still runs, so nothing the client needs is lost.
+	*/
+	if (window != WINDOW_VIRTUAL && object != NULL) {
+		return;
+	}
+
 	CC_Draw_Shape(shapefile, shapenum, x, y, window, flags, fadingdata, ghostdata, rotation);
 }
 
@@ -4063,9 +4153,14 @@ static void DrawSafePlaceholder(const ObjectClass* object,
 
 	int size = 32; // larger and more visible placeholder during long exemption for corrupted early objects
 
-	// B: Deep breadcrumb inside placeholder
-	Aeloria_Debug_Log("PLACEHOLDER_ENTER this=%p size=%d has_creation=%d", (void*)object, size,
-	                  g_AeloriaObjectCreationFrame.find(reinterpret_cast<uintptr_t>(object)) != g_AeloriaObjectCreationFrame.end() ? 1 : 0);
+	// B: Deep breadcrumb inside placeholder.
+	// Guarded: the has_creation argument is a std::map lookup that was evaluated on EVERY placeholder
+	// draw even with logging off (12,186 times in one profiled session), because arguments are
+	// evaluated before Aeloria_Debug_Log can discard the message.
+	if (g_AeloriaEnableVerboseDrawLogs) {
+		Aeloria_Debug_Log("PLACEHOLDER_ENTER this=%p size=%d has_creation=%d", (void*)object, size,
+		                  g_AeloriaObjectCreationFrame.find(reinterpret_cast<uintptr_t>(object)) != g_AeloriaObjectCreationFrame.end() ? 1 : 0);
+	}
 
 	// Guard: during the absolute first Map.Render() (g_EarlyLoadGraceActive is only true for
 	// that one call, set/cleared in the CNC_Start_* arming blocks). The DLL client path can AV
@@ -4146,6 +4241,13 @@ void CC_Draw_Pip(const ObjectClass *object, void const * shapefile, int shapenum
 		return;
 	}
 
+	// Third object-bearing route into the legacy blitter. Same rule as the two CC_Draw_Shape
+	// overloads: the client already has the pips from DLL_Draw_Pip_Intercept above, and the MAIN
+	// draw only paints the offscreen page nobody composites from.
+	if (object != NULL) {
+		return;
+	}
+
 	CC_Draw_Shape(shapefile, shapenum, x, y, window, flags, fadingdata, ghostdata, rotation);
 }
 
@@ -4196,6 +4298,106 @@ void CC_Draw_Line(int x, int y, int x1, int y1, unsigned char color, int frame, 
  * HISTORY:                                                                                    *
  *   02/21/1995 JLB : Created.                                                                 *
  *=============================================================================================*/
+/*
+**	Mirrors tShapeHeaderType in 2KEYFRAM.CPP. Declared locally so this guard does not depend on
+**	that file exporting its private struct.
+*/
+extern "C" {
+	extern char * BigShapeBufferStart;
+	extern char * TheaterShapeBufferStart;
+	extern BOOL UseBigShapeBuffer;
+}
+extern unsigned BigShapeBufferLength;
+extern unsigned TheaterShapeBufferLength;
+
+/*
+**	Project Aeloria — size the client's sprite rect the way vanilla's VIRTUAL path does.
+**
+**	CC_Draw_Shape fills width/height from Get_Build_Frame_Width/Height(shapefile) before handing
+**	them to DLL_Draw_Intercept, i.e. the real pixel size of the frame being drawn. The Aeloria
+**	Draw_It paths instead pass TypeClass::Dimensions(), which is the logical selection box and
+**	nothing like the sprite: InfantryTypeClass::Dimensions is a flat 14x20 and the ObjectTypeClass
+**	default is 10x10. The client scales what it draws to this rect, so every object built on the
+**	guarded paths renders undersized — infantry most visibly, and vessels/aircraft small enough to
+**	read as missing or flickering. Prefer the true frame size and keep the caller's value only as
+**	a fallback when no shape is available.
+*/
+/*
+**	Clamp a frame index to what the shape file actually contains, for the CLIENT export path.
+**
+**	The blitter guard in CC_Draw_Shape covers the legacy path, but objects no longer reach it — they
+**	go to the client via DLL_Draw_Intercept, which never validated the index. An index past the end
+**	is silently dropped by the renderer, so the object is exported yet invisible. Building shape
+**	numbers are especially exposed: Shape_Number() returns Fetch_Stage(), which is driven by
+**	Fetch_Anim_Control() -> Aeloria_Building_Safe_Type, so a stale cachedTypeEnum cycles ANOTHER
+**	building's animation stages against this building's sprite.
+**
+**	Falls back to frame 0 (intact/first frame) rather than dropping the draw, and logs once per
+**	object so a recurring offender is visible instead of silently missing.
+*/
+int Aeloria_ClampClientShape(const ObjectClass * object, void const * shapefile, int shapenum)
+{
+	if (shapenum < 0) return 0;
+	if (shapefile == NULL) return shapenum;
+
+	int const frames = (int)Get_Build_Frame_Count(shapefile);
+	if (frames <= 0 || shapenum < frames) {
+		return shapenum;
+	}
+
+	if (object != NULL && Aeloria_ShouldLogOncePerObject(object, AEL_LOG_SHAPENUM_OUT_OF_RANGE)) {
+		Aeloria_Debug_Log("CLIENT_SHAPE_CLAMPED this=%p RTTI=%d owner=%d shapenum=%d frames=%d frame=%u (exported frame 0 instead)",
+		                  (void*)object, (int)object->What_Am_I(), (int)object->Owner(),
+		                  shapenum, frames, Frame);
+	}
+	return 0;
+}
+
+void Aeloria_ClientDrawDims(void const * shapefile, int & width, int & height)
+{
+	if (shapefile == NULL) return;
+
+	int const w = (int)Get_Build_Frame_Width(shapefile);
+	int const h = (int)Get_Build_Frame_Height(shapefile);
+	if (w > 0 && h > 0) {
+		width = w;
+		height = h;
+	}
+}
+
+static bool Aeloria_Blitter_Source_Is_Sane(void const * buffer)
+{
+	if (buffer == NULL) return(false);
+	if (!UseBigShapeBuffer) return(true);
+
+	struct AeloriaShapeHeader {
+		unsigned	draw_flags;
+		char *	shape_data;
+		int		shape_buffer;
+	};
+	AeloriaShapeHeader const * header = (AeloriaShapeHeader const *)buffer;
+
+	// shape_buffer is a 0/1 discriminator (2KEYFRAM.CPP:444 / :470); anything else means this is
+	// not a header at all.
+	int const which = header->shape_buffer;
+	if (which != 0 && which != 1) return(false);
+
+	char const * base = which ? TheaterShapeBufferStart : BigShapeBufferStart;
+	if (base == NULL) return(false);
+
+	/*
+	**	shape_data is an offset into that buffer, stored as an offset precisely so it survives the
+	**	Resize_Alloc rebase. Bound it at BOTH ends: a plausible-looking but out-of-range offset
+	**	still resolves to a real-looking address the blitter will happily read (observed: AV at
+	**	0x16546810, which is base + a garbage offset, not a null).
+	*/
+	unsigned const length = which ? TheaterShapeBufferLength : BigShapeBufferLength;
+	long const offset = (long)header->shape_data;
+	if (offset < 0 || (unsigned)offset >= length) return(false);
+
+	return(true);
+}
+
 void CC_Draw_Shape(void const * shapefile, int shapenum, int x, int y, WindowNumberType window, ShapeFlags_Type flags, void const * fadingdata, void const * ghostdata, DirType rotation)
 {
 	int predoffset;
@@ -4256,6 +4458,33 @@ void CC_Draw_Shape(void const * shapefile, int shapenum, int x, int y, WindowNum
 														WindowList[window][WINDOWWIDTH],
 														WindowList[window][WINDOWHEIGHT]);
 			unsigned char * buffer = (unsigned char *) shape_pointer;	//Get_Shape_Header_Data((void*)shape_pointer);
+
+			/*
+			**	Project Aeloria — validate what the blitter will ACTUALLY dereference.
+			**
+			**	Buffer_Frame_To_Page tests src for NULL on entry (KEYFBUFF.ASM:1236) and only
+			**	afterwards rewrites it through the big-shape-buffer header:
+			**	    src = header->shape_data + (header->shape_buffer ? TheaterShapeBufferStart
+			**	                                                    : BigShapeBufferStart)
+			**	(KEYFBUFF.ASM:1243-1258, mirrored in C by Get_Shape_Header_Data). So the existing
+			**	"buffer != nullptr" tests at the call sites below prove nothing — the pointer the
+			**	blitter reads is produced after that check, from data inside the buffer. When this
+			**	object is not really a shape header the result lands anywhere, which is all three
+			**	observed faults: read 0xFFFFFFFF, read 0x00000000, and an illegal instruction once
+			**	the garbage reaches the computed jump. UseBigShapeBuffer is unconditionally true
+			**	here (Check_Use_Compressed_Shapes), so this path is always live.
+			*/
+			if (!Aeloria_Blitter_Source_Is_Sane(buffer)) {
+				// Rate-limited: this overload has no ObjectClass, so log the first few and then
+				// sample. If this never appears, the guard is not the reason something looks wrong.
+				static unsigned s_rejects = 0;
+				s_rejects++;
+				if (s_rejects <= 8 || (s_rejects % 500) == 0) {
+					Aeloria_Debug_Log("BLITTER_SOURCE_REJECTED n=%u shapefile=%p shapenum=%d w=%d h=%d flags=0x%08x window=%d frame=%u",
+					                  s_rejects, shapefile, shapenum, width, height, (unsigned)flags, (int)window, Frame);
+				}
+				return;
+			}
 
 #else	//WIN32
 		if ( Build_Frame(shapefile, shapenum, _ShapeBuffer ) <= (unsigned long)_ShapeBufferSize) {
@@ -4321,25 +4550,77 @@ void CC_Draw_Shape(void const * shapefile, int shapenum, int x, int y, WindowNum
 			}
 
 			if (draw_window.Lock()) {
-				if ((flags & (SHAPE_GHOST|SHAPE_FADING)) == (SHAPE_GHOST|SHAPE_FADING)) {
-					// Defensive: ensure ghost/fading data and buffer are valid before calling
-					// the blitter which may dereference the source pointer.
-					const void *gd = ghostdata ? ghostdata : DisplayClass::SpecialGhost;
-					const void *fd = fadingdata ? fadingdata : DisplayClass::FadingShade;
+				/*
+				**	The blitter reads whichever optional tables the flags advertise, indexing them
+				**	by source pixel (KEYFBUFF.ASM:3109-3128). A NULL table therefore faults at a
+				**	low address rather than being ignored. Only the ghost+fade branch below was
+				**	ever checked; the fading-only and ghost-only branches passed their table raw,
+				**	and the entry substitution at the top of this function only fires when the
+				**	matching flag is set and can itself leave the pointer NULL if the DisplayClass
+				**	table was never loaded. Resolve every table once, up front, and drop the flag
+				**	when nothing valid backs it so the blitter stops looking for it.
+				*/
+				const void *gd = ghostdata ? ghostdata : DisplayClass::SpecialGhost;
+				const void *fd = fadingdata ? fadingdata : DisplayClass::FadingShade;
+				ShapeFlags_Type const base_flags = (ShapeFlags_Type)(flags | SHAPE_TRANS);
+				ShapeFlags_Type safe_flags = base_flags;
+				if (gd == nullptr) safe_flags = (ShapeFlags_Type)(safe_flags & ~SHAPE_GHOST);
+				if (fd == nullptr) safe_flags = (ShapeFlags_Type)(safe_flags & ~SHAPE_FADING);
 
-					if (gd != nullptr && fd != nullptr && buffer != nullptr) {
-						Buffer_Frame_To_Page(x, y, width, height, buffer, draw_window, flags | SHAPE_TRANS, gd, fd, 1, predoffset);
-					} else {
-						// Invalid data: skip ghost+fade path to avoid access violation.
+				if (safe_flags != base_flags) {
+					static unsigned s_dropped = 0;
+					s_dropped++;
+					if (s_dropped <= 8 || (s_dropped % 500) == 0) {
+						Aeloria_Debug_Log("BLITTER_TABLE_MISSING n=%u ghost=%p fade=%p special_ghost=%p fading_shade=%p flags=0x%08x -> 0x%08x frame=%u",
+						                  s_dropped, ghostdata, fadingdata,
+						                  (void*)DisplayClass::SpecialGhost, (void*)DisplayClass::FadingShade,
+						                  (unsigned)flags, (unsigned)safe_flags, Frame);
 					}
+				}
+
+				/*
+				**	Destination is the last input the blitter dereferences that nothing here has
+				**	validated. Lock() succeeding does not by itself guarantee a mapped Offset.
+				*/
+				if (draw_window.Get_Offset() == 0) {
+					static unsigned s_nodest = 0;
+					s_nodest++;
+					if (s_nodest <= 8 || (s_nodest % 500) == 0) {
+						Aeloria_Debug_Log("BLITTER_NO_DEST n=%u window=%d w=%d h=%d frame=%u",
+						                  s_nodest, (int)window, width, height, Frame);
+					}
+					draw_window.Unlock();
+					return;
+				}
+
+				/*
+				**	One-shot dump of a known-good ghost+fade draw. Gives us the exact parameter set
+				**	to diff against the crashing one, since every guard above passes clean.
+				*/
+				{
+					static unsigned s_gf = 0;
+					if ((safe_flags & (SHAPE_GHOST|SHAPE_FADING)) == (SHAPE_GHOST|SHAPE_FADING) && s_gf < 3) {
+						s_gf++;
+						Aeloria_Debug_Log("BLITTER_GF_SAMPLE n=%u src=%p dest_off=0x%08lx gd=%p fd=%p w=%d h=%d x=%d y=%d shapenum=%d flags=0x%08x frame=%u",
+						                  s_gf, buffer, (unsigned long)draw_window.Get_Offset(), gd, fd,
+						                  width, height, x, y, shapenum, (unsigned)safe_flags, Frame);
+					}
+				}
+
+				if ((safe_flags & (SHAPE_GHOST|SHAPE_FADING)) == (SHAPE_GHOST|SHAPE_FADING)) {
+					Buffer_Frame_To_Page(x, y, width, height, buffer, draw_window, safe_flags, gd, fd, 1, predoffset);
 				} else {
-					if (flags & SHAPE_FADING) {
-						Buffer_Frame_To_Page(x, y, width, height, buffer, draw_window, flags | SHAPE_TRANS, fadingdata, 1, predoffset);
+					if (safe_flags & SHAPE_FADING) {
+						Buffer_Frame_To_Page(x, y, width, height, buffer, draw_window, safe_flags, fd, 1, predoffset);
 					} else {
-						if (flags & SHAPE_PREDATOR) {
-							Buffer_Frame_To_Page(x, y, width, height, buffer, draw_window, flags | SHAPE_TRANS, predoffset);
+						if (safe_flags & SHAPE_PREDATOR) {
+							Buffer_Frame_To_Page(x, y, width, height, buffer, draw_window, safe_flags, predoffset);
 						} else {
-							Buffer_Frame_To_Page(x, y, width, height, buffer, draw_window, flags | SHAPE_TRANS, ghostdata, predoffset);
+							if (safe_flags & SHAPE_GHOST) {
+								Buffer_Frame_To_Page(x, y, width, height, buffer, draw_window, safe_flags, gd, predoffset);
+							} else {
+								Buffer_Frame_To_Page(x, y, width, height, buffer, draw_window, safe_flags, predoffset);
+							}
 						}
 					}
 				}
