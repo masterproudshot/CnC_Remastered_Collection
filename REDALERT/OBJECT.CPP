@@ -161,6 +161,41 @@ ObjectClass::ObjectClass(RTTIType rtti, int id) :
  *=============================================================================================*/
 void const * ObjectClass::Get_Image_Data(void) const
 {
+	/*
+	**	Project Aeloria — restore the original "one source of truth" invariant.
+	**
+	**	Vanilla derived both halves of a draw from Class: Shape_Number() read Class->... and the
+	**	shape file came from Class_Of(). An index could never be wrong for its file, which is why
+	**	the blitter has no bounds check. Aeloria rewired every Shape_Number() through
+	**	Aeloria_Safe_Techno_Type, which substitutes a cached or fallback type (JEEP / E1 / PILLBOX)
+	**	whenever Class is distrusted — but left the shape file coming from Class_Of(). The two can
+	**	now disagree, and a frame index computed for one type against another type's file walks
+	**	Build_Frame off the frame table: Buffer_Frame_To_Page then reads garbage (0xC0000005) or
+	**	executes it (0xC000001D). Take the file from the same type the index came from.
+	**
+	**	Gated on Aeloria_LiveClassTrustworthy() so this only fires where Class_Of() would hand back
+	**	garbage anyway. When the live Class is sound we take it, byte for byte as vanilla did —
+	**	substituting a cached type for a healthy object would draw the wrong sprite and animation
+	**	(harvesters are the obvious casualty: this fork force-writes their cachedTypeEnum in
+	**	Aeloria_RelocateHarvesterStability, so a healthy harvester must never be re-typed here).
+	*/
+	if (Is_Techno() && !Aeloria_LiveClassTrustworthy(this)) {
+		TechnoTypeClass const * ttype = Aeloria_Safe_Techno_Type(static_cast<TechnoClass const *>(this));
+		if (ttype != NULL) {
+			void const * data = ttype->Get_Image_Data();
+			if (data != NULL) return(data);
+			/*
+			**	The safe type resolved but carries no art yet (ImageData is only filled in by
+			**	One_Time() once the mixfiles are registered). Falling through would dispatch a
+			**	virtual through the very Class we just distrusted -- the null-vtable AV this whole
+			**	guard exists to avoid. NULL simply means "no image this frame": Is_Drawable() drops
+			**	the object, the census counts it under noimg, and the sustain net re-feeds it once
+			**	art is up. Aeloria_Safe_Techno_Type never returns NULL for a techno, so this is
+			**	reached only in that pre-art window.
+			*/
+			return(NULL);
+		}
+	}
 	return(Class_Of().Get_Image_Data());
 }
 

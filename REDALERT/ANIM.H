@@ -55,7 +55,12 @@ class AnimClass : public ObjectClass, public StageClass {
 		AnimClass(NoInitClass const & x) : ObjectClass(x), Class(x), StageClass(x) {};
 		virtual ~AnimClass(void);
 
-		operator AnimType(void) const {return Class->Type;};
+		// Null-safe like UnitClass/VesselClass: a raw Class->Type deref makes every caller
+		// (Shape_Number, draw guards) unsafe on an object with an unsettled +8.
+		operator AnimType(void) const {
+			AnimTypeClass const* t = Class;
+			return t ? t->Type : ANIM_NONE;
+		};
 
 		static void * operator new(size_t size);
 		static void * operator new(size_t , void * ptr) {return(ptr);};
@@ -89,11 +94,20 @@ class AnimClass : public ObjectClass, public StageClass {
 		virtual COORDINATE Sort_Y(void) const;
 		virtual LayerType In_Which_Layer(void) const;
 		virtual ObjectTypeClass const & Class_Of(void) const {return *Class;};
+		/*
+		**	See the full note in BULLET.H. Two conditions removed:
+		**	  Class.Raw() <= 0     rejected heap index 0, a legal type id.
+		**	  t->MaxStrength <= 0  AnimTypeClass inherits MaxStrength(0) from ObjectTypeClass and never
+		**	                       sets it -- an animation is not damageable -- so this was false for
+		**	                       every anim type, making Is_Drawable() fail and AnimClass::Draw_It
+		**	                       return immediately. No explosions, muzzle flashes or impact effects
+		**	                       ever reached the client (census: anims seen=19 elig=19, fx enter=0).
+		*/
 		bool Class_Is_Valid(void) const override {
-			if (!Class.Is_Valid() || Class.Raw() <= 0) return false;
+			if (!Class.Is_Valid() || Class.Raw() < 0) return false;
 			const AnimTypeClass* t = Class;
 			if (!t) return false;
-			if (t->RTTI != RTTI_ANIMTYPE || t->MaxStrength <= 0) return false;
+			if (t->RTTI != RTTI_ANIMTYPE) return false;
 
 			/*
 			**	Project Aeloria — TEMPORARY BAND-AID (see Is_Plausible_Class_Pointer in OBJECT.H
@@ -107,7 +121,9 @@ class AnimClass : public ObjectClass, public StageClass {
 				sprintf(_buf, "REJECTED Class_Is_Valid this=%p RTTI=%d Class.Raw=%d at+8=0x%08X\r\n",
 				        this, What_Am_I(), Class.Raw(), (unsigned)effective);
 				OutputDebugStringA(_buf);
-				return false;
+				// Tactical relaxation, matching the other Class_Is_Valid overrides — otherwise muzzle
+				// flashes, explosions and impact effects silently stop rendering.
+				return true;
 			}
 
 			return true;

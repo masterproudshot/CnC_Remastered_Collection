@@ -78,17 +78,24 @@ class VesselClass : public DriveClass
 		static void * operator new(size_t size);
 		static void * operator new(size_t , void * ptr) {return(ptr);};
 		static void operator delete(void *ptr);
-		operator VesselType(void) const {return Class->Type;};
+		// Null-safe like UnitClass::operator UnitType (UNIT.H:149). The raw Class->Type deref made
+		// VesselClass::Shape_Number() unsafe for an untrusted vessel, which forced the caller onto a
+		// shape-0 fallback — frame 0 is FACING NORTH, so the hull pointed north no matter which way
+		// the ship sailed while its turret tracked correctly.
+		operator VesselType(void) const {
+			VesselTypeClass const* t = Class;
+			return t ? t->Type : VESSEL_NONE;
+		};
 
 		static void Init(void);
 
 		virtual ~VesselClass(void);
 		virtual ObjectTypeClass const & Class_Of(void) const;
 		bool Class_Is_Valid(void) const override {
-			if (!Class.Is_Valid() || Class.Raw() <= 0) return false;
+			if (!Class.Is_Valid() || Class.Raw() < 0) return false;
 			const VesselTypeClass* t = Class;
 			if (!t) return false;
-			if (t->RTTI != RTTI_VESSELTYPE || t->MaxStrength <= 0) return false;
+			if (t->RTTI != RTTI_VESSELTYPE) return false;
 
 			/*
 			**	Project Aeloria — TEMPORARY BAND-AID (see Is_Plausible_Class_Pointer in OBJECT.H
@@ -102,7 +109,10 @@ class VesselClass : public DriveClass
 				sprintf(_buf, "REJECTED Class_Is_Valid this=%p RTTI=%d Class.Raw=%d at+8=0x%08X\r\n",
 				        this, What_Am_I(), Class.Raw(), (unsigned)effective);
 				OutputDebugStringA(_buf);
-				return false;
+				// Tactical relaxation, matching UnitClass and BuildingClass — see the note in AIRCRAFT.H.
+				// Is_Drawable() gates Draw_It entirely, so a false here silently removed the vessel from
+				// the tactical view and the radar together.
+				return true;
 			}
 
 			return true;

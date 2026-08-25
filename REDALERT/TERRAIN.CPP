@@ -305,7 +305,11 @@ void TerrainClass::Draw_It(int x, int y, WindowNumberType window) const
 	**	Early-out if the Class pointer is not yet valid (can happen very early
 	**	during scenario load before TypeClasses are fully constructed).
 	*/
-	if (!Is_Drawable(this)) return;
+	// Inlined from Is_Drawable() to fetch the shape pointer once -- see BuildingClass::Draw_It.
+	// TerrainClass::Draw_It was 506 samples in the ETW profile.
+	if (!Class_Is_Valid()) return;
+	void const * const cached_image_data = Get_Image_Data();
+	if (cached_image_data == NULL) return;
 
 	// Aggressive real-time suppression for non-player Terrain verbose spam.
 	// The old Frame-based throttle + counter was too weak because Frame moves extremely
@@ -327,7 +331,7 @@ void TerrainClass::Draw_It(int x, int y, WindowNumberType window) const
 	}
 	void const * shapedata;
 
-	shapedata = Get_Image_Data();
+	shapedata = cached_image_data;
 	if (shapedata) {
 		int	shapenum = 0;
 

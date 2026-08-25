@@ -1127,6 +1127,8 @@ bool Aeloria_TrySafeVirtualDrawIntercept(const ObjectClass* object, int shapenum
                                          const char* shape_file_name, char override_owner);
 void Aeloria_Seed_Building_Creation(BuildingClass* building);
 void Aeloria_RefreshBuildingStabilityOnSeed(BuildingClass* building, bool humanDeployed);
+void Aeloria_ClientDrawDims(void const * shapefile, int & width, int & height);
+int Aeloria_ClampClientShape(const ObjectClass * object, void const * shapefile, int shapenum);
 bool Aeloria_TryNotifyProducedUnitMainDrawCache(const ObjectClass* obj, int shape_number, int width, int height,
                                                 int draw_x, int draw_y, bool runtime_bad_plus_8);
 

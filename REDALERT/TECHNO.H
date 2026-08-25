@@ -272,7 +272,7 @@ class TechnoClass :	public RadioClass,
 		virtual int How_Many_Survivors(void) const;
 		virtual DirType Turret_Facing(void) const {return(PrimaryFacing.Current());}
 		CELL Nearby_Location(TechnoClass const * from=NULL, int locationmod=0) const;
-		TechnoTypeClass * Techno_Type_Class(void) const {return((TechnoTypeClass *)&Class_Of());};
+		TechnoTypeClass * Techno_Type_Class(void) const;
 		bool Is_Visible_On_Radar(void) const;
 		int Anti_Air(void) const;
 		int Anti_Armor(void) const;

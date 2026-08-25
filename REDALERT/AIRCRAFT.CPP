@@ -484,14 +484,28 @@ static void Aeloria_ProducedAircraftEmitClientDraw(const AircraftClass* aircraft
 	const bool fixedWing = aircraft_type->IsFixedWing;
 	const bool rotorEquipped = aircraft_type->IsRotorEquipped;
 	int bodyShape = 0;
-	if (!fixedWing) {
+	if (Aeloria_LiveClassTrustworthy(static_cast<const ObjectClass*>(aircraft))) {
+		// Real frame when the object is sound, matching UnitClass/VesselClass. The guarded helper
+		// below only knows static body facings.
+		bodyShape = aircraft->Shape_Number();
+	} else if (!fixedWing) {
 		bodyShape = Aeloria_GuardedAircraftShapeNumber(aircraft);
 		if (bodyShape <= 0) {
 			bodyShape = 16;
 		}
 	}
 
-	DLL_Draw_Intercept(bodyShape, x, y, drawW, drawH, AELORIA_CLIENT_DRAW_FLAGS_CENTER,
+	/*
+	**	The body must be lifted by the aircraft's altitude exactly as TechnoClass::Techno_Draw_Object
+	**	does on the normal path (`y -= Lepton_To_Pixel(Height)`). This helper skipped it while
+	**	Draw_Rotors applies the same offset internally, so an airborne helicopter's rotor sat a full
+	**	flight-level (~24px) above its hull — the reported "rotors not properly positioned relative
+	**	to the copter", visible only while flying. Draw_Rotors still receives the UNADJUSTED y below,
+	**	since it does its own subtraction.
+	*/
+	int const bodyY = y - Lepton_To_Pixel(aircraft->Height);
+
+	DLL_Draw_Intercept(bodyShape, x, bodyY, drawW, drawH, AELORIA_CLIENT_DRAW_FLAGS_CENTER,
 	                   const_cast<AircraftClass*>(aircraft), DIR_N, 0x100, nullptr, (char)aircraft->Owner());
 
 	if (rotorEquipped) {
@@ -501,6 +515,19 @@ static void Aeloria_ProducedAircraftEmitClientDraw(const AircraftClass* aircraft
 			jitter = _jitter[::Frame % 16];
 		}
 		const_cast<AircraftClass*>(aircraft)->Draw_Rotors(x, y + jitter, window);
+	}
+
+	/*
+	**	Pips are emitted by TechnoClass::Draw_It, which the guarded paths that call this helper skip
+	**	entirely — for an aircraft those pips ARE the ammo readout (AircraftClass::Pip_Count returns
+	**	Ammo), which is why helicopter ammo never displayed. Anchored on the logical Dimensions() box
+	**	like TechnoClass::Draw_It, and lifted with the body so it tracks an airborne aircraft.
+	*/
+	{
+		int pipW = 0;
+		int pipH = 0;
+		aircraft_type->Dimensions(pipW, pipH);
+		const_cast<AircraftClass*>(aircraft)->Draw_Pips((x - pipW / 2) + 5, bodyY + pipH / 2 - 3, window);
 	}
 
 	uintptr_t key = reinterpret_cast<uintptr_t>(aircraft);
@@ -524,7 +551,10 @@ void AircraftClass::Draw_It(int x, int y, WindowNumberType window) const
 	**	Early-out if the Class pointer is not yet valid (can happen very early
 	**	during scenario load before TypeClasses are fully constructed).
 	*/
-	if (!Is_Drawable(this)) return;
+	// Inlined from Is_Drawable() to fetch the shape pointer once -- see BuildingClass::Draw_It.
+	if (!Class_Is_Valid()) return;
+	void const * const cached_image_data = Get_Image_Data();
+	if (cached_image_data == NULL) return;
 
 	AircraftTypeClass const* aircraft_type = static_cast<AircraftTypeClass const*>(Aeloria_Safe_Techno_Type(this));
 	if (aircraft_type == nullptr) return;
@@ -548,6 +578,9 @@ void AircraftClass::Draw_It(int x, int y, WindowNumberType window) const
 	aircraft_type->Dimensions(drawW, drawH);
 	if (drawW <= 0) drawW = 48;
 	if (drawH <= 0) drawH = 48;
+	// Real frame size for the client rect — undersized rects are why helicopters often fail to
+	// show up at all.
+	Aeloria_ClientDrawDims(cached_image_data, drawW, drawH);
 
 	uintptr_t at_plus_8 = *(uintptr_t*)((const char*)this + 8);
 	const bool bad_plus_8 = !Is_Plausible_Class_Pointer(at_plus_8);
@@ -600,11 +633,23 @@ void AircraftClass::Draw_It(int x, int y, WindowNumberType window) const
 
 	if (window == WINDOW_VIRTUAL && useGuardedIntercept) {
 		Aeloria_LogProducedAircraftFirstDrawIfNeeded(this, window, guardedFlag, bad_plus_8 ? 1 : 0);
-		int virtualShape = Aeloria_GuardedAircraftShapeNumber(this);
-		if (virtualShape <= 0) {
-			virtualShape = 16;
+		/*
+		**	Third VIRTUAL emit path for aircraft, and it had none of the three corrections the other
+		**	two received: static facing shape instead of the real one, no altitude lift on the body
+		**	(while Draw_Rotors applies its own, so the rotor floats), and no pips (which for an
+		**	aircraft are the ammo readout).
+		*/
+		int virtualShape = 0;
+		if (Aeloria_LiveClassTrustworthy(selfObj)) {
+			virtualShape = Shape_Number();
+		} else {
+			virtualShape = Aeloria_GuardedAircraftShapeNumber(this);
+			if (virtualShape <= 0) {
+				virtualShape = 16;
+			}
 		}
-		DLL_Draw_Intercept(virtualShape, x, y, drawW, drawH, AELORIA_CLIENT_DRAW_FLAGS_CENTER,
+		int const bodyY = y - Lepton_To_Pixel(Height);
+		DLL_Draw_Intercept(virtualShape, x, bodyY, drawW, drawH, AELORIA_CLIENT_DRAW_FLAGS_CENTER,
 		                   const_cast<AircraftClass*>(this), DIR_N, 0x100, nullptr, (char)Owner());
 		if (aircraft_type->IsRotorEquipped) {
 			int jitter = 0;
@@ -613,6 +658,12 @@ void AircraftClass::Draw_It(int x, int y, WindowNumberType window) const
 				jitter = _jitter[::Frame % 16];
 			}
 			const_cast<AircraftClass*>(this)->Draw_Rotors(x, y + jitter, window);
+		}
+		{
+			int pipW = 0;
+			int pipH = 0;
+			aircraft_type->Dimensions(pipW, pipH);
+			const_cast<AircraftClass*>(this)->Draw_Pips((x - pipW / 2) + 5, bodyY + pipH / 2 - 3, window);
 		}
 		return;
 	}
@@ -644,7 +695,21 @@ void AircraftClass::Draw_It(int x, int y, WindowNumberType window) const
 		Aeloria_LogProducedAircraftFirstDrawIfNeeded(this, window, 0, bad_plus_8 ? 1 : 0);
 	}
 
-	// 5z-m8/m12: seed MAIN cache without legacy blitter; VIRTUAL waits until cache exists.
+	/*
+	**	5z-m8/m12: seed the MAIN cache without the legacy blitter.
+	**
+	**	This used to fall through to a bare `return` on WINDOW_VIRTUAL, emitting NOTHING to the
+	**	client — and VIRTUAL is the pass Get_Layer_State builds the client object list from. So a
+	**	produced aircraft without a MAIN tactical cache was simply absent from the export, missing
+	**	from the tactical view and the radar together. mainCacheReady only becomes true while the
+	**	aircraft is being drawn on MAIN, and AircraftClass::AI stops calling Mark() once it is
+	**	landed in LAYER_GROUND, so a helicopter that lands never recovers: exactly the reported
+	**	"flew in and stopped = visible, moved and landed again = invisible". Export snapshots put
+	**	aircraft in only 5 of 40 samples.
+	**
+	**	Emit on VIRTUAL the same way the sustain-handoff block below already does, and keep the
+	**	MAIN-only cache seeding unchanged.
+	*/
 	if (producedTracked && !mainCacheReady && !useGuardedIntercept) {
 		if (window != WINDOW_VIRTUAL) {
 			int liteShape = Aeloria_GuardedAircraftShapeNumber(this);
@@ -659,7 +724,9 @@ void AircraftClass::Draw_It(int x, int y, WindowNumberType window) const
 				Aeloria_ProducedAircraftBulkDrawCoords(this, x, y, bulkX, bulkY);
 				Aeloria_TryNotifyProducedUnitMainDrawCache(selfObj, liteShape, drawW, drawH, bulkX, bulkY, bad_plus_8);
 			}
+			return;
 		}
+		Aeloria_ProducedAircraftEmitClientDraw(this, x, y, window, drawW, drawH, aircraft_type);
 		return;
 	}
 

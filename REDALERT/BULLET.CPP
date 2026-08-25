@@ -560,9 +560,13 @@ void BulletClass::Draw_It(int x, int y, WindowNumberType window) const
 	*/
 	if (!Is_Drawable(this)) return;
 
-	Aeloria_Debug_Log("Bullet guard passed this=%p Class.Raw=%ld - proceeding to draw", (void*)this, Class.Raw());
-
-	Aeloria_Debug_Log("Bullet about to access Class->IsInvisible this=%p Class.Raw=%ld", (void*)this, Class.Raw());
+	// Same as ANIM.CPP: unconditional per-projectile, per-frame logging with a flush per line.
+	if (g_AeloriaEnableVerboseDrawLogs && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_GUARD_PASSED)) {
+		Aeloria_Debug_Log("Bullet guard passed this=%p Class.Raw=%ld - proceeding to draw", (void*)this, Class.Raw());
+	}
+	if (g_AeloriaEnableVerboseDrawLogs && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_GET_IMAGE_DATA)) {
+		Aeloria_Debug_Log("Bullet about to access Class->IsInvisible this=%p Class.Raw=%ld", (void*)this, Class.Raw());
+	}
 	/*
 	**	Certain projectiles aren't visible. This includes small bullets (which are actually
 	**	invisible) and flame thrower flames (which are rendered as an animation instead of a projectile).

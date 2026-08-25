@@ -61,7 +61,12 @@ class TerrainClass : public ObjectClass, public StageClass
 		TerrainClass(TerrainType id, CELL cell);
 		TerrainClass(NoInitClass const & x) : ObjectClass(x), Class(x), StageClass(x) {};
 		virtual ~TerrainClass(void);
-		operator TerrainType(void) const {return Class->Type;};
+		// Null-safe like UnitClass/VesselClass: a raw Class->Type deref makes every caller
+		// (Shape_Number, draw guards) unsafe on an object with an unsettled +8.
+		operator TerrainType(void) const {
+			TerrainTypeClass const* t = Class;
+			return t ? t->Type : TERRAIN_NONE;
+		};
 
 		static void Init(void);
 
@@ -75,10 +80,10 @@ class TerrainClass : public ObjectClass, public StageClass
 		*/
 		virtual ObjectTypeClass const & Class_Of(void) const {return *Class;};
 		bool Class_Is_Valid(void) const override {
-			if (!Class.Is_Valid() || Class.Raw() <= 0) return false;
+			if (!Class.Is_Valid() || Class.Raw() < 0) return false;
 			const TerrainTypeClass* t = Class;
 			if (!t) return false;
-			if (t->RTTI != RTTI_TERRAINTYPE || t->MaxStrength <= 0) return false;
+			if (t->RTTI != RTTI_TERRAINTYPE) return false;
 
 			/*
 			**	Project Aeloria — TEMPORARY BAND-AID (see Is_Plausible_Class_Pointer in OBJECT.H
@@ -92,7 +97,8 @@ class TerrainClass : public ObjectClass, public StageClass
 				sprintf(_buf, "REJECTED Class_Is_Valid this=%p RTTI=%d Class.Raw=%d at+8=0x%08X\r\n",
 				        this, What_Am_I(), Class.Raw(), (unsigned)effective);
 				OutputDebugStringA(_buf);
-				return false;
+				// Tactical relaxation, matching the other Class_Is_Valid overrides. All eight now agree.
+				return true;
 			}
 
 			return true;

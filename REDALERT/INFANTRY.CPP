@@ -526,7 +526,19 @@ int InfantryClass::Shape_Number(WindowNumberType window) const
 	/*
 	** The animation frame numbers may be different when rendering in legacy mode vs. exporting for render in GlyphX. ST - 9/5/2019 12:34PM
 	*/
-	const DoInfoStruct *do_controls = (window == WINDOW_VIRTUAL) ? Class->DoControlsVirtual : Class->DoControls;
+	/*
+	**	This was a raw Class-> dereference, so Draw_It could not call Shape_Number on an infantry with
+	**	an untrustworthy +8 and fell back to virtualShape = 0 -- the North-facing stand pose. Produced
+	**	Soviet infantry then walked in any direction while permanently drawn standing still facing
+	**	North, which reads as gliding sideways/backwards. Same root cause as the vessel hull pinned
+	**	North (VESSEL.H operator VesselType), and the same fix: resolve through the safe type so
+	**	Shape_Number is callable unconditionally.
+	*/
+	InfantryTypeClass const* itype = static_cast<InfantryTypeClass const*>(Aeloria_Safe_Techno_Type(this));
+	if (itype == NULL || itype->RTTI != RTTI_INFANTRYTYPE) {
+		return 0;
+	}
+	const DoInfoStruct *do_controls = (window == WINDOW_VIRTUAL) ? itype->DoControlsVirtual : itype->DoControls;
 	if (window != WINDOW_VIRTUAL && !IsOwnedByPlayer && *this == INFANTRY_SPY) {
 		do_controls = InfantryTypeClass::As_Reference(INFANTRY_E1).DoControls;
 	}
@@ -593,13 +605,30 @@ void InfantryClass::Draw_It(int x, int y, WindowNumberType window) const
 	}
 	if (drawW <= 0) drawW = 24;
 	if (drawH <= 0) drawH = 24;
+	// InfantryTypeClass::Dimensions is a flat 14x20 selection box, far smaller than the sprite —
+	// this is why infantry render undersized. Use the real frame size for the client rect.
+	Aeloria_ClientDrawDims(Get_Image_Data(), drawW, drawH);
 	DirType rot = PrimaryFacing.Current();
 
 	// LAYERS export uses WINDOW_VIRTUAL. Never call Get_Image_Data / FootClass::Draw_It here —
 	// plausible-but-corrupt +8 (common on E3) AVs in Techno_Draw_Object or Class_Of().
 	if (window == WINDOW_VIRTUAL && infantry_type != nullptr) {
-		DLL_Draw_Intercept(0, x, y, drawW, drawH, AELORIA_CLIENT_DRAW_FLAGS_CENTER,
+		// The client renders this frame, so a healthy infantryman must send its real one or the
+		// walk / prone / firing choreography never animates. Shape_Number now resolves its type
+		// through Aeloria_Safe_Techno_Type and touches no raw Class pointer, so it is safe to call
+		// unconditionally -- the old live-Class gate is what pinned produced infantry to the
+		// North-facing stand frame while they walked.
+		int virtualShape = Shape_Number(window);
+		if (virtualShape < 0) virtualShape = 0;
+		DLL_Draw_Intercept(virtualShape, x, y, drawW, drawH, AELORIA_CLIENT_DRAW_FLAGS_CENTER,
 		                   const_cast<InfantryClass*>(this), rot, 0x100, nullptr, (char)Owner());
+		// Pips come from TechnoClass::Draw_It, which this early return skips.
+		{
+			int pipW = 0;
+			int pipH = 0;
+			infantry_type->Dimensions(pipW, pipH);
+			Draw_Pips((x - pipW / 2) + 5, y + pipH / 2 - 3, window);
+		}
 		return;
 	}
 
@@ -641,7 +670,10 @@ void InfantryClass::Draw_It(int x, int y, WindowNumberType window) const
 	**	Early-out if the Class pointer is not yet valid (can happen very early
 	**	during scenario load before TypeClasses are fully constructed).
 	*/
-	if (!Is_Drawable(this)) return;
+	// Inlined from Is_Drawable() to fetch the shape pointer once -- see BuildingClass::Draw_It.
+	if (!Class_Is_Valid()) return;
+	void const * const cached_image_data = Get_Image_Data();
+	if (cached_image_data == NULL) return;
 
 	if (g_AeloriaEnableVerboseDrawLogs && Aeloria_ShouldLogOncePerObject(this, AEL_LOG_GUARD_PASSED)) {
 		Aeloria_Debug_Log("Infantry guard passed this=%p Class.Raw=%ld - proceeding to draw", (void*)this, Class.Raw());
@@ -654,9 +686,7 @@ void InfantryClass::Draw_It(int x, int y, WindowNumberType window) const
 	**	Verify the legality of the unit class by seeing if there is shape imagery for it. If
 	**	there is no shape image, then it certainly can't be drawn -- bail.
 	*/
-	void const * shapefile = Get_Image_Data();
-
-	if (shapefile == NULL) return;
+	void const * shapefile = cached_image_data;
 
 	y += 4;
 	x -= 2;

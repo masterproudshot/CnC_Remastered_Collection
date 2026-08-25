@@ -261,7 +261,7 @@ class BuildingClass : public TechnoClass
 		BuildingClass(NoInitClass const & x) : TechnoClass(x), Class(x), CountDown(x), PlacementDelay(x) {};
 #endif
 		virtual ~BuildingClass(void);
-		operator StructType(void) const {return Class->Type;};
+		operator StructType(void) const;
 
 		/*---------------------------------------------------------------------
 		**	Member function prototypes.
@@ -269,7 +269,7 @@ class BuildingClass : public TechnoClass
 		static void Init(void);
 
 		TARGET Target_Scan(void);
-		BuildingTypeClass::AnimControlType const * Fetch_Anim_Control(void) {return (&Class->Anims[BState]);};
+		BuildingTypeClass::AnimControlType const * Fetch_Anim_Control(void);
 
 		/*
 		**	Query functions.
@@ -289,15 +289,24 @@ class BuildingClass : public TechnoClass
 		virtual bool Can_Capture(void) const;
 		virtual ObjectTypeClass const & Class_Of(void) const {return *Class;};
 		bool Class_Is_Valid(void) const override {
-			if (!Class.Is_Valid() || Class.Raw() <= 0) return false;
+			if (!Class.Is_Valid() || Class.Raw() < 0) return false;
 			const BuildingTypeClass* t = Class;
 			if (!t) return false;
-			if (t->RTTI != RTTI_BUILDINGTYPE || t->MaxStrength <= 0) return false;
+			if (t->RTTI != RTTI_BUILDINGTYPE) return false;
 
 			/*
 			**	Project Aeloria — TEMPORARY BAND-AID (see Is_Plausible_Class_Pointer in OBJECT.H
 			**	and the full "Expert Panel Review" section in plan.md for rationale).
 			**	This replaces the weaker range check that let 0x80738000 and similar through.
+			**
+			**	Tactical relaxation, matching UnitClass::Class_Is_Valid: a bad runtime +8 peek
+			**	must not veto the draw. Returning false here makes Is_Drawable() fail, so
+			**	BuildingClass::Draw_It returns on its first line and CELL.CPP culls the building
+			**	from the cell draw list — the object never reaches DLL_Draw_Intercept and renders
+			**	nowhere. That is invisible buildings for every human structure, which keep a
+			**	plausible-but-wrong +8 all match (see LEGACY_PLACE bad_at8=1). The checks above
+			**	already validate the real type through the CCPtr heap id, and the whole safe-draw
+			**	stack downstream exists precisely to handle a corrupt +8 — but only if we let it run.
 			*/
 			uintptr_t effective = *(uintptr_t*)((const char*)this + 8);
 			if (!Is_Plausible_Class_Pointer(effective)) {
@@ -306,7 +315,8 @@ class BuildingClass : public TechnoClass
 				sprintf(_buf, "REJECTED Class_Is_Valid this=%p RTTI=%d Class.Raw=%d at+8=0x%08X\r\n",
 				        this, What_Am_I(), Class.Raw(), (unsigned)effective);
 				OutputDebugStringA(_buf);
-				return false;
+				// CCPtr::Raw() is a heap ID — trust declared Class when dereferenced RTTI is sane.
+				return true;
 			}
 
 			return true;
