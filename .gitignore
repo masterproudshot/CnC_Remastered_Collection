@@ -27,3 +27,6 @@ Icon?
 
 # Dolphin
 .directory
+# Local editor/lane backups
+*.bak
+*.bak_*
